@@ -74,6 +74,29 @@ chmod 600 .env.production
 
 Compose 把整份文件作为 `mathweaver_backend_env` secret 只挂载给 `migrate` 与 `backend`，不会把内容展开进编排配置，前端也不会挂载该 secret。容器入口先静默读取 `/run/secrets/mathweaver_backend.env`，再降权到镜像内 `mathweaver` 用户并 `exec` 实际命令；入口不会打印变量名对应的值。镜像标签和监听端口等非敏感 Compose 参数请通过部署 shell 或不含密钥的 `.env` 设置，不要再把 `.env.production` 传给 Compose 的 `--env-file`。
 
+### 3.1 配置私有 OSS 任务文件存储
+
+MySQL 继续保存用户、会话、历史记录、进度及 OSS 对象前缀；处理产物、源 PDF、TeX 和日志等文件保存到私有 OSS Bucket。Bucket 禁止公共读写，RAM 用户只授予 `mathweaver/` 前缀所需的列举、上传、下载和删除权限，不授予 Bucket 管理权限。
+
+在服务器受保护的 `.env.production` 中填写以下变量，真实值不得提交到 Git、前端构建参数或 Compose 插值变量：
+
+```dotenv
+MATHWEAVER_OBJECT_STORAGE=oss
+MATHWEAVER_OSS_ENDPOINT=https://oss-<region>.aliyuncs.com
+MATHWEAVER_OSS_BUCKET=<PRIVATE_BUCKET>
+MATHWEAVER_OSS_ACCESS_KEY_ID=<RAM_ACCESS_KEY_ID>
+MATHWEAVER_OSS_ACCESS_KEY_SECRET=<RAM_ACCESS_KEY_SECRET>
+MATHWEAVER_OSS_PREFIX=mathweaver/
+```
+
+修改后保持文件权限为 `600`。先执行 `alembic upgrade head`，确保 `history.object_storage_prefix` 已创建，再在与后端相同的运行时环境中执行一次不含业务数据的连通性自检：
+
+```bash
+python scripts/verify_oss_storage.py
+```
+
+该脚本使用随机任务号上传一个小型探针，删除本地副本后从 OSS 恢复并比较内容，最后删除本次远端前缀。它只输出固定的成功或失败文本，不打印 Endpoint、Bucket、对象键或访问凭据。若自检失败，不要切换生产流量；先检查 ECS 到 OSS 的 HTTPS 网络、Endpoint 区域、RAM 前缀权限和系统时间。已在聊天或截图中出现过的 AccessKey 应在接入完成后轮换。
+
 ## 4. 备份与迁移预演
 
 任何结构或数据迁移前，先在 RDS 控制台创建手动备份/快照并记录备份 ID。正在使用旧 SQLite 时，还要做只读副本：

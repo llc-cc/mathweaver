@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.verify_oss_storage import run_smoke
 from storage.object_storage import (
     ObjectStorageConfig,
     ObjectStorageError,
@@ -165,3 +166,12 @@ def test_provider_error_details_are_not_exposed(tmp_path: Path) -> None:
     with pytest.raises(ObjectStorageError) as raised:
         storage.sync_job(7, "job-1", artifact_root, tmp_path / "source")
     assert "leaked-secret-value" not in str(raised.value)
+
+
+def test_smoke_check_round_trips_marker_and_cleans_remote_objects(tmp_path: Path) -> None:
+    bucket = FakeBucket()
+    storage = configured_storage(bucket)
+
+    run_smoke(storage, tmp_path, user_id=1, job_id="smoke-test")
+
+    assert bucket.objects == {}

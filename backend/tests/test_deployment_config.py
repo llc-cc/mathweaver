@@ -69,6 +69,31 @@ def test_compose_mounts_runtime_env_as_backend_only_secret():
     assert '"8"' in compose
 
 
+def test_oss_runtime_configuration_stays_in_backend_secret():
+    example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+    compose = (PROJECT_ROOT / "deploy" / "docker-compose.web.yml").read_text(
+        encoding="utf-8"
+    )
+
+    for row in (
+        "MATHWEAVER_OBJECT_STORAGE=local",
+        "MATHWEAVER_OSS_ENDPOINT=",
+        "MATHWEAVER_OSS_BUCKET=",
+        "MATHWEAVER_OSS_ACCESS_KEY_ID=",
+        "MATHWEAVER_OSS_ACCESS_KEY_SECRET=",
+        "MATHWEAVER_OSS_PREFIX=mathweaver/",
+    ):
+        assert row in example
+    for secret_name in (
+        "MATHWEAVER_OSS_ACCESS_KEY_ID",
+        "MATHWEAVER_OSS_ACCESS_KEY_SECRET",
+    ):
+        assert f"${{{secret_name}" not in compose
+    frontend = compose.split("  frontend:", 1)[1].split("  proxy:", 1)[0]
+    assert "MATHWEAVER_OSS_" not in frontend
+    assert "target: mathweaver_backend.env" in compose
+
+
 def test_backend_image_uses_non_logging_runtime_environment_entrypoint():
     dockerfile = (PROJECT_ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
     entrypoint = (
