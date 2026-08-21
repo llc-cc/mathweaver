@@ -1,0 +1,17 @@
+.claude
+.codex
+.pytest_cache
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+jobs
+notebooks
+tests
+docs
+

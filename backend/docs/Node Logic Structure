@@ -1,0 +1,447 @@
+1. 设计目标
+本方案面向数学文档中的命题类节点，目标是构建一套可供多个项目共享的节点级逻辑结构表示，作为后续单文档依赖提取、跨文档节点对齐、节点内部逻辑致密化与信息补全的基础接口。
+考虑到不同下游任务对结构粒度的要求不同，本方案将节点表示划分为两层：
+- 抽取层（Extraction Layer）：用于表达原文中显式出现的命题骨架，强调忠实性、稳定性和可复用性；
+- 分析层（Analysis Layer）：用于表达节点内部的边界歧义、逻辑缺口、定义依赖与特殊结构，强调后续补全与形式化预处理能力。
+其中，抽取层提供 v1.0 与 v1.1 两个版本，以适应不同阶段的工程需求；分析层暂只保留一个统一版本。
+
+---
+2. 总体设计原则
+2.1 命题骨架统一原则
+对命题类节点，整体上采用“语境 + 条件 + 结论”的统一骨架进行表示。
+更具体地说，绝大多数数学命题都可视为某种条件推出结论的结构；即使原始形式为等价、存在、刻画等，也尽量保持与这一主骨架兼容。
+2.2 稳定优先原则
+1.0 阶段优先保证结构可稳定抽取，而不是追求最细粒度的逻辑原子化。
+因此，抽取层 v1.0 以文本级结构化为主；若后续实验表明模型和后处理已足够稳定，再切换或补充到 v1.1 的轻量谓词化表示。
+2.3 分层清晰原则
+- 抽取层只回答：原文明确说了什么
+- 分析层只回答：原文还没说清什么、哪里存在歧义、后续需要补什么
+这样可以避免将“原文事实”和“模型推断”混杂在同一层，便于后续实验对照与模块解耦。
+
+---
+3. Context 与 Condition 的区分原则
+这是节点抽取中最容易混淆的部分，因此单独给出约定。
+Context
+context 用于表示命题讨论的基础语境、对象类型、母域或默认范围，回答的问题是：
+对象在什么数学环境中被讨论？
+例如：
+- (f:[a,b]\to\mathbb R)
+- (G) is a finite group
+- over a normed space (X)
+- for real numbers (x,y)
+Condition
+condition 用于表示在该语境下，为推出结论还需额外满足的性质约束或判断，回答的问题是：
+在这个语境中，还需要哪些前提，结论才成立？
+例如：
+- (f) 在 ([a,b]) 上连续
+- (f(a)=f(b))
+- (G) is abelian
+- (x>0)
+工程化约定
+若一句话同时包含对象语境与额外性质，则优先拆为：
+- 语境信息进入 context
+- 性质约束进入 conditions
+若边界难以稳定判断，则允许在分析层中通过 boundary_analysis 进行说明，而不在抽取层做过度强拆。
+
+---
+4. 抽取层设计
+
+---
+1.4.1 Extraction Layer v1.0（推荐默认版本）
+设计思想
+v1.0 以轻量、稳定、易于大模型输出为主要目标。
+该版本不强制要求模型将所有条件、结论进一步原子化为 predicate-args 结构，而是优先保证命题骨架的稳定拆分。
+字段结构
+{
+  "global_id": "md5_id"
+  "node_type": "statement",
+  "title": {
+    "chinese": "chinese_id",
+    "english": "english_id"
+  },
+  "statement_form": "implication",
+  "remark": {
+    "original_form": "implication"
+  },
+  "subject":{
+    "text":[
+    "function f"
+    ],
+    "text_normalized":[
+    "FUNC_1 f"
+    ]
+  }
+  "context":{
+    "text":  [
+    "f:[a,b] -> R"
+    ],
+    "text_normalized": [
+    "FUNC_1:[REAL_1, REAL_2] -> R"
+    ]
+  }
+  "variables": [
+    {
+      "name": "f",
+      "type": "function",
+      "normalize_type": "FUNCTION_1"
+    },
+    {
+      "name": "a",
+      "type": "real",
+      "normalize_type": "REAL_1"
+    },
+    {
+      "name": "b",
+      "type": "real",
+      "normalize_type": "REAL_2"
+    }
+  ],
+  "conditions": [
+    {
+      "id": "c1",
+      "text": "f is continuous on [a,b]",
+      "text_normalized": "..."
+    },
+    {
+      "id": "c2",
+      "text": "f is differentiable on (a,b)",
+      "text_normalized": "..."
+    },
+    {
+      "id": "c3",
+      "text": "f(a)=f(b)",
+      "text_normalized": "..."
+    }
+  ],
+  "conclusions": [
+    {
+      "id": "q1",
+      "text": "there exists xi in (a,b) such that f'(xi)=0",
+      "text_normalized": "..."
+    }
+  ]
+}
+4.1.3 字段说明
+global_id
+节点全局唯一标识符
+当前方案由节点类型加正则化原文组合后的字符串的MD5码 生成
+node_type
+固定表示当前节点属于命题类节点。
+当前方案只针对 statement 节点，不涉及 proof 节点。
+title
+由大模型生成的对节点内容的简要概括
+分为中文和英文
+statement_form
+用于标记命题的整体形态，例如：
+- implication
+- equivalence
+- existence
+- equality
+- characterization
+- other
+该字段用于保留命题的整体逻辑外形，便于后续特殊处理。
+remark.original_form
+用于保留原始命题表述类型，与 statement_form 形成轻量冗余。
+其主要作用是：即使后续做统一表示，也能回溯原始形式。
+subject
+表示该命题主要讨论的核心对象。
+它不是所有出现的变量，而是命题的“主角”。
+例如：
+- 罗尔定理的主体是 function f
+- 矩阵命题的主体可能是 matrix A
+- 等式类命题可能有多个主体，因此采用列表表示
+context
+表示命题讨论的基础语境、对象类型或母域。
+该字段为后续跨文档对齐、泛化判断和对象理解提供支撑。
+variables
+表示命题中显式出现的重要变量及其基本类型。
+1.0 阶段仅保留 name 和 type 两个最基本字段，不要求进一步判断变量来源或引入方式。
+conditions
+表示推出结论所需满足的前提条件。
+在 v1.0 中，每个 condition 仅保留：
+- id
+- text
+即优先保证边界切分和文本表达稳定，而不要求深层结构化。
+conclusions
+表示命题最终断言成立的结果。
+在 v1.0 中，同样仅保留：
+- id
+- text
+优先保证结论片段能够稳定抽出。
+text_normalized
+记录当前节点原文经过正则化之后的文本
+
+---
+1.4.2 Extraction Layer v1.1（增强版本，可选）
+设计思想
+v1.1 在 v1.0 基础上引入轻量谓词化表示，适用于以下情况：
+- 大模型输出已较稳定
+- 后处理规则已较清晰
+- 下游任务明确需要更细粒度的逻辑匹配
+v1.1 并不是替代 v1.0，而是一个可选增强版本。
+4.2.2 字段结构
+{
+  "node_type": "statement",
+  "statement_form": "implication",
+  "remark": {
+    "original_form": "implication"
+  },
+  "subject": [
+    "function f"
+  ],
+  "context": [
+    {
+      "text": "f:[a,b] -> R",
+      "predicate": "function_mapping",
+      "args": ["f", "[a,b]", "R"]
+    }
+  ],
+  "variables": [
+    {
+      "name": "f",
+      "type": "function"
+    },
+    {
+      "name": "a",
+      "type": "real"
+    },
+    {
+      "name": "b",
+      "type": "real"
+    }
+  ],
+  "conditions": [
+    {
+      "id": "c1",
+      "text": "f is continuous on [a,b]",
+      "predicate": "is_continuous",
+      "args": ["f", "[a,b]"]
+    },
+    {
+      "id": "c2",
+      "text": "f is differentiable on (a,b)",
+      "predicate": "is_differentiable",
+      "args": ["f", "(a,b)"]
+    },
+    {
+      "id": "c3",
+      "text": "f(a)=f(b)",
+      "predicate": "equal",
+      "args": ["f(a)", "f(b)"]
+    }
+  ],
+  "conclusions": [
+    {
+      "id": "q1",
+      "text": "there exists xi in (a,b) such that f'(xi)=0",
+      "predicate": "exists",
+      "args": ["xi"],
+      "property_text": "f'(xi)=0"
+    }
+  ]
+}
+4.2.3 说明
+v1.1 的核心变化是：
+- 在 context、conditions、conclusions 中增加 predicate 和 args
+- 保留 text 作为原始文本保底表示
+这样做的意义是：
+- 有利于 condition-conclusion 匹配
+- 有利于跨文档相似度计算
+- 有利于后续进一步接近形式化表达
+但这一版本对模型能力和后处理要求更高，因此在工程上建议作为可选版本，而非强制默认版本。
+
+---
+5. 特殊命题类型的处理原则
+5.1 等价命题（Equivalence）
+对于 (A \iff B) 这类命题，从逻辑上可以拆成：
+- (A \to B)
+- (B \to A)
+但在节点结构表示阶段，先不拆分为两个独立节点，而是：
+- 在 extraction 层中保留 statement_form = "equivalence"
+- 在 remark.original_form 中记录其原始形式
+- 在后续关系提取或图构建阶段，再按需要将其展开为两个方向
+5.2 存在命题（Existence）
+对“存在某对象使得某性质成立”这类命题，原则上仍放入统一骨架中。
+在 v1.0 中只需将其结论保留为文本片段；在 v1.1 中可进一步使用 predicate = exists、args = [...]、property_text = ... 的形式表达。
+5.3 恒等式 / 相等类命题（Equality）
+对 (A=B) 这类命题，建议：
+- 保留其 statement_form = "equality"
+- subject 使用列表，允许同时表示多个主体对象
+- 不在 1.0 阶段额外扩展复杂字段
+5.4 刻画类命题（Characterization）
+对于“当且仅当”“等价于以下条件”“可刻画为”等命题，可统一标记为：
+- statement_form = "characterization" 或 equivalence
+后续视下游需求决定如何展开。
+
+---
+6. 分析层设计
+6.1 设计目标
+Analysis Layer 不重复抽取原文，也不直接替代 Extraction Layer，而是在抽取层基础上，对节点进行进一步的诊断性分析与补充刻画。
+ 其核心作用主要有两类：
+1. 记录 extraction 层中的不稳定因素，例如边界划分歧义、命题类型退化、局部结构被压平等； 
+2. 识别自然语言数学中尚未显式化的逻辑信息，例如隐含约束、变量范围、定义依赖、局部条件作用域和可能的逻辑跳步。 
+因此，Analysis Layer 既服务于 extraction 结果的误差分析，也服务于后续的信息补全、逻辑致密化和形式化预处理。
+其主要服务于：
+-  节点内部逻辑致密化 
+-  信息补全与后续 repair 的入口定位 
+-  后续形式化预处理 
+-  错误分析与评测 
+6.2 字段结构
+{
+  "boundary_analysis": {
+    "context_condition_notes": [],
+    "condition_conclusion_notes": []
+  },
+  "gap_analysis": {
+    "logic_gaps": [],
+    "missing_constraints": []
+  },
+  "definition_analysis": {
+    "definitions_referenced": []
+  },
+  "structural_analysis": {
+    "special_form_notes": []
+  }
+}
+6.3 字段说明
+boundary_analysis
+用于记录命题边界上的不稳定因素，主要包括：
+- context_condition_notes：context 与 condition 是否存在划分歧义 
+- condition_conclusion_notes：condition 与 conclusion 是否存在边界不稳问题 
+该字段主要服务于 extraction 层的误差分析与结构诊断。
+ 它的作用不是强行在分析层重新划分边界，而是在 extraction 层不做过度强拆的前提下，为后续脚本迭代和人工检查保留解释空间。
+
+gap_analysis
+用于记录节点中尚未显式化、但可能影响理解、关系提取或形式化的逻辑缺口，主要包括：
+-  隐含约束未显式写出 
+-  变量或对象的范围、身份或作用域不完整 
+-  局部条件只作用于部分结论但未被结构化表示 
+-  默认知识、定义依赖或中间步骤未显式说明 
+-  其他可能影响后续补全与推理的信息缺失 
+初期只保留：
+- logic_gaps
+- missing_constraints
+其中：
+- logic_gaps 更侧重记录“缺了哪一类逻辑信息” 
+- missing_constraints 更侧重记录“可以进一步补出的约束或说明”
+例如：
+- continuity
+- differentiability
+- compactness
+- normal subgroup
+这部分放在分析层而非抽取层，是因为它更多面向后续理解、补全和形式化，而非基础命题骨架本身。
+
+definition_analysis 
+用于记录该节点涉及的关键定义性术语或默认概念依赖。
+ 例如：
+-  continuity 
+-  differentiability 
+-  compactness 
+-  normal subgroup 
+-  Hall subgroup 
+-  commutator subgroup 
+这部分放在分析层而非抽取层，是因为它更多面向后续理解、补全、关系提取与形式化，而不是基础命题骨架本身。
+ 换言之，它描述的是“这个节点在机器可处理之前，还依赖哪些默认知识背景”。
+
+structural_analysis
+用于记录该节点的整体逻辑外形及特殊结构说明。
+ 例如：
+-  原始命题为 equivalence 
+-  节点在后续关系提取中需要双向展开 
+-  存在多主体、公式型结论、子命题结构或其他特殊逻辑形态 
+-  局部条件与全局前提可能混杂，需要后续拆分 
+该字段的作用是：
+ 在 extraction 层先保留主骨架的前提下，为后续的关系建模、branch 处理和 repair 提供结构提示。
+
+---
+7. 示例：罗尔定理
+7.1 Extraction v1.0
+{
+  "node_type": "statement",
+  "statement_form": "implication",
+  "remark": {
+    "original_form": "implication"
+  },
+  "subject": [
+    "function f"
+  ],
+  "context": [
+    "f:[a,b] -> R"
+  ],
+  "variables": [
+    {"name": "f", "type": "function"},
+    {"name": "a", "type": "real"},
+    {"name": "b", "type": "real"},
+    {"name": "xi", "type": "real"}
+  ],
+  "conditions": [
+    {
+      "id": "c1",
+      "text": "f is continuous on [a,b]"
+    },
+    {
+      "id": "c2",
+      "text": "f is differentiable on (a,b)"
+    },
+    {
+      "id": "c3",
+      "text": "f(a)=f(b)"
+    }
+  ],
+  "conclusions": [
+    {
+      "id": "q1",
+      "text": "there exists xi in (a,b) such that f'(xi)=0"
+    }
+  ]
+}
+7.2 Analysis
+{
+  "boundary_analysis": {
+    "context_condition_notes": [
+      "The mapping f:[a,b] -> R is treated as context, while continuity and differentiability are treated as conditions."
+    ],
+    "condition_conclusion_notes": []
+  },
+  "gap_analysis": {
+    "logic_gaps": [
+      "ordering relation a < b is not explicit"
+    ],
+    "missing_constraints": [
+      "interval well-formedness assumption"
+    ]
+  },
+  "definition_analysis": {
+    "definitions_referenced": [
+      "continuity",
+      "differentiability"
+    ]
+  },
+  "structural_analysis": {
+    "special_form_notes": []
+  }
+}
+
+---
+8. 与证明节点的关系说明
+方案当前仅针对命题节点设计。
+证明补全、证明步骤抽取和自然语言证明翻译涉及的逻辑对象与字段需求与命题节点明显不同，例如：
+- 当前目标（goal）
+- 使用的前提（premises used）
+- 推理动作（inference move）
+- 中间结论（derived fact）
+- 步骤依赖（step dependency）
+因此，证明节点的 schema 还需要单独设计，现在的想法是和命题共用一些模块（如变量、定义依赖、引用节点），但也会有自己的一些新字段。
+9. 结论
+本方案提出了一套面向命题节点的共享基础表示，其核心思想是：
+- 用统一的“语境 + 条件 + 结论”骨架表达数学命题；
+- 在抽取层提供 v1.0（轻量文本结构化） 与 v1.1（轻量谓词化增强） 两个版本，以适应不同阶段需求；
+- 用单独的分析层表达边界歧义、逻辑缺口、定义依赖与特殊结构，为后续逻辑致密化与形式化预处理提供接口；
+- 对 equivalence 等特殊命题类型，不在 extraction 阶段立即强拆，而通过 statement_form 与 remark 保留原始语义，并在后续关系提取阶段再做展开。
+表格版：字段说明
+Extraction Layer 字段表
+暂时无法在飞书文档外展示此内容
+
+---
+Analysis Layer 字段表
+暂时无法在飞书文档外展示此内容

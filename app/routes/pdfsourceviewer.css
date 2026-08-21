@@ -1,0 +1,8 @@
+.gs-pdf-viewer { position: relative; flex: 1; min-height: 0; overflow: auto; background: #343434; }
+.gs-pdf-document { padding: 12px 0 18px; }
+.gs-pdf-page { position: relative; margin: 0 auto 12px; box-shadow: 0 2px 12px rgba(0, 0, 0, .38); background: #fff; }
+.gs-pdf-page canvas { display: block; }
+.gs-pdf-highlight { position: absolute; pointer-events: none; box-sizing: border-box; border: 0; border-left: 3px solid rgba(202, 145, 28, .62); background: rgba(255, 204, 78, .16); border-radius: 6px; box-shadow: inset 0 0 0 1px rgba(202, 145, 28, .12); }
+.gs-pdf-viewer-state { position: absolute; inset: 0; display: grid; place-items: center; color: #f1f1f1; font-size: 14px; z-index: 2; }
+.gs-pdf-viewer-state.error { color: #ffd0d0; padding: 24px; text-align: center; }
+.gs-pdf-viewer-note { position: sticky; top: 0; z-index: 3; width: max-content; max-width: calc(100% - 12px); margin: 0 auto 12px; padding: 7px 10px; border-radius: 4px; background: rgba(42, 42, 42, .86); color: #f1f1f1; font-size: 12px; }

@@ -1,0 +1,6 @@
+OCR powered by MinerU.
+
+The release OCR component is distributed separately from the MathWeaver base
+installer. The pinned component is MinerU pipeline 3.4.4 for Windows x64,
+Python 3.12, CPU inference, with local-only model loading. The release manifest
+records the component archive hashes, model revision, sizes, and licenses.

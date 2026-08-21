@@ -1,0 +1,122 @@
+name: mathweaver
+
+x-backend-environment: &backend-environment
+  MATHWEAVER_DATABASE_NAME: mathweaver
+  MATHGRAPH_DATA_DIR: /var/lib/mathweaver
+
+x-backend-secrets: &backend-secrets
+  - source: mathweaver_backend_env
+    target: mathweaver_backend.env
+    mode: 0400
+
+services:
+  migrate:
+    image: ${MATHWEAVER_MIGRATION_IMAGE:-mathweaver-backend:local}
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    # 入口只以 root 读取 0400 secret，随后在 exec 前立即降权到 UID/GID 10001。
+    user: "0:0"
+    secrets: *backend-secrets
+    environment: *backend-environment
+    command:
+      - python
+      - -m
+      - alembic
+      - -c
+      - migrations/alembic.ini
+      - upgrade
+      - head
+    restart: "no"
+
+  backend:
+    image: ${MATHWEAVER_BACKEND_IMAGE:-mathweaver-backend:local}
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    user: "0:0"
+    secrets: *backend-secrets
+    environment: *backend-environment
+    command:
+      - gunicorn
+      - --workers
+      - "1"
+      - --threads
+      - "8"
+      - --timeout
+      - "300"
+      - --bind
+      - 0.0.0.0:5001
+      - api_v2:app
+    volumes:
+      - mathweaver_artifacts:/var/lib/mathweaver
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import sys, urllib.request;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5001/api/v2/ping', timeout=5).status == 200 else 1)
+      interval: 15s
+      timeout: 6s
+      retries: 8
+      start_period: 30s
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  frontend:
+    image: ${MATHWEAVER_FRONTEND_IMAGE:-mathweaver-web:local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        VITE_API_ORIGIN: __SAME_ORIGIN__
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3000/').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))
+      interval: 15s
+      timeout: 6s
+      retries: 8
+      start_period: 20s
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+  proxy:
+    image: nginx:1.27-alpine
+    ports:
+      - "${MATHWEAVER_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./nginx.mathweaver.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1/health"]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  mathweaver_artifacts:
+    name: mathweaver_artifacts
+
+secrets:
+  mathweaver_backend_env:
+    file: ../.env.production
+

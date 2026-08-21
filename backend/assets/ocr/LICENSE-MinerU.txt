@@ -1,0 +1,7 @@
+MinerU is distributed under the MinerU Open Source License, an Apache 2.0
+derived license with additional conditions. The exact license text shipped with
+each OCR release is copied from:
+
+https://github.com/opendatalab/MinerU/blob/master/LICENSE.md
+
+The release manifest records the component version and license identifier.

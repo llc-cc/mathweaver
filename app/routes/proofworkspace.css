@@ -1,0 +1,370 @@
+.proof-ws {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line, #e7e2da);
+  color: var(--ink, #1c1b19);
+}
+
+.proof-ws-card {
+  border: 1px solid var(--line, #e7e2da);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+
+.proof-ws-rowbtn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  color: var(--ink, #1c1b19);
+  background: var(--surface-alt, var(--surface-2, #f4f2ee));
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.proof-ws-rowbtn b {
+  margin-left: auto;
+  color: var(--accent, #1e5aa8);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.proof-ws-textbook {
+  padding: 10px 11px;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--ink-2, var(--muted, #4a4843));
+}
+
+.proof-ws-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 9px;
+}
+
+.proof-ws-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--ink, #1c1b19);
+}
+
+.proof-ws-subtitle {
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--muted, #6b6864);
+}
+
+.proof-ws .proof-ws-save,
+.proof-ws .proof-ws-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--line, #e7e2da);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  color: var(--ink, #1c1b19);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 10px;
+  transition: background 140ms, border-color 140ms, color 140ms;
+}
+
+.proof-ws-save:hover,
+.proof-ws-actions button:hover {
+  background: var(--accent-light, var(--accent-2, #eaf1fa));
+  border-color: var(--accent-mid, var(--accent, #1e5aa8));
+  color: var(--accent, #1e5aa8);
+}
+
+.proof-ws-save:disabled,
+.proof-ws-actions button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.proof-ws-import {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 8px 0 9px;
+  color: var(--muted, #6b6864);
+  font-size: 11.5px;
+}
+
+.proof-ws-import-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--line, #e7e2da);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  color: var(--accent, #1e5aa8);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  padding: 6px 10px;
+  transition: background 140ms, border-color 140ms;
+  white-space: nowrap;
+}
+
+.proof-ws-import-btn:hover {
+  background: var(--accent-light, var(--accent-2, #eaf1fa));
+  border-color: var(--accent, #1e5aa8);
+}
+
+.proof-ws-import-cancel {
+  margin: 0;
+  color: var(--muted, #6b6864);
+}
+
+.proof-ws-import-btn.disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.proof-ws-import-btn input {
+  display: none;
+}
+
+.proof-ws-import-progress {
+  height: 4px;
+  margin: -2px 0 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--accent-light, var(--accent-2, #eaf1fa));
+}
+
+.proof-ws-import-progress div {
+  width: 42%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent, #1e5aa8);
+  animation: proof-ws-progress 1.15s ease-in-out infinite;
+}
+
+.proof-ws-import-preview {
+  margin-bottom: 10px;
+  border: 1px solid var(--line, #e7e2da);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  overflow: hidden;
+}
+
+.proof-ws-import-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  background: var(--surface-alt, var(--surface-2, #f4f2ee));
+  color: var(--muted, #6b6864);
+  font-size: 10.5px;
+}
+
+.proof-ws-import-preview-head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proof-ws-import-preview-head button {
+  border: 1px solid var(--line, #e7e2da);
+  border-radius: 7px;
+  background: var(--surface, #fff);
+  color: var(--ink, #1c1b19);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
+.proof-ws-import-preview-actions button {
+  flex: 1 1 0;
+  min-height: 36px;
+  margin: 0;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line, #e7e2da);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  color: var(--ink, #1c1b19);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  padding: 7px 12px;
+  text-align: center;
+  transition: background 140ms, border-color 140ms, color 140ms, transform 140ms, box-shadow 140ms;
+}
+
+.proof-ws-import-preview pre {
+  max-height: 180px;
+  margin: 0;
+  padding: 9px 10px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink-2, var(--ink, #1c1b19));
+  font: 11.5px/1.55 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+.proof-ws-import-preview-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px 9px;
+  border-top: 1px solid var(--line, #e7e2da);
+}
+
+.proof-ws-import-preview-actions button.primary {
+  background: var(--accent, #1e5aa8);
+  border-color: var(--accent, #1e5aa8);
+  color: #fff;
+}
+
+.proof-ws-import-preview-actions button:not(:disabled):hover {
+  background: var(--accent-light, var(--accent-2, #eaf1fa));
+  border-color: var(--accent, #1e5aa8);
+  color: var(--accent, #1e5aa8);
+  box-shadow: var(--shadow-sm, 0 1px 3px rgba(28, 27, 25, .08));
+  transform: translateY(-1px);
+}
+
+.proof-ws-import-preview-actions button.primary:not(:disabled):hover {
+  background: var(--accent, #1e5aa8);
+  border-color: var(--accent, #1e5aa8);
+  color: #fff;
+}
+
+.proof-ws-import-preview-actions button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.proof-ws-editor {
+  width: 100%;
+  min-height: 150px;
+  resize: vertical;
+  padding: 10px 11px;
+  border: 1px solid var(--line, #e7e2da);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  color: var(--ink, #1c1b19);
+  font: 12.5px/1.55 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  outline: none;
+}
+
+.proof-ws-editor:focus {
+  border-color: var(--accent, #1e5aa8);
+  box-shadow: 0 0 0 3px var(--accent-light, var(--accent-2, #eaf1fa));
+}
+
+.proof-ws-actions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.proof-ws-error {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger-line, #f1b8b3);
+  border-radius: 8px;
+  background: var(--danger-light, #fff6f5);
+  color: var(--danger, #b42318);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.proof-ws-ai,
+.proof-ws-versions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.proof-ws-ai-item,
+.proof-ws-version {
+  border: 1px solid var(--line, #e7e2da);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  overflow: hidden;
+}
+
+.proof-ws-ai-head,
+.proof-ws-version-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  background: var(--surface-alt, var(--surface-2, #f4f2ee));
+  color: var(--muted, #6b6864);
+  font-size: 10.5px;
+}
+
+.proof-ws-ai-head span,
+.proof-ws-version-head span {
+  color: var(--accent, #1e5aa8);
+  font-weight: 700;
+}
+
+.proof-ws-ai-body {
+  padding: 9px 10px;
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+
+.proof-ws-version pre {
+  margin: 0;
+  padding: 9px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink-2, var(--ink, #1c1b19));
+  font: 11.5px/1.55 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+.proof-ws-empty {
+  padding: 10px;
+  border: 1px dashed var(--line, #e7e2da);
+  border-radius: 8px;
+  color: var(--muted, #6b6864);
+  text-align: center;
+  font-size: 12px;
+}
+
+.proof-ws-spin {
+  animation: proof-ws-spin 1s linear infinite;
+}
+
+@keyframes proof-ws-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes proof-ws-progress {
+  0% { transform: translateX(-105%); }
+  100% { transform: translateX(245%); }
+}
+
+@media (max-width: 520px) {
+  .proof-ws-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -1,0 +1,6 @@
+# backend 级补充规则（主规则在顶层 .gitignore）
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+_stage_cache/

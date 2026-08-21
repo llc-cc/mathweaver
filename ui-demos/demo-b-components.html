@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Demo B — 组件拆分 + 动画过渡</title>
+<style>
+:root {
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --surface-alt: #f1f4f7;
+  --ink: #17202a;
+  --muted: #64717f;
+  --line: #d9e0e7;
+  --line-strong: #b8c4cf;
+  --accent: #225ea8;
+  --accent-light: #f5f8fe;
+  --accent-mid: #95b8eb;
+  --ok: #16703b; --ok-bg: #edf8f0;
+  --warn: #a15c07; --warn-bg: #fff8e6;
+  --danger: #b42318; --danger-bg: #fff6f5;
+  --shadow-sm: 0 2px 6px rgba(23,32,42,0.06);
+  --shadow: 0 8px 24px rgba(23,32,42,0.08);
+  --radius: 8px;
+  --transition: 160ms cubic-bezier(.25,.46,.45,.94);
+  --node-dfn-bg: #fbfcfd; --node-dfn-border: #94a3b8;
+  --node-thm-bg: #edf8f0; --node-thm-border: #9ad4aa;
+  --node-lem-bg: #f5f8fe; --node-lem-border: #95b8eb;
+  --node-cor-bg: #f8f5ff; --node-cor-border: #b8a6e0;
+  --node-axm-bg: #fffdf5; --node-axm-border: #c8b266;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: Inter, system-ui, sans-serif; font-size: 13px; background: var(--bg); color: var(--ink); }
+
+/* ── Buttons ── */
+.btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: var(--radius); font-size: 13px; font-family: inherit; cursor: pointer; border: 1px solid transparent; transition: var(--transition); }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: #1a4d8f; }
+.btn-ghost { background: transparent; color: var(--muted); border-color: var(--line); }
+.btn-ghost:hover { background: var(--surface-alt); color: var(--ink); }
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+.chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+.chip-blue { background: var(--accent-light); color: var(--accent); }
+.chip-green { background: var(--ok-bg); color: var(--ok); }
+.chip-amber { background: var(--warn-bg); color: var(--warn); }
+.chip-gray { background: var(--surface-alt); color: var(--muted); }
+.chip-purple { background: #f8f5ff; color: #6b3fa0; }
+
+/* ── View fade animation ── */
+.view { display: none; animation: viewIn 220ms ease forwards; }
+.view.active { display: block; }
+@keyframes viewIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ── Header ── */
+.header { height: 56px; background: var(--surface); border-bottom: 1px solid var(--line); display: flex; align-items: center; padding: 0 20px; gap: 14px; position: sticky; top: 0; z-index: 10; box-shadow: var(--shadow-sm); }
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 16px; }
+.brand-mark { width: 30px; height: 30px; background: var(--accent); border-radius: 7px; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 800; font-size: 14px; }
+.header-meta { display: flex; align-items: center; gap: 8px; padding: 4px 10px; background: var(--surface-alt); border-radius: 6px; border: 1px solid var(--line); font-size: 12px; }
+.header-meta-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
+.stat-pill { font-size: 11px; color: var(--muted); padding: 2px 6px; }
+.stat-pill span { color: var(--ink); font-weight: 600; }
+.header-sep { flex: 1; }
+
+/* ── Upload Page ── */
+.upload-page { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: calc(100vh - 56px); padding: 48px 20px; }
+.upload-hero { text-align: center; margin-bottom: 32px; }
+.upload-hero h1 { font-size: 24px; font-weight: 700; letter-spacing: -.01em; }
+.upload-hero p { font-size: 14px; color: var(--muted); margin-top: 8px; }
+.upload-card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 28px; width: 100%; max-width: 540px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 16px; }
+.dropzone { border: 2px dashed var(--line-strong); border-radius: var(--radius); padding: 36px 20px; text-align: center; cursor: pointer; transition: var(--transition); background: var(--bg); }
+.dropzone:hover { border-color: var(--accent); background: var(--accent-light); }
+.dropzone-icon { width: 40px; height: 40px; background: var(--surface-alt); border-radius: 10px; display: flex; align-items: center; justify-content: center; margin: 0 auto 12px; font-size: 18px; }
+.dropzone-primary { font-size: 14px; font-weight: 600; color: var(--ink); }
+.dropzone-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.or-divider { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
+.or-divider::before, .or-divider::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+textarea.area { width: 100%; border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; font-family: inherit; font-size: 13px; resize: vertical; min-height: 90px; background: var(--bg); color: var(--ink); transition: var(--transition); line-height: 1.5; }
+textarea.area:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(34,94,168,0.1); background: var(--surface); }
+.config-panel { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.config-toggle { width: 100%; display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; background: var(--surface-alt); border: none; cursor: pointer; font-family: inherit; font-size: 12px; }
+.config-toggle:hover { background: var(--line); }
+.config-body { padding: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; background: var(--surface); }
+.config-body.hidden { display: none; }
+.field label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; font-weight: 500; }
+.field input { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; font-family: inherit; font-size: 12px; background: var(--bg); color: var(--ink); transition: var(--transition); }
+.field input:focus { outline: none; border-color: var(--accent); background: var(--surface); }
+.field.full { grid-column: span 2; }
+.submit-btn { width: 100%; padding: 13px; font-size: 14px; font-weight: 500; justify-content: center; border-radius: 10px; letter-spacing: .01em; }
+
+/* ── Processing Page ── */
+.processing-page { display: flex; align-items: center; justify-content: center; min-height: calc(100vh - 56px); padding: 40px; }
+.processing-card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 28px; width: 100%; max-width: 580px; box-shadow: var(--shadow); }
+.processing-card h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; }
+.progress-bar-outer { height: 4px; background: var(--surface-alt); border-radius: 2px; margin-bottom: 20px; overflow: hidden; }
+.progress-bar-inner { height: 100%; background: var(--accent); border-radius: 2px; width: 62%; transition: width 1s ease; }
+.stages { display: flex; flex-direction: column; gap: 8px; }
+.stage-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.stage-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.stage-dot.done { background: var(--ok); }
+.stage-dot.active { background: var(--accent); animation: pulse 1.2s ease infinite; }
+.stage-dot.pending { background: var(--line-strong); }
+.stage-name { font-size: 12px; flex: 1; }
+.stage-name.active { font-weight: 500; color: var(--accent); }
+.stage-name.done { color: var(--ok); }
+.stage-name.pending { color: var(--muted); }
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(1.3)} }
+
+/* ── Result page ── */
+.result-page { display: flex; flex-direction: column; height: calc(100vh - 56px); }
+/* Sub-header with layout switcher */
+.result-subheader { height: 44px; border-bottom: 1px solid var(--line); background: var(--surface); display: flex; align-items: center; padding: 0 16px; gap: 12px; }
+.layout-tabs { display: flex; gap: 2px; background: var(--bg); border-radius: 8px; padding: 3px; border: 1px solid var(--line); }
+.layout-tab { padding: 5px 14px; border: none; background: transparent; border-radius: 6px; cursor: pointer; font-size: 12px; color: var(--muted); font-family: inherit; transition: var(--transition); }
+.layout-tab.active { background: var(--surface); color: var(--ink); font-weight: 500; box-shadow: var(--shadow-sm); }
+.result-body { flex: 1; display: flex; overflow: hidden; }
+
+/* Left sidebar */
+.sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid var(--line); background: var(--surface); display: flex; flex-direction: column; overflow-y: auto; }
+.sidebar-section { padding: 12px; border-bottom: 1px solid var(--line); }
+.sidebar-title { font-size: 10px; font-weight: 600; text-transform: uppercase; color: var(--muted); letter-spacing: .04em; margin-bottom: 8px; }
+.filter-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px; cursor: pointer; }
+.filter-row:hover { background: var(--surface-alt); }
+.fdot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.filter-row input { accent-color: var(--accent); }
+.filter-row .lbl { flex: 1; font-size: 12px; }
+.filter-row .cnt { font-size: 11px; color: var(--muted); font-weight: 600; }
+.view-mode-btn { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 6px; border: none; background: transparent; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 12px; color: var(--muted); transition: var(--transition); }
+.view-mode-btn:hover { background: var(--surface-alt); color: var(--ink); }
+.view-mode-btn.on { background: var(--accent-light); color: var(--accent); font-weight: 500; }
+.sidebar-action { display: block; width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); font-family: inherit; font-size: 12px; color: var(--muted); cursor: pointer; margin-bottom: 6px; text-align: center; transition: var(--transition); }
+.sidebar-action:hover { background: var(--surface-alt); color: var(--ink); }
+.canvas-height-row { display: flex; align-items: center; gap: 8px; padding: 0 2px; }
+.canvas-height-row label { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.canvas-height-row input[type=range] { flex: 1; accent-color: var(--accent); }
+
+/* Graph canvas */
+.graph-canvas { flex: 1; background: var(--bg); position: relative; overflow: hidden; }
+.gcvs { width: 100%; height: 100%; position: relative; }
+.gnode { position: absolute; min-width: 138px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 8px 10px; cursor: pointer; box-shadow: var(--shadow-sm); transition: all var(--transition); }
+.gnode:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+.gnode.sel { outline: 2px solid var(--accent); outline-offset: 2px; }
+.gnkind { font-size: 10px; text-transform: uppercase; font-weight: 600; margin-bottom: 3px; }
+.gnlabel { font-size: 12px; font-weight: 500; }
+.gnsub { font-size: 11px; color: var(--muted); margin-top: 1px; }
+.gnode.dfn { background: var(--node-dfn-bg); border-color: var(--node-dfn-border); }
+.gnode.dfn .gnkind { color: #64748b; }
+.gnode.thm { background: var(--node-thm-bg); border-color: var(--node-thm-border); border-radius: 999px; min-width: 160px; }
+.gnode.thm .gnkind { color: var(--ok); }
+.gnode.lem { background: var(--node-lem-bg); border-color: var(--node-lem-border); }
+.gnode.lem .gnkind { color: var(--accent); }
+.gnode.cor { background: var(--node-cor-bg); border-color: var(--node-cor-border); }
+.gnode.cor .gnkind { color: #6b3fa0; }
+.edge-svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+.edge-svg line { stroke-width: 1.5; }
+.e-dep { stroke: #b8c4cf; }
+.e-def { stroke: var(--accent-mid); }
+
+/* Right detail drawer (slides in) */
+.detail-drawer { width: 0; flex-shrink: 0; overflow: hidden; border-left: 1px solid var(--line); background: var(--surface); transition: width 250ms cubic-bezier(.25,.46,.45,.94); }
+.detail-drawer.open { width: 320px; }
+.dd-header { padding: 12px 14px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
+.dd-body { padding: 14px; display: flex; flex-direction: column; gap: 14px; min-width: 320px; }
+.dd-section { }
+.dd-section + .dd-section { padding-top: 14px; border-top: 1px solid var(--line); }
+.dd-section h5 { font-size: 10px; font-weight: 600; text-transform: uppercase; color: var(--muted); letter-spacing: .04em; margin-bottom: 6px; }
+.dd-section p { font-size: 13px; line-height: 1.65; }
+.lean-hint { font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 11px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; line-height: 1.5; color: var(--muted); }
+
+/* ── Action feedback ── */
+.action-feedback { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 6px; font-size: 12px; }
+.af-running { color: var(--accent); background: var(--accent-light); }
+.af-done { color: var(--ok); background: var(--ok-bg); }
+.af-error { color: var(--danger); background: var(--danger-bg); }
+
+.demo-label { position: fixed; top: 0; left: 50%; transform: translateX(-50%); background: #17202a; color: #fff; font-size: 11px; padding: 3px 14px; border-radius: 0 0 6px 6px; z-index: 100; }
+.page-toggle { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; display: flex; gap: 6px; box-shadow: var(--shadow); z-index: 100; }
+.page-toggle button { padding: 5px 14px; border-radius: 999px; border: none; cursor: pointer; font-size: 12px; font-family: inherit; transition: var(--transition); background: transparent; color: var(--muted); }
+.page-toggle button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body>
+<div class="demo-label">DEMO B — 组件拆分 + 视图动画（推荐方案）</div>
+
+<!-- HEADER -->
+<header class="header">
+  <div class="brand"><div class="brand-mark">M</div>MathGraph</div>
+  <div class="header-meta" id="hdr-meta" style="display:none">
+    <div class="header-meta-dot"></div>
+    <span style="font-size:12px;font-weight:500">noetherian_rings.md</span>
+    <span class="stat-pill"><span>12</span> 节点</span>
+    <span class="stat-pill"><span>8</span> 关系</span>
+  </div>
+  <div class="header-sep"></div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <div id="btn-export" style="display:none"><button class="btn btn-ghost btn-sm">导出 HTML ↗</button></div>
+    <button class="btn btn-ghost btn-sm" id="btn-login">登录 / 注册</button>
+    <button class="btn btn-ghost btn-sm" id="btn-history" style="display:none">历史 ↗</button>
+    <button class="btn btn-ghost btn-sm" id="btn-settings">⚙</button>
+  </div>
+</header>
+
+<!-- UPLOAD VIEW -->
+<div class="view active" id="v-upload">
+  <div class="upload-page">
+    <div class="upload-hero">
+      <h1>将数学文档转化为知识图谱</h1>
+      <p>支持 Markdown · LaTeX 数学文本 · 多种可视化模式</p>
+    </div>
+    <div class="upload-card">
+      <div class="dropzone" onclick="goResult()">
+        <div class="dropzone-icon">↑</div>
+        <div class="dropzone-primary">拖拽 Markdown 或 LaTeX 文件至此</div>
+        <div class="dropzone-sub">.md · .txt · 或点击选择</div>
+      </div>
+      <div class="or-divider">或直接粘贴文本</div>
+      <textarea class="area" placeholder="在此粘贴 Markdown / LaTeX 数学文本…" rows="5"></textarea>
+      <div class="config-panel">
+        <button class="config-toggle" onclick="var b=this.nextElementSibling;b.classList.toggle('hidden');this.querySelector('span:last-child').textContent=b.classList.contains('hidden')?'▼':'▲'">
+          <span style="display:flex;align-items:center;gap:8px;font-weight:500">⚙ LLM 配置 <span class="chip chip-amber">未填写</span></span>
+          <span>▼</span>
+        </button>
+        <div class="config-body hidden">
+          <div class="field"><label>API 地址</label><input placeholder="https://api.openai.com/v1"></div>
+          <div class="field"><label>模型名称</label><input placeholder="gpt-4o"></div>
+          <div class="field full"><label>API 密钥</label><input type="password" placeholder="sk-..."></div>
+        </div>
+      </div>
+      <button class="btn btn-primary submit-btn" onclick="goProcessing()">开始分析</button>
+    </div>
+  </div>
+</div>
+
+<!-- PROCESSING VIEW -->
+<div class="view" id="v-processing">
+  <div class="processing-page">
+    <div class="processing-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <h2>正在分析文档…</h2>
+        <span class="chip chip-blue">进行中</span>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:14px">noetherian_rings.md · 正在运行第 8/13 阶段</div>
+      <div class="progress-bar-outer"><div class="progress-bar-inner" id="prog-bar"></div></div>
+      <div class="stages">
+        <div class="stage-row"><div class="stage-dot done"></div><div class="stage-name done">文本规范化</div><span class="chip chip-green" style="font-size:10px">完成</span></div>
+        <div class="stage-row"><div class="stage-dot done"></div><div class="stage-name done">语义分块</div><span class="chip chip-green" style="font-size:10px">完成</span></div>
+        <div class="stage-row"><div class="stage-dot done"></div><div class="stage-name done">提取定理/定义块</div><span class="chip chip-green" style="font-size:10px">完成</span></div>
+        <div class="stage-row"><div class="stage-dot done"></div><div class="stage-name done">拆分复合节点</div><span class="chip chip-green" style="font-size:10px">完成</span></div>
+        <div class="stage-row"><div class="stage-dot done"></div><div class="stage-name done">生成标题</div><span class="chip chip-green" style="font-size:10px">完成</span></div>
+        <div class="stage-row"><div class="stage-dot done"></div><div class="stage-name done">提取逻辑三元组</div><span class="chip chip-green" style="font-size:10px">完成</span></div>
+        <div class="stage-row"><div class="stage-dot active"></div><div class="stage-name active">构建关系网络</div><span class="action-feedback af-running" style="font-size:10px;padding:2px 7px">运行中</span></div>
+        <div class="stage-row"><div class="stage-dot pending"></div><div class="stage-name pending">修复缺失引用</div></div>
+        <div class="stage-row"><div class="stage-dot pending"></div><div class="stage-name pending">覆盖率检验</div></div>
+        <div class="stage-row"><div class="stage-dot pending"></div><div class="stage-name pending">规范化谓词</div></div>
+        <div class="stage-row"><div class="stage-dot pending"></div><div class="stage-name pending">生成最终输出</div></div>
+      </div>
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line);display:flex;justify-content:flex-end">
+        <button class="btn btn-ghost btn-sm" onclick="goResult()">跳过，查看当前结果 →</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- RESULT VIEW -->
+<div class="view" id="v-result">
+  <div class="result-page">
+    <!-- Sub-header with layout tabs -->
+    <div class="result-subheader">
+      <div class="layout-tabs">
+        <button class="layout-tab" onclick="setTab(this,'md')">MD+图谱</button>
+        <button class="layout-tab active" onclick="setTab(this,'full')">全图谱</button>
+        <button class="layout-tab" onclick="setTab(this,'gn')">图谱+节点</button>
+      </div>
+      <div class="header-sep"></div>
+      <span class="action-feedback af-done" id="save-fb" style="display:none">✓ 已自动保存</span>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('save-fb').style.display='';setTimeout(()=>document.getElementById('save-fb').style.display='none',2000)">保存</button>
+    </div>
+
+    <div class="result-body">
+      <!-- Left sidebar -->
+      <div class="sidebar">
+        <div class="sidebar-section">
+          <div class="sidebar-title">节点类型</div>
+          <div class="filter-row"><input type="checkbox" checked><div class="fdot" style="background:var(--node-dfn-border)"></div><span class="lbl">定义</span><span class="cnt">4</span></div>
+          <div class="filter-row"><input type="checkbox" checked><div class="fdot" style="background:var(--node-thm-border)"></div><span class="lbl">定理</span><span class="cnt">3</span></div>
+          <div class="filter-row"><input type="checkbox" checked><div class="fdot" style="background:var(--node-lem-border)"></div><span class="lbl">引理</span><span class="cnt">2</span></div>
+          <div class="filter-row"><input type="checkbox" checked><div class="fdot" style="background:var(--node-cor-border)"></div><span class="lbl">推论</span><span class="cnt">2</span></div>
+          <div class="filter-row"><input type="checkbox"><div class="fdot" style="background:var(--node-axm-border)"></div><span class="lbl">公理</span><span class="cnt">1</span></div>
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-title">布局视图</div>
+          <button class="view-mode-btn on" onclick="setMode(this)">⊙ 力导向</button>
+          <button class="view-mode-btn" onclick="setMode(this)">≡ 层级</button>
+          <button class="view-mode-btn" onclick="setMode(this)">↕ 文档顺序</button>
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-title">画布高度</div>
+          <div class="canvas-height-row">
+            <label>400px</label>
+            <input type="range" min="200" max="900" value="400">
+          </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-title">操作</div>
+          <button class="sidebar-action">⊡ 适应窗口</button>
+          <button class="sidebar-action">⊞ 全部显示</button>
+        </div>
+      </div>
+
+      <!-- Graph canvas -->
+      <div class="graph-canvas">
+        <div class="gcvs">
+          <svg class="edge-svg">
+            <defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#b8c4cf"/></marker></defs>
+            <line x1="215" y1="95" x2="380" y2="175" class="e-dep" marker-end="url(#arr)"/>
+            <line x1="215" y1="95" x2="155" y2="255" class="e-def" marker-end="url(#arr)"/>
+            <line x1="380" y1="175" x2="510" y2="280" class="e-dep" marker-end="url(#arr)"/>
+            <line x1="155" y1="255" x2="365" y2="355" class="e-dep" marker-end="url(#arr)"/>
+            <line x1="510" y1="280" x2="365" y2="355" class="e-dep" marker-end="url(#arr)"/>
+            <line x1="365" y1="355" x2="240" y2="440" class="e-def" marker-end="url(#arr)"/>
+            <line x1="365" y1="355" x2="520" y2="420" class="e-dep" marker-end="url(#arr)"/>
+          </svg>
+          <div class="gnode dfn sel" style="left:130px;top:58px" onclick="openDetail(this,'定义 1.1','Noetherian 环','设 R 为交换环。若 R 的每个理想均为有限生成的，则称 R 为 Noetherian 环。','主体：交换环 R · 条件：每个理想有限生成 · 结论：R 为 Noetherian 环','IsNoetherianRing R')">
+            <div class="gnkind">定义</div><div class="gnlabel">Noetherian 环</div><div class="gnsub">定义 1.1</div>
+          </div>
+          <div class="gnode thm" style="left:288px;top:134px" onclick="openDetail(this,'定理 2.1','Hilbert 基定理','若 R 为 Noetherian 环，则多项式环 R[x] 也是 Noetherian 环。','主体：R[x] · 条件：R Noetherian · 结论：R[x] Noetherian','Polynomial.isNoetherianRing')">
+            <div class="gnkind">定理</div><div class="gnlabel">Hilbert 基定理</div><div class="gnsub">定理 2.1</div>
+          </div>
+          <div class="gnode dfn" style="left:68px;top:215px" onclick="openDetail(this,'定义 1.2','有限生成模','设 M 为 R-模，若存在有限集合 S ⊆ M 使 M = RS，则称 M 为有限生成模。','主体：R-模 M · 条件：有限生成集 S 存在 · 结论：M 有限生成','Module.FinitelyGenerated')">
+            <div class="gnkind">定义</div><div class="gnlabel">有限生成模</div><div class="gnsub">定义 1.2</div>
+          </div>
+          <div class="gnode lem" style="left:420px;top:240px" onclick="openDetail(this,'引理 2.3','升链条件等价','环 R 满足升链条件当且仅当每个非空理想族有极大元。','主体：环 R · 升链条件 ↔ 极大元存在','IsNoetherian.iff_wellFounded')">
+            <div class="gnkind">引理</div><div class="gnlabel">升链条件等价</div><div class="gnsub">引理 2.3</div>
+          </div>
+          <div class="gnode thm" style="left:270px;top:318px" onclick="openDetail(this,'定理 3.1','Cohen 定理','交换环 R 为 Noetherian 当且仅当每个素理想均有限生成。','主体：交换环 R · 条件：每个素理想有限生成 · 结论：R Noetherian','Ideal.noetherian_of_prime_fg')">
+            <div class="gnkind">定理</div><div class="gnlabel">Cohen 定理</div><div class="gnsub">定理 3.1</div>
+          </div>
+          <div class="gnode cor" style="left:150px;top:405px" onclick="openDetail(this,'推论 3.2','多项式推论','域上的多项式环 k[x₁,…,xₙ] 为 Noetherian 环。','主体：k[x₁,…,xₙ] · 条件：k 为域 · 结论：Noetherian','MvPolynomial.isNoetherianRing')">
+            <div class="gnkind">推论</div><div class="gnlabel">多项式推论</div><div class="gnsub">推论 3.2</div>
+          </div>
+          <div class="gnode lem" style="left:440px;top:385px" onclick="openDetail(this,'引理 3.4','理想格引理','Noetherian 环的理想格满足 DCC。','主体：理想格 · 条件：Noetherian · 结论：满足 DCC','Ideal.wellFounded')">
+            <div class="gnkind">引理</div><div class="gnlabel">理想格引理</div><div class="gnsub">引理 3.4</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Detail drawer -->
+      <div class="detail-drawer open" id="detail-drawer">
+        <div class="dd-header">
+          <div class="fdot" style="width:12px;height:12px;background:var(--node-dfn-border)"></div>
+          <strong id="dd-label" style="font-size:13px">定义 1.1</strong>
+          <div style="flex:1"></div>
+          <button class="btn btn-ghost btn-sm" onclick="document.getElementById('detail-drawer').classList.remove('open')">×</button>
+        </div>
+        <div class="dd-body">
+          <div class="dd-section">
+            <h5>标题</h5>
+            <p style="font-size:15px;font-weight:600" id="dd-title">Noetherian 环</p>
+          </div>
+          <div class="dd-section">
+            <h5>内容</h5>
+            <p id="dd-content" style="line-height:1.7">设 R 为交换环。若 R 的每个理想均为有限生成的，则称 R 为 Noetherian 环。</p>
+          </div>
+          <div class="dd-section">
+            <h5>逻辑结构</h5>
+            <p id="dd-logic" style="font-size:12px;line-height:1.75;color:var(--muted)">主体：交换环 R · 条件：每个理想有限生成 · 结论：R 为 Noetherian 环</p>
+          </div>
+          <div class="dd-section">
+            <h5>形式化提示</h5>
+            <div class="lean-hint" id="dd-lean">IsNoetherianRing R</div>
+          </div>
+          <div class="dd-section">
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <span class="chip chip-blue">定义</span>
+              <span class="chip chip-green">已提取</span>
+              <span class="chip chip-gray">sec-1</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Page toggle -->
+<div class="page-toggle">
+  <button class="on" onclick="showView('upload')" id="t-up">上传页</button>
+  <button onclick="showView('processing')" id="t-pro">处理中</button>
+  <button onclick="showView('result')" id="t-res">结果页</button>
+</div>
+
+<script>
+function showView(v) {
+  ['upload','processing','result'].forEach(x=>{
+    var el=document.getElementById('v-'+x);
+    el.classList.toggle('active', x===v);
+  });
+  document.getElementById('t-up').className = v==='upload'?'on':'';
+  document.getElementById('t-pro').className = v==='processing'?'on':'';
+  document.getElementById('t-res').className = v==='result'?'on':'';
+  document.getElementById('hdr-meta').style.display = v==='result'?'':'none';
+  document.getElementById('btn-export').style.display = v==='result'?'':'none';
+  document.getElementById('btn-history').style.display = v==='result'?'':'none';
+}
+function goProcessing() { showView('processing'); setTimeout(()=>showView('result'),1400); }
+function goResult() { showView('result'); }
+function setTab(el, t) { document.querySelectorAll('.layout-tab').forEach(b=>b.className='layout-tab'); el.className='layout-tab active'; }
+function setMode(el) { document.querySelectorAll('.view-mode-btn').forEach(b=>b.className='view-mode-btn'); el.className='view-mode-btn on'; }
+function openDetail(el, label, title, content, logic, lean) {
+  document.querySelectorAll('.gnode').forEach(n=>n.classList.remove('sel')); el.classList.add('sel');
+  document.getElementById('dd-label').textContent=label;
+  document.getElementById('dd-title').textContent=title;
+  document.getElementById('dd-content').textContent=content;
+  document.getElementById('dd-logic').textContent=logic;
+  document.getElementById('dd-lean').textContent=lean;
+  document.getElementById('detail-drawer').classList.add('open');
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>MathWeaver — Evans5-short.md</title>
+<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Inter,system-ui,sans-serif;background:#F7F6F2;color:#111110;height:100vh;display:flex;flex-direction:column}
+header{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;background:#fff;border-bottom:1px solid #E2DFD8;flex-shrink:0}
+header h1{font-size:15px;font-weight:600;letter-spacing:.01em}
+header span{font-size:12px;color:#6B6860}
+#app{display:flex;flex:1;overflow:hidden}
+#graph{flex:1;background:#EFEDE7}
+#detail{width:380px;background:#fff;border-left:1px solid #E2DFD8;overflow-y:auto;padding:24px;flex-shrink:0;display:none}
+#detail.open{display:block}
+.badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600;color:#fff;margin-right:6px}
+.section{margin-top:20px}
+.section h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#6B6860;margin-bottom:8px}
+.tag{display:inline-block;background:#F0EEE8;border:1px solid #E2DFD8;border-radius:3px;padding:2px 7px;font-size:12px;margin:2px 2px 2px 0}
+.risk{background:#FEF3C7;border:1px solid #FCD34D;border-radius:4px;padding:8px 10px;font-size:12px;margin-top:6px}
+pre{background:#1C1C1E;color:#E5E5E7;padding:12px;border-radius:4px;font-size:11px;overflow-x:auto;white-space:pre-wrap;font-family:'JetBrains Mono',monospace}
+</style>
+</head>
+<body>
+<header>
+  <h1>MathWeaver — Evans5-short.md</h1>
+  <span id="stats"></span>
+</header>
+<div id="app">
+  <div id="graph"></div>
+  <div id="detail">
+    <div id="detail-content"></div>
+  </div>
+</div>
+<script>
+const NODES_RAW = [{"id": 0, "node_type": "定义", "title_zh": "赫尔德连续函数的定义", "title_en": "Definition of Hölder Continuous Functions", "label": "", "content": "Assume $\\operatorname{Subset}(U,\\mathbb { R } ^ { n })$ is open and $0 < \\gamma \\leq 1$.  We have previously considered the class of Lipschitz continuous functions $\\operatorname{Mapping}(u, U, \\mathbb { R })$ , which by definition satisfy the estimate$$\\operatorname{Abs}( u ( x ) - u ( y ) ) \\leq C \\operatorname{Abs}( x - y ) \\quad ( x , y \\in U )$$for some constant $C$.  Now (1) of course implies $\\pmb { u }$ is continuous, and more importantly provides a uniform modulus of continuity.  It turns out to be useful to consider also functions $\\textbf { \\em u }$ satisfying a variant of (1), namely$$\\operatorname{Abs}( u ( x ) - u ( y ) ) \\leq C \\operatorname{Abs}( x - y ) ^ { \\gamma } \\quad ( x , y \\in U )$$for some constant $C$.  Such a function is said to be Hölder continuous with exponent $\\gamma$.", "statement_form": "implication", "subject": [], "conditions": [], "conclusions": [], "proof": "", "formalization_guidance": {"primary_statement": "Assume $U \\subset \\mathbb { R } ^ { n }$ is open and $0 < \\gamma \\leq 1$.  We have previously considered the class of Lipschitz continuous functions $u : U \\to \\mathbb { R }$ , which by definition satisfy the estimate$$| u ( x ) - u ( y ) | \\leq C | x - y | \\quad ( x , y \\in U )$$for some constant $C$.  Now (1) of course implies $\\pmb { u }$ is continuous, and more importantly provides a uniform modulus of continuity.  It turns out to be useful to consider also functions $\\textbf { \\em u }$ satisfying a variant of (1), namely$$| u ( x ) - u ( y ) | \\leq C | x - y | ^ { \\gamma } \\quad ( x , y \\in U )$$for some constant $C$.  Such a function is said to be Hölder continuous with exponent $\\gamma$.", "statement_skeleton": {"kind": "definition", "source": "rule", "triggers": ["definition marker"], "expected_connectives": ["definitional body", "iff/predicate expansion"], "forbidden_connectives": [], "notes": ["定义类节点应优先展开题目条件，避免直接用 Mathlib 实现函数替代定义。"]}, "role_bindings": [], "concept_hints": [], "context_policy": ["Primary statement is authoritative.", "Auxiliary context may disambiguate terms but must not add new assumptions.", "Title and label help naming only; they must not override the statement body.", "Do not add nonzero, positivity, maximality, finiteness, or strictness assumptions unless present in the primary statement."], "semantic_risks": []}}, {"id": 1, "node_type": "定义", "title_zh": "有界连续函数的 sup 范数", "title_en": "Sup norm for bounded continuous functions", "label": "", "content": "(i) If $u \\in \\operatorname{Map}(U,\\mathbb{R})$ is bounded and continuous, we write \\operatorname{Norm}_{C(\\bar{U})}(u) := \\operatorname*{sup}_{x \\in U} \\operatorname{Abs}(u(x)).", "statement_form": "equality", "subject": [], "conditions": [], "conclusions": [], "proof": "", "formalization_guidance": {"primary_statement": "(i) If $u : U \\to \\mathbb { R }$ is bounded and continuous, we write\\| u \\| _ { C ( { \\bar { U } } ) } : = \\operatorname* { s u p } _ { x \\in U } | u ( x ) |.", "statement_skeleton": {"kind": "definition", "source": "rule", "triggers": ["definition marker"], "expected_connectives": ["definitional body", "iff/predicate expansion"], "forbidden_connectives": [], "notes": ["定义类节点应优先展开题目条件，避免直接用 Mathlib 实现函数替代定义。"]}, "role_bindings": [], "concept_hints": [], "context_policy": ["Primary statement is authoritative.", "Auxiliary context may disambiguate terms but must not add new assumptions.", "Title and label help naming only; they must not override the statement body.", "Do not add nonzero, positivity, maximality, finiteness, or strictness assumptions unless present in the primary statement."], "semantic_risks": []}}, {"id": 2, "node_type": "定义", "title_zh": "Hölder半范数与Hölder范数的定义", "title_en": "Definition of Hölder Seminorm and Hölder Norm", "label": "", "content": "(ii) The $\\gamma ^ { t h }$ -Hölder seminorm of $u : Mapping(u, U, \\mathbb{R})$ is$$[ u ] _ { { \\cal C } ^ { 0 , \\gamma } ( \\bar { U } ) } : = \\operatorname* { s u p } _ { \\stackrel { x , y \\in U } { x \\neq y } } \\left\\{ \\frac { Abs(u ( x ) - u ( y )) } { Abs(x - y)^{\\gamma} } \\right\\} ,$$and the $\\gamma ^ { t h }$ -Hölder norm is$$\\| u \\| _ { C ^ { 0 , \\gamma } ( \\bar { U } ) } : = \\| u \\| _ { C ( \\bar { U } ) } + [ u ] _ { C ^ { 0 , \\gamma } ( \\bar { U } ) }.", "statement_form": "equality", "subject": [], "conditions": [], "conclusions": [], "proof": "", "formalization_guidance": {"primary_statement": "(ii) The $\\gamma ^ { t h }$ -Hölder seminorm of $u : U \\to \\mathbb { R }$ is$$[ u ] _ { { \\cal C } ^ { 0 , \\gamma } ( \\bar { U } ) } : = \\operatorname* { s u p } _ { \\stackrel { x , y \\in U } { x \\neq y } } \\left\\{ \\frac { \\vert u ( x ) - u ( y ) \\vert } { \\vert x - y \\vert ^ { \\gamma } } \\right\\} ,$$and the $\\gamma ^ { t h }$ -Hölder norm is$$\\| u \\| _ { C ^ { 0 , \\gamma } ( \\bar { U } ) } : = \\| u \\| _ { C ( \\bar { U } ) } + [ u ] _ { C ^ { 0 , \\gamma } ( \\bar { U } ) }.", "statement_skeleton": {"kind": "definition", "source": "rule", "triggers": ["definition marker"], "expected_connectives": ["definitional body", "iff/predicate expansion"], "forbidden_connectives": [], "notes": ["定义类节点应优先展开题目条件，避免直接用 Mathlib 实现函数替代定义。"]}, "role_bindings": [], "concept_hints": [], "context_policy": ["Primary statement is authoritative.", "Auxiliary context may disambiguate terms but must not add new assumptions.", "Title and label help naming only; they must not override the statement body.", "Do not add nonzero, positivity, maximality, finiteness, or strictness assumptions unless present in the primary statement."], "semantic_risks": []}}, {"id": 3, "node_type": "定义", "title_zh": "Hölder 空间 $C^{k,\\gamma}(\\bar{U})$", "title_en": "Hölder Space $C^{k,\\gamma}(\\bar{U})$", "label": "", "content": "The Hölder space$$C ^ { k , \\gamma } ( \\bar { U } )$$consists of all functions $u \\in C ^ { k } ( \\hat { U } )$ for which the norm$$\\operatorname{Norm}(u) _ { C ^ { k , \\gamma } ( \\bar { U } ) } : = \\sum _ { \\Abs{\\alpha} \\leq k } \\operatorname{Norm}(D^\\alpha u) _ { C ( \\bar { U } ) } + \\sum _ { \\Abs{\\alpha} = k } [ D ^ { \\alpha } u ] _ { C ^ { 0 , \\gamma } ( \\bar { U } ) }$$is finite. So the space $C ^ { k , \\gamma } ( { \\bar { U } } )$ consists of those functions $\\textbf { \\em u }$ that are $k \\mathrm {.}$ -times continuously differentiable and whose $k ^ { t h }$ -partial derivatives are Hölder continuous with exponent $\\gamma$.", "statement_form": "equivalence", "subject": [], "conditions": [], "conclusions": [], "proof": "", "formalization_guidance": {"primary_statement": "The Hölder space$$C ^ { k , \\gamma } ( \\bar { U } )$$consists of all functions $u \\in C ^ { k } ( \\hat { U } )$ for which the norm$$\\| u \\| _ { C ^ { k , \\gamma } ( \\bar { U } ) } : = \\sum _ { | \\alpha | \\leq k } \\| D ^ { \\alpha } u \\| _ { C ( \\bar { U } ) } + \\sum _ { | \\alpha | = k } [ D ^ { \\alpha } u ] _ { C ^ { 0 , \\gamma } ( \\bar { U } ) }$$is finite. So the space $C ^ { k , \\gamma } ( { \\bar { U } } )$ consists of those functions $\\textbf { \\em u }$ that are $k \\mathrm {.}$ -times continuously differentiable and whose $k ^ { t h }$ -partial derivatives are Hölder continuous with exponent $\\gamma$.", "statement_skeleton": {"kind": "definition", "source": "rule", "triggers": ["definition marker"], "expected_connectives": ["definitional body", "iff/predicate expansion"], "forbidden_connectives": [], "notes": ["定义类节点应优先展开题目条件，避免直接用 Mathlib 实现函数替代定义。"]}, "role_bindings": [], "concept_hints": [], "context_policy": ["Primary statement is authoritative.", "Auxiliary context may disambiguate terms but must not add new assumptions.", "Title and label help naming only; they must not override the statement body.", "Do not add nonzero, positivity, maximality, finiteness, or strictness assumptions unless present in the primary statement."], "semantic_risks": []}}, {"id": 4, "node_type": "定义", "title_zh": "赋范线性空间中序列的收敛定义", "title_en": "Definition of Sequence Convergence in Normed Linear Spaces", "label": "", "content": "A normed linear space $\\Subset(\\{ u _ { k } \\} _ { k = 1 } ^ { \\infty }, X)$ converges to $u \\in X$ , written $\\ConvergesTo(u _ { k }, u)$ , if $\\begin{array} { r } { \\operatorname* { l i m } _ { k  \\infty } \\Norm(u _ { k } - u) = 0 } \\end{array}$.", "statement_form": "equality", "subject": [], "conditions": [], "conclusions": [], "proof": "", "formalization_guidance": {"primary_statement": "A normed linear space $\\{ u _ { k } \\} _ { k = 1 } ^ { \\infty }$ $\\subset X$ converges to $u \\in X$ , written $u _ { k } \\to u$ , if $\\begin{array} { r } { \\operatorname* { l i m } _ { k  \\infty } \\| u _ { k } - u \\| = 0 } \\end{array}$.", "statement_skeleton": {"kind": "definition", "source": "rule", "triggers": ["definition marker"], "expected_connectives": ["definitional body", "iff/predicate expansion"], "forbidden_connectives": [], "notes": ["定义类节点应优先展开题目条件，避免直接用 Mathlib 实现函数替代定义。"]}, "role_bindings": [], "concept_hints": [], "context_policy": ["Primary statement is authoritative.", "Auxiliary context may disambiguate terms but must not add new assumptions.", "Title and label help naming only; they must not override the statement body.", "Do not add nonzero, positivity, maximality, finiteness, or strictness assumptions unless present in the primary statement."], "semantic_risks": []}}, {"id": 5, "node_type": "定义", "title_zh": "Banach空间的定义", "title_en": "Definition of Banach Space", "label": "", "content": "A Banach space is then a normed linear space which is complete, that is, within which each Cauchy sequence converges.", "statement_form": "implication", "subject": [], "conditions": [], "conclusions": [], "proof": "", "formalization_guidance": {"primary_statement": "A Banach space is then a normed linear space which is complete, that is, within which each Cauchy sequence converges.", "statement_skeleton": {"kind": "definition", "source": "rule", "triggers": ["definition marker"], "expected_connectives": ["definitional body", "iff/predicate expansion"], "forbidden_connectives": [], "notes": ["定义类节点应优先展开题目条件，避免直接用 Mathlib 实现函数替代定义。"]}, "role_bindings": [], "concept_hints": [], "context_policy": ["Primary statement is authoritative.", "Auxiliary context may disambiguate terms but must not add new assumptions.", "Title and label help naming only; they must not override the statement body.", "Do not add nonzero, positivity, maximality, finiteness, or strictness assumptions unless present in the primary statement."], "semantic_risks": []}}, {"id": 6, "node_type": "定义", "title_zh": "Test Function Space \\(C_c^{\\infty}(U)\\)", "title_en": "Test Function Space \\(C_c^{\\infty}(U)\\)", "label": "", "content": "Let $C _ { c } ^ { \\infty } ( U )$ denote the space of infinitely differentiable functions $\\phi : \\text{Mapping}(U,\\mathbb{R})$ , with compact support in $U$. We will call a function $\\phi$ belonging to $C _ { c } ^ { \\infty } ( U )$ a test function.", "statement_form": "equivalence", "subject": [], "conditions": [], "conclusions": [], "proof": "", "formalization_guidance": {"primary_statement": "Let $C _ { c } ^ { \\infty } ( U )$ denote the space of infinitely differentiable functions $\\phi : U \\to { \\mathbb { R } }$ , with compact support in $U$. We will call a function $\\phi$ belonging to $C _ { c } ^ { \\infty } ( U )$ a test function.", "statement_skeleton": {"kind": "definition", "source": "rule", "triggers": ["definition marker"], "expected_connectives": ["definitional body", "iff/predicate expansion"], "forbidden_connectives": [], "notes": ["定义类节点应优先展开题目条件，避免直接用 Mathlib 实现函数替代定义。"]}, "role_bindings": [], "concept_hints": [], "context_policy": ["Primary statement is authoritative.", "Auxiliary context may disambiguate terms but must not add new assumptions.", "Title and label help naming only; they must not override the statement body.", "Do not add nonzero, positivity, maximality, finiteness, or strictness assumptions unless present in the primary statement."], "semantic_risks": []}}, {"id": 7, "node_type": "引理", "title_zh": "弱偏导数的唯一性", "title_en": "Uniqueness of Weak Partial Derivatives", "label": "", "content": "$A$ weak $\\alpha ^ { t h }$ -partial derivative of $\\textbf { \\em u }$ , if it exists, is uniquely defined up to a set of measure zero.", "statement_form": "implication", "subject": ["u", "weak $\\alpha^{th}$-partial derivative"], "conditions": ["u has a weak $\\alpha^{th}$-partial derivative"], "conclusions": ["the weak $\\alpha^{th}$-partial derivative of u is uniquely defined up to a set of measure zero."], "proof": "Assume that $v , \\tilde { v } \\in L _ { \\mathrm { l o c } } ^ { 1 } ( U )$ satisfy$$\\int _ { U } u D ^ { \\alpha } \\phi d x = ( - 1 ) ^ { | \\alpha | } \\int _ { U } v \\phi d x = ( - 1 ) ^ { | \\alpha | } \\int _ { U } { \\tilde { v } } \\phi d x$$for all $\\phi \\in C _ { c } ^ { \\infty } ( U )$ . Then$$\\int _ { U } ( v - \\tilde { v } ) \\phi d x = 0$$for all $\\phi \\in C _ { c } ^ { \\infty } ( U )$ ; whence $v - \\tilde { v } = 0$ a.e.", "formalization_guidance": {"primary_statement": "$A$ weak $\\alpha ^ { t h }$ -partial derivative of $\\textbf { \\em u }$ , if it exists, is uniquely defined up to a set of measure zero.", "statement_skeleton": {"kind": "existence", "source": "rule", "triggers": ["existence marker"], "expected_connectives": ["∃"], "forbidden_connectives": [], "notes": []}, "role_bindings": [], "concept_hints": [], "context_policy": ["Primary statement is authoritative.", "Auxiliary context may disambiguate terms but must not add new assumptions.", "Title and label help naming only; they must not override the statement body.", "Do not add nonzero, positivity, maximality, finiteness, or strictness assumptions unless present in the primary statement."], "semantic_risks": []}}, {"id": 8, "node_type": "定义", "title_zh": "弱偏导数的定义", "title_en": "Definition of Weak Partial Derivative", "label": "", "content": "Suppose $u , v \\in L _ { \\mathrm { l o c } } ^ { 1 } ( U )$ , and $\\pmb { \\alpha }$ is a multiindex.We say that $v$ is the $\\alpha ^ { \\mathrm { t } h }$ -weak partial derivative of $\\textbf { \\em u }$ , written.", "statement_form": "implication", "subject": [], "conditions": [], "conclusions": [], "proof": "", "formalization_guidance": {"primary_statement": "Suppose $u , v \\in L _ { \\mathrm { l o c } } ^ { 1 } ( U )$ , and $\\pmb { \\alpha }$ is a multiindex.We say that $v$ is the $\\alpha ^ { \\mathrm { t } h }$ -weak partial derivative of $\\textbf { \\em u }$ , written.", "statement_skeleton": {"kind": "definition", "source": "rule", "triggers": ["definition marker"], "expected_connectives": ["definitional body", "iff/predicate expansion"], "forbidden_connectives": [], "notes": ["定义类节点应优先展开题目条件，避免直接用 Mathlib 实现函数替代定义。"]}, "role_bindings": [], "concept_hints": [], "context_policy": ["Primary statement is authoritative.", "Auxiliary context may disambiguate terms but must not add new assumptions.", "Title and label help naming only; they must not override the statement body.", "Do not add nonzero, positivity, maximality, finiteness, or strictness assumptions unless present in the primary statement."], "semantic_risks": []}}];
+const EDGES_RAW = [];
+const COLORS = {"定义": "#3B6FBF", "公理": "#7A6B4A", "定理": "#2E7D5E", "引理": "#5B8E78", "推论": "#6B5B9E", "性质": "#4A7A8E", "命题": "#8E6B4A", "例子": "#7A8E4A"};
+
+document.getElementById('stats').textContent =
+  NODES_RAW.length + ' 节点 · ' + EDGES_RAW.length + ' 关系';
+
+const visNodes = NODES_RAW.map(n => ({
+  id: n.id,
+  label: n.title_zh || n.title_en || ('节点' + n.id),
+  color: {background: COLORS[n.node_type] || '#95A5A6', border: 'transparent',
+           highlight: {background: COLORS[n.node_type] || '#95A5A6', border: '#111110'}},
+  font: {color:'#fff', size:13},
+  shape: 'box',
+  margin: 10,
+  _data: n,
+}));
+
+const visEdges = EDGES_RAW.map((e,i) => ({
+  id: i, from: e.from, to: e.to,
+  label: e.label,
+  arrows: 'to',
+  color: {color:'#C8C5BE', highlight:'#1A3A6B'},
+  font: {size:10, color:'#6B6860', strokeWidth:0},
+}));
+
+const network = new vis.Network(
+  document.getElementById('graph'),
+  {nodes: new vis.DataSet(visNodes), edges: new vis.DataSet(visEdges)},
+  {
+    physics:{solver:'forceAtlas2Based',forceAtlas2Based:{gravitationalConstant:-50,centralGravity:0.01,springLength:200,avoidOverlap:0.5},stabilization:{iterations:1500}},
+    interaction:{hover:true,zoomView:true,dragView:true},
+    edges:{smooth:{type:'cubicBezier',roundness:0.5},width:1.5},
+  }
+);
+
+network.on('click', params => {
+  const detail = document.getElementById('detail');
+  const content = document.getElementById('detail-content');
+  if (!params.nodes.length) { detail.classList.remove('open'); return; }
+  const node = NODES_RAW[params.nodes[0]];
+  const color = COLORS[node.node_type] || '#95A5A6';
+  const fg = node.formalization_guidance;
+  const risks = fg && fg.semantic_risks && fg.semantic_risks.length ?
+    fg.semantic_risks.map(r => `<div class="risk">⚠ ${r.message}</div>`).join('') : '';
+  const skeleton = fg && fg.statement_skeleton ?
+    `<div class="tag">${fg.statement_skeleton.kind}</div>` +
+    (fg.statement_skeleton.expected_connectives || []).map(c => `<div class="tag">${c}</div>`).join('') : '';
+  content.innerHTML = `
+    <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:16px">
+      <span class="badge" style="background:${color}">${node.node_type}</span>
+      <h2 style="font-size:16px;font-weight:600">${node.title_zh}</h2>
+    </div>
+    ${node.title_en ? `<div style="font-size:12px;color:#6B6860;margin-bottom:16px">${node.title_en}</div>` : ''}
+    <div class="section">
+      <h3>原文</h3>
+      <p style="font-size:13px;line-height:1.7;color:#1A1A1A">${node.content || '—'}</p>
+    </div>
+    ${node.statement_form ? `<div class="section"><h3>命题形式</h3><div class="tag">${node.statement_form}</div></div>` : ''}
+    ${(node.conditions||[]).length ? `<div class="section"><h3>条件</h3>${(node.conditions||[]).map(c=>`<div class="tag">${typeof c==='string'?c:JSON.stringify(c)}</div>`).join('')}</div>` : ''}
+    ${(node.conclusions||[]).length ? `<div class="section"><h3>结论</h3>${(node.conclusions||[]).map(c=>`<div class="tag">${typeof c==='string'?c:JSON.stringify(c)}</div>`).join('')}</div>` : ''}
+    ${skeleton ? `<div class="section"><h3>形式化骨架</h3>${skeleton}</div>` : ''}
+    ${risks ? `<div class="section"><h3>语义风险</h3>${risks}</div>` : ''}
+  `;
+  detail.classList.add('open');
+});
+</script>
+</body>
+</html>
