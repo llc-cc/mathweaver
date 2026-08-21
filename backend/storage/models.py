@@ -170,6 +170,8 @@ class History(Base):
     stages_done_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     source_format: Mapped[str] = mapped_column(String(32), nullable=False, default="markdown")
     experimental_logic_ir: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 只记录所属任务前缀，访问凭据和服务器绝对路径都不进入业务数据库。
+    object_storage_prefix: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
     )

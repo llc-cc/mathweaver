@@ -42,6 +42,7 @@ class JobSnapshot:
     source_format: str
     experimental_logic_ir: bool
     created_at: datetime
+    object_storage_prefix: str | None = None
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -172,6 +173,7 @@ class LearningRepository:
                 row.stages_done_json = list(snapshot.stages_done)
                 row.source_format = snapshot.source_format
                 row.experimental_logic_ir = bool(snapshot.experimental_logic_ir)
+                row.object_storage_prefix = snapshot.object_storage_prefix
                 row.created_at = snapshot.created_at
                 row.updated_at = utc_now()
             return True
@@ -247,6 +249,7 @@ class LearningRepository:
             "stages_done": list(row.stages_done_json or []),
             "source_format": row.source_format,
             "experimental_logic_ir": bool(row.experimental_logic_ir),
+            "object_storage_prefix": row.object_storage_prefix,
             "updated_at": _iso(row.updated_at),
             "created_at": _iso(row.created_at),
         }

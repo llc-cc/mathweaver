@@ -13,7 +13,7 @@ from sqlalchemy.schema import CreateTable
 
 from storage import database
 from storage.database import configure_database, get_engine, session_scope
-from storage.models import User
+from storage.models import History, User
 
 
 def create_teacher(email: str = "teacher@example.edu") -> User:
@@ -54,6 +54,13 @@ def test_multiple_null_emails_are_allowed():
 
     with session_scope() as session:
         assert len(session.scalars(select(User)).all()) == 2
+
+
+def test_history_object_storage_prefix_is_optional() -> None:
+    column = History.__table__.c.object_storage_prefix
+
+    assert column.nullable is True
+    assert column.type.length == 1024
 
 
 def test_whitespace_emails_normalize_before_unique_indexing():

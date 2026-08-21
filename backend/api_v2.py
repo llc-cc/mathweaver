@@ -1202,6 +1202,7 @@ def _upsert_job_history(job: dict, status: str, user_id: int | None = None) -> b
             source_format=job.get("source_format") or "markdown",
             experimental_logic_ir=bool(job.get("_experimental_logic_ir")),
             created_at=created_at,
+            object_storage_prefix=job.get("_object_storage_prefix"),
         )
         try:
             persisted = _learning_repository.upsert_job_progress(int(owner_id), snapshot)

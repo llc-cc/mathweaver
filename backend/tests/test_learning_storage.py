@@ -97,7 +97,12 @@ def _headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _snapshot(job_id: str, status: str = "running"):
+def _snapshot(
+    job_id: str,
+    status: str = "running",
+    *,
+    object_storage_prefix: str | None = None,
+):
     try:
         from storage.learning_repository import JobSnapshot
     except ImportError as exc:
@@ -118,6 +123,7 @@ def _snapshot(job_id: str, status: str = "running"):
         stages_done=["parse", "segment"],
         source_format="markdown",
         experimental_logic_ir=False,
+        object_storage_prefix=object_storage_prefix,
         created_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
     )
 
@@ -201,6 +207,19 @@ def test_repository_snapshots_survive_memory_clear_and_enforce_owner(users):
     assert repository.get_owned_history(other_id, "job-done") is None
     assert repository.upsert_job_progress(other_id, _snapshot("job-done", "error")) is False
     assert repository.get_owned_history(owner_id, "job-done")["status"] == "done"
+
+
+def test_history_round_trips_object_storage_prefix(users):
+    repository = _repository()
+    owner_id = users[0][0]
+    prefix = f"mathweaver/users/{owner_id}/jobs/job-oss/"
+
+    assert repository.upsert_job_progress(
+        owner_id,
+        _snapshot("job-oss", object_storage_prefix=prefix),
+    ) is True
+
+    assert repository.get_owned_history(owner_id, "job-oss")["object_storage_prefix"] == prefix
 
 
 def test_persisted_status_and_result_are_available_after_jobs_clear(authenticated_clients):
