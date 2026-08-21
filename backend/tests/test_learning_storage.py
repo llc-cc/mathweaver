@@ -31,6 +31,7 @@ import api_v2
 from storage import database as storage_database
 from storage.database import configure_database, get_engine, session_scope
 from storage.models import Base, History, User
+from storage.object_storage import ObjectStorageError
 
 
 @pytest.fixture(autouse=True)
@@ -97,11 +98,60 @@ def _headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+class FakeObjectStorage:
+    def __init__(self, *, fail_sync: bool = False) -> None:
+        self.fail_sync = fail_sync
+        self.synced: list[tuple[int, str]] = []
+        self.restored: list[tuple[int, str]] = []
+        self.deleted: list[tuple[int, str]] = []
+
+    @staticmethod
+    def task_prefix(user_id: int, job_id: str) -> str:
+        return f"mathweaver/users/{user_id}/jobs/{job_id}/"
+
+    def sync_job(
+        self,
+        user_id: int,
+        job_id: str,
+        artifact_root: Path,
+        source_pdf_root: Path,
+    ) -> str:
+        del artifact_root, source_pdf_root
+        if self.fail_sync:
+            raise ObjectStorageError("OSS object upload failed")
+        self.synced.append((user_id, job_id))
+        return self.task_prefix(user_id, job_id)
+
+    def restore_job(
+        self,
+        user_id: int,
+        job_id: str,
+        artifact_root: Path,
+        source_pdf_root: Path,
+    ) -> bool:
+        self.restored.append((user_id, job_id))
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        (artifact_root / "nodes.json").write_text('[{"id": 1, "title": "定理"}]', encoding="utf-8")
+        (artifact_root / "edges.json").write_text("[]", encoding="utf-8")
+        cache = artifact_root / "_stage_cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "manifest.json").write_text('{"schema_version": 1}', encoding="utf-8")
+        source_pdf_root.mkdir(parents=True, exist_ok=True)
+        (source_pdf_root / "source.pdf").write_bytes(b"%PDF-1.4 restored\n%%EOF")
+        (source_pdf_root / "source.tex").write_text("\\begin{document}x\\end{document}", encoding="utf-8")
+        (source_pdf_root / "compile.log").write_text("restored log", encoding="utf-8")
+        return True
+
+    def delete_job(self, user_id: int, job_id: str) -> None:
+        self.deleted.append((user_id, job_id))
+
+
 def _snapshot(
     job_id: str,
     status: str = "running",
     *,
     object_storage_prefix: str | None = None,
+    source_pdf: dict | None = None,
 ):
     try:
         from storage.learning_repository import JobSnapshot
@@ -115,7 +165,7 @@ def _snapshot(
         edges=[{"from": 1, "to": 1}],
         source_markdown="# Lesson",
         latex_macros={"RR": "\\mathbb{R}"},
-        source_pdf=None,
+        source_pdf=source_pdf,
         stage="build_graph" if status != "done" else None,
         stage_label="构建图谱" if status != "done" else None,
         stage_index=2,
@@ -480,6 +530,37 @@ def test_async_persistence_failure_is_exposed_without_false_success(
     assert job.get("result") is None
 
 
+def test_web_job_syncs_oss_before_database_success(users, tmp_path, monkeypatch):
+    owner_id = users[0][0]
+    job = _install_persisted_live_job(owner_id, tmp_path)
+    storage = FakeObjectStorage()
+    order: list[str] = []
+    original_upsert = api_v2._upsert_job_history
+
+    def tracked_upsert(*args, **kwargs):
+        assert storage.synced == [(owner_id, job["job_id"])]
+        order.append("database")
+        return original_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(api_v2, "_object_storage", storage)
+    monkeypatch.setattr(api_v2, "_upsert_job_history", tracked_upsert)
+
+    assert api_v2._persist_job_with_files(job, "running") is True
+    row = _repository().get_owned_history(owner_id, job["job_id"])
+
+    assert order == ["database"]
+    assert row["object_storage_prefix"] == storage.task_prefix(owner_id, job["job_id"])
+
+
+def test_oss_failure_never_reports_persistence_success(users, tmp_path, monkeypatch):
+    job = _install_persisted_live_job(users[0][0], tmp_path)
+    monkeypatch.setattr(api_v2, "_object_storage", FakeObjectStorage(fail_sync=True))
+
+    assert api_v2._persist_job_state(job, "done") is False
+    assert job["status"] == "error"
+    assert job["error_code"] == "persistence_error"
+
+
 def test_resume_persistence_failure_restores_memory_and_never_starts_worker(
     authenticated_clients, tmp_path, monkeypatch
 ):
@@ -537,6 +618,133 @@ def test_persisted_done_artifact_export_uses_database_json_and_ignores_client_in
         nodes = json.loads(archive.read(nodes_name))
     assert nodes == [{"id": 1, "title": "定理"}]
     assert forbidden.status_code == 404
+
+
+def test_restart_export_restores_owned_artifacts_from_oss(
+    authenticated_clients, monkeypatch
+):
+    client, users, tokens = authenticated_clients
+    owner_id = users[0][0]
+    storage = FakeObjectStorage()
+    prefix = storage.task_prefix(owner_id, "restart-oss-export")
+    assert _repository().upsert_job_progress(
+        owner_id,
+        _snapshot("restart-oss-export", "done", object_storage_prefix=prefix),
+    )
+    api_v2._jobs.clear()
+    monkeypatch.setattr(api_v2, "_object_storage", storage)
+
+    response = client.post(
+        "/api/v2/export/restart-oss-export/artifacts",
+        headers=_headers(tokens[0]),
+    )
+    forbidden = client.post(
+        "/api/v2/export/restart-oss-export/artifacts",
+        headers=_headers(tokens[1]),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["X-MathGraph-Export-Mode"] == "complete"
+    assert storage.restored == [(owner_id, "restart-oss-export")]
+    assert forbidden.status_code == 404
+
+
+def test_source_pdf_and_log_restore_only_after_owner_check(
+    authenticated_clients, monkeypatch
+):
+    client, users, tokens = authenticated_clients
+    owner_id = users[0][0]
+    storage = FakeObjectStorage()
+    job_id = "restart-source-pdf"
+    prefix = storage.task_prefix(owner_id, job_id)
+    source_pdf = {
+        "status": "ready",
+        "available": True,
+        "error": None,
+        "pdf_name": "source.pdf",
+        "source_name": "source.tex",
+        "log_name": "compile.log",
+        "pdf_url": f"/api/v2/source-pdf/{job_id}",
+        "compile_log_url": f"/api/v2/source-pdf/{job_id}/compile-log",
+    }
+    assert _repository().upsert_job_progress(
+        owner_id,
+        _snapshot(
+            job_id,
+            "done",
+            object_storage_prefix=prefix,
+            source_pdf=source_pdf,
+        ),
+    )
+    api_v2._jobs.clear()
+    monkeypatch.setattr(api_v2, "_object_storage", storage)
+
+    pdf = client.get(f"/api/v2/source-pdf/{job_id}", headers=_headers(tokens[0]))
+    log = client.get(
+        f"/api/v2/source-pdf/{job_id}/compile-log",
+        headers=_headers(tokens[0]),
+    )
+    forbidden = client.get(f"/api/v2/source-pdf/{job_id}", headers=_headers(tokens[1]))
+
+    assert pdf.status_code == 200 and pdf.data.startswith(b"%PDF-")
+    assert log.status_code == 200 and b"restored log" in log.data
+    assert storage.restored == [(owner_id, job_id)]
+    assert forbidden.status_code == 404
+
+
+def test_history_resume_restores_cache_before_availability_check(
+    authenticated_clients, monkeypatch
+):
+    client, users, tokens = authenticated_clients
+    owner_id = users[0][0]
+    storage = FakeObjectStorage()
+    job_id = "restart-paused-job"
+    prefix = storage.task_prefix(owner_id, job_id)
+    assert _repository().upsert_job_progress(
+        owner_id,
+        _snapshot(job_id, "paused", object_storage_prefix=prefix),
+    )
+    api_v2._jobs.clear()
+    monkeypatch.setattr(api_v2, "_object_storage", storage)
+
+    response = client.post(
+        f"/api/v2/history/{job_id}/resume",
+        json={},
+        headers=_headers(tokens[0]),
+    )
+    forbidden = client.post(
+        f"/api/v2/history/{job_id}/resume",
+        json={},
+        headers=_headers(tokens[1]),
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "Complete LLM and embedding configuration is required"
+    assert storage.restored == [(owner_id, job_id)]
+    assert forbidden.status_code == 404
+
+
+def test_history_delete_removes_owned_oss_prefix(authenticated_clients, monkeypatch):
+    client, users, tokens = authenticated_clients
+    owner_id = users[0][0]
+    storage = FakeObjectStorage()
+    assert _repository().upsert_job_progress(
+        owner_id,
+        _snapshot(
+            "delete-oss-job",
+            "done",
+            object_storage_prefix=storage.task_prefix(owner_id, "delete-oss-job"),
+        ),
+    )
+    monkeypatch.setattr(api_v2, "_object_storage", storage)
+
+    response = client.delete(
+        "/api/v2/history/delete-oss-job",
+        headers=_headers(tokens[0]),
+    )
+
+    assert response.status_code == 200
+    assert storage.deleted == [(owner_id, "delete-oss-job")]
 
 
 def test_explicit_desktop_mode_restores_sqlite_source_pdf_and_artifact_fallback(

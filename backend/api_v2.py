@@ -81,6 +81,17 @@ from storage.learning_repository import (
     LearningRepository,
     sanitize_source_pdf_meta,
 )
+from storage.object_storage import (
+    ObjectStorageConfig,
+    ObjectStorageError,
+    OssObjectStorage,
+)
+
+
+_object_storage_config = ObjectStorageConfig.from_environment()
+_object_storage = (
+    OssObjectStorage(_object_storage_config) if _object_storage_config is not None else None
+)
 
 def _configure_cors(flask_app: Flask) -> None:
     """按部署白名单启用 Web CORS，并保留旧桌面端的本地兼容行为。"""
@@ -1118,6 +1129,26 @@ def _persistent_job_dir(job_id: str) -> Path:
     return _job_storage_root() / safe_id
 
 
+def _restore_job_files(job: dict) -> bool:
+    """仅在数据库归属已确认后恢复该用户任务，拒绝被篡改的存储前缀。"""
+    if _desktop_legacy_auth or _object_storage is None:
+        return False
+    owner_id = job.get("_user_id")
+    job_id = str(job.get("job_id") or "")
+    stored_prefix = job.get("_object_storage_prefix")
+    if owner_id is None or not job_id or not stored_prefix:
+        return False
+    expected_prefix = _object_storage.task_prefix(int(owner_id), job_id)
+    if stored_prefix != expected_prefix:
+        raise ObjectStorageError("stored OSS task prefix does not match task ownership")
+    return _object_storage.restore_job(
+        int(owner_id),
+        job_id,
+        _persistent_job_dir(job_id),
+        _source_pdf_dir(job_id),
+    )
+
+
 def _history_resume_available(row) -> bool:
     status = row["status"] if "status" in row.keys() else "done"
     if status not in {"paused", "error"}:
@@ -1303,6 +1334,7 @@ def _history_job_resource(row: dict) -> dict:
         "_user_id": row.get("user_id"),
         "_history_persisted": True,
         "_persistent_artifacts": True,
+        "_object_storage_prefix": row.get("object_storage_prefix"),
         "_artifact_dir": str(_persistent_job_dir(row["id"])),
         "_is_live": False,
         "created_at": row.get("created_at"),
@@ -1400,7 +1432,7 @@ def history_save():
         return jsonify({"error": "job not done or not found"}), 400
     if not _desktop_legacy_auth and int(job.get("_user_id") or -1) != int(user["id"]):
         return jsonify({"error": "job not done or not found"}), 400
-    if not _upsert_job_history(job, "done", int(user["id"])):
+    if not _persist_job_with_files(job, "done", int(user["id"])):
         return jsonify({"error": "unable to save history"}), 500
     return jsonify({"ok": True, "id": job_id}), 201
 
@@ -1484,6 +1516,15 @@ def history_resume(hist_id):
             "error": "Only a paused or failed history task can be resumed",
             "status": status,
         }), 409
+    if not _desktop_legacy_auth and row.get("object_storage_prefix"):
+        try:
+            _restore_job_files({
+                "job_id": hist_id,
+                "_user_id": int(user["id"]),
+                "_object_storage_prefix": row.get("object_storage_prefix"),
+            })
+        except ObjectStorageError:
+            return jsonify({"error": "Task files could not be restored from OSS"}), 503
     if not _history_resume_available(row):
         return jsonify({"error": "Recovery cache is unavailable"}), 410
     llm_config = _resume_llm_config(request.get_json(silent=True) or {})
@@ -1630,10 +1671,13 @@ def history_delete(hist_id):
             hist_id,
             int(user["id"]),
             artifact_dir=artifact_dir or str(_persistent_job_dir(hist_id)),
+            object_storage_prefix=(
+                row.get("object_storage_prefix") if isinstance(row, dict) else None
+            ),
         )
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 409
-    except (OSError, ValueError) as exc:
+    except (ObjectStorageError, OSError, ValueError) as exc:
         return jsonify({"error": f"Unable to delete history: {exc}"}), 500
     return jsonify({"ok": True})
 
@@ -2650,6 +2694,13 @@ def _compile_agent_source_pdf(job_id: str, source_text: str, filename: str) -> N
     result = job.get("result")
     if isinstance(result, dict):
         result["source_pdf"] = _public_source_pdf_meta(meta)
+    if (
+        not _desktop_legacy_auth
+        and job.get("_user_id") is not None
+        and not _persist_job_with_files(job, "done")
+    ):
+        _mark_persistence_error(job)
+        return
     _update_history_source_pdf(job_id, meta)
 
 
@@ -2943,10 +2994,33 @@ def _mark_persistence_error(job: dict, *, preserve_status: bool = False) -> None
     job.pop("error_detail", None)
 
 
+def _persist_job_with_files(
+    job: dict,
+    status: str,
+    user_id: int | None = None,
+) -> bool:
+    """先持久化受控文件，再提交同一状态的 MySQL 快照。"""
+    owner_id = user_id if user_id is not None else job.get("_user_id")
+    if owner_id is None:
+        return False
+    if not _desktop_legacy_auth and _object_storage is not None:
+        try:
+            prefix = _object_storage.sync_job(
+                int(owner_id),
+                str(job["job_id"]),
+                _persistent_job_dir(str(job["job_id"])),
+                _source_pdf_dir(str(job["job_id"])),
+            )
+        except (ObjectStorageError, OSError, ValueError):
+            return False
+        job["_object_storage_prefix"] = prefix
+    return _upsert_job_history(job, status, int(owner_id))
+
+
 def _persist_job_state(job: dict, status: str) -> bool:
     if not job.get("_history_persisted"):
         return True
-    if _upsert_job_history(job, status):
+    if _persist_job_with_files(job, status):
         return True
     _mark_persistence_error(job)
     return False
@@ -3248,7 +3322,7 @@ def create_job():
     }
 
     if not _desktop_legacy_auth:
-        if not _upsert_job_history(_jobs[job_id], "running", int(user["id"])):
+        if not _persist_job_with_files(_jobs[job_id], "running", int(user["id"])):
             failed_job = _jobs.pop(job_id)
             try:
                 _remove_job_artifacts(job_id, failed_job.get("_artifact_dir"))
@@ -3353,7 +3427,13 @@ def _remove_job_artifacts(job_id: str, artifact_dir: str | os.PathLike | None):
         shutil.rmtree(source_pdf_path)
 
 
-def _cancel_job_record(job_id: str, owner_id: int | None, *, artifact_dir=None):
+def _cancel_job_record(
+    job_id: str,
+    owner_id: int | None,
+    *,
+    artifact_dir=None,
+    object_storage_prefix: str | None = None,
+):
     with _jobs_lock:
         job = _jobs.get(job_id)
         runtime = _job_runtimes.get(job_id)
@@ -3363,6 +3443,19 @@ def _cancel_job_record(job_id: str, owner_id: int | None, *, artifact_dir=None):
         selected_artifact_dir = (
             job.get("_artifact_dir") if job else artifact_dir or str(_persistent_job_dir(job_id))
         )
+        selected_object_prefix = (
+            job.get("_object_storage_prefix") if job else object_storage_prefix
+        )
+    if (
+        owner_id is not None
+        and not _desktop_legacy_auth
+        and _object_storage is not None
+        and selected_object_prefix
+    ):
+        expected_prefix = _object_storage.task_prefix(int(owner_id), job_id)
+        if selected_object_prefix != expected_prefix:
+            raise ObjectStorageError("stored OSS task prefix does not match task ownership")
+        _object_storage.delete_job(int(owner_id), job_id)
     _remove_job_artifacts(job_id, selected_artifact_dir)
     if owner_id is not None and not _desktop_legacy_auth:
         _learning_repository.delete_owned_history(int(owner_id), job_id)
@@ -3450,7 +3543,7 @@ def agent_import():
         "_persistent_artifacts": bool(user),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    if not _desktop_legacy_auth and not _upsert_job_history(
+    if not _desktop_legacy_auth and not _persist_job_with_files(
         _jobs[job_id], "done", int(user["id"])
     ):
         _jobs.pop(job_id, None)
@@ -3561,7 +3654,7 @@ def pause_job(job_id):
             job.pop("error_user_message", None)
             _set_cache_manifest_status(job, "paused")
             _cleanup_job_stage_work(job)
-            if job.get("_user_id") is not None and not _upsert_job_history(job, "paused"):
+            if job.get("_user_id") is not None and not _persist_job_with_files(job, "paused"):
                 return jsonify({
                     "error": "Task paused but history persistence failed",
                     "status": "paused",
@@ -3590,7 +3683,7 @@ def cancel_job(job_id):
         _cancel_job_record(job_id, owner_id)
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 409
-    except (OSError, ValueError) as exc:
+    except (ObjectStorageError, OSError, ValueError) as exc:
         return jsonify({"error": f"Unable to cancel task: {exc}"}), 500
     return jsonify({"ok": True, "status": "cancelled", "job_id": job_id})
 
@@ -3653,7 +3746,7 @@ def _begin_pipeline_resume(job_id: str):
         job["stage_label"] = stage_labels.get(next_stage)
         job["stage_index"] = next_index
         _set_cache_manifest_status(job, "running")
-        if job.get("_history_persisted") and not _upsert_job_history(job, "running"):
+        if job.get("_history_persisted") and not _persist_job_with_files(job, "running"):
             # worker 只能在 running 已持久化后启动；失败时恢复原任务状态供安全重试。
             job.clear()
             job.update(previous_state)
@@ -3784,6 +3877,12 @@ def source_pdf(job_id):
     if meta.get("status") == "compiling":
         return jsonify({"error": "source PDF is compiling", "status": "compiling"}), 409
     pdf_path = _controlled_source_pdf_file(job_id, meta, "pdf_name", "pdf_path")
+    if meta.get("available") and pdf_path is not None and not pdf_path.is_file():
+        try:
+            _restore_job_files(job)
+        except ObjectStorageError:
+            return jsonify({"error": "Source PDF could not be restored from OSS"}), 503
+        pdf_path = _controlled_source_pdf_file(job_id, meta, "pdf_name", "pdf_path")
     if not meta.get("available") or pdf_path is None or not pdf_path.is_file():
         return jsonify({"error": meta.get("error") or "source PDF unavailable"}), 404
     return send_file(
@@ -3805,6 +3904,12 @@ def source_pdf_compile_log(job_id):
     if meta.get("status") == "compiling":
         return jsonify({"error": "source PDF is compiling", "status": "compiling"}), 409
     log_path = _controlled_source_pdf_file(job_id, meta, "log_name", "log_path")
+    if log_path is not None and not log_path.is_file():
+        try:
+            _restore_job_files(job)
+        except ObjectStorageError:
+            return jsonify({"error": "Compile log could not be restored from OSS"}), 503
+        log_path = _controlled_source_pdf_file(job_id, meta, "log_name", "log_path")
     if log_path is None or not log_path.is_file():
         return jsonify({"error": "compile log not found"}), 404
     return send_file(log_path, mimetype="text/plain; charset=utf-8", as_attachment=False)
@@ -3825,6 +3930,16 @@ def source_pdf_locate(job_id):
         if meta and meta.get("status") == "compiling":
             return jsonify({"error": "source PDF is compiling", "status": "compiling"}), 409
         return jsonify({"error": (meta or {}).get("error") or "source PDF unavailable"}), 404
+    pdf_path = _controlled_source_pdf_file(job_id, meta, "pdf_name", "pdf_path")
+    source_path = _controlled_source_pdf_file(job_id, meta, "source_name", "source_path")
+    if (
+        (pdf_path is not None and not pdf_path.is_file())
+        or (source_path is not None and not source_path.is_file())
+    ):
+        try:
+            _restore_job_files(job)
+        except ObjectStorageError:
+            return jsonify({"error": "Source files could not be restored from OSS"}), 503
     node = next((n for n in nodes if isinstance(n, dict) and n.get("id") == node_id), None)
     if not node:
         return jsonify({"error": "node not found"}), 404
@@ -3900,6 +4015,21 @@ def export_artifacts(job_id):
     nodes_path = artifact_root / "nodes.json" if artifact_root else None
     edges_path = artifact_root / "edges.json" if artifact_root else None
     cache_path = artifact_root / "_stage_cache" if artifact_root else None
+    local_cache_missing = not (
+        artifact_root
+        and artifact_root.is_dir()
+        and nodes_path
+        and nodes_path.is_file()
+        and edges_path
+        and edges_path.is_file()
+        and cache_path
+        and cache_path.is_dir()
+    )
+    if local_cache_missing and job.get("_object_storage_prefix"):
+        try:
+            _restore_job_files(job)
+        except ObjectStorageError:
+            return jsonify({"error": "Processing files could not be restored from OSS"}), 503
     has_complete_cache = bool(
         artifact_root
         and artifact_root.is_dir()
