@@ -75,6 +75,7 @@ from services.auth_service import (
 )
 from services.admin_user_service import AdminUserService
 from storage.auth_repository import AuthRepository
+from storage.audit_service import AuditService
 from storage.credential_crypto import CredentialCipher, CredentialKeyring
 from storage.capacity import CapacityExceeded, CapacityLimits
 from storage.database import configure_database, database_is_ready
@@ -292,6 +293,10 @@ else:
     _auth_service = AuthService(AuthRepository())
     _admin_user_service = AdminUserService(AuthRepository())
     _learning_repository = LearningRepository(cipher=_credential_cipher)
+    _audit_service = AuditService()
+
+if _desktop_legacy_auth:
+    _audit_service = None
 
 if _desktop_legacy_auth:
     _init_db()
@@ -562,6 +567,13 @@ def auth_login():
         try:
             result = _auth_service.login(identifier, password)
         except InvalidCredentialsError:
+            _audit_service.record(
+                actor_id=None,
+                action="auth.login",
+                subject_type="user",
+                subject_id="unknown",
+                details={"result": "failure", "reason": "invalid_credentials"},
+            )
             return jsonify({"error": "学号、邮箱或密码错误"}), 401
         return jsonify({"token": result.token, "user": asdict(result.user)})
 

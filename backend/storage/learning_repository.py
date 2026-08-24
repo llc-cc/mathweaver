@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from storage.credential_crypto import CredentialCipher, CredentialConfigurationError
+from storage.audit_service import AuditWriter
 from storage.database import session_scope
 from storage.models import History, ProofWorkspace, StorageOutbox, UserSettings, utc_now
 from storage.object_storage import StoredVersion
@@ -98,9 +99,11 @@ class LearningRepository:
         session_factory: SessionFactory = session_scope,
         *,
         cipher: CredentialCipher | None = None,
+        audit_writer: AuditWriter | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._cipher = cipher
+        self._audit_writer = audit_writer or AuditWriter()
 
     def _credential_cipher(self) -> CredentialCipher:
         if self._cipher is None:
@@ -270,6 +273,14 @@ class LearningRepository:
             row.llm_secrets_encrypted_json = self._credential_cipher().encrypt_json(
                 next_secrets,
                 aad=self._settings_aad(user_id),
+            )
+            self._audit_writer.add(
+                session,
+                actor_id=user_id,
+                action="settings.update",
+                subject_type="user",
+                subject_id=str(user_id),
+                details={"config_count": len(normalized)},
             )
             return self._public_settings(normalized, next_secrets, active_index)
 
@@ -448,6 +459,14 @@ class LearningRepository:
                     payload_json={},
                     next_attempt_at=utc_now(),
                 )
+            )
+            self._audit_writer.add(
+                session,
+                actor_id=user_id,
+                action="history.delete",
+                subject_type="history",
+                subject_id=history_id,
+                details={"storage_status": "delete_pending"},
             )
             return True
 

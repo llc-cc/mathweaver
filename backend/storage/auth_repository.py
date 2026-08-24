@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from storage.database import session_scope
+from storage.audit_service import AuditWriter
 from storage.models import ClassMembership, Course, LoginSession, TeachingClass, User
 
 
@@ -44,9 +45,13 @@ class StudentBatchImportError(RuntimeError):
 class AuthUserTransaction:
     """封装持锁用户行上的认证写入；实例只在仓储事务上下文内有效。"""
 
-    def __init__(self, session: Session, user: User) -> None:
+    def __init__(self, session: Session, user: User, audit_writer: AuditWriter) -> None:
         self._session = session
         self.user = user
+        self._audit_writer = audit_writer
+
+    def add_audit(self, **event) -> None:
+        self._audit_writer.add(self._session, **event)
 
     def has_active_session(self, token_hash: str, now: datetime) -> bool:
         session_id = self._session.scalar(
@@ -102,8 +107,13 @@ class AuthUserTransaction:
 class AuthRepository:
     """封装认证查询和会话写入，不感知 HTTP 请求。"""
 
-    def __init__(self, session_factory: SessionFactory = session_scope) -> None:
+    def __init__(
+        self,
+        session_factory: SessionFactory = session_scope,
+        audit_writer: AuditWriter | None = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._audit_writer = audit_writer or AuditWriter()
 
     def find_user_by_identifier(self, identifier: str) -> User | None:
         condition = self._identifier_condition(identifier)
@@ -123,7 +133,7 @@ class AuthRepository:
         with self._session_factory() as session:
             # 所有账号状态决策都从持锁行读取，跨 worker 也由 MySQL 串行化。
             user = session.scalar(select(User).where(condition).with_for_update())
-            yield AuthUserTransaction(session, user) if user is not None else None
+            yield AuthUserTransaction(session, user, self._audit_writer) if user is not None else None
 
     @contextmanager
     def user_transaction_by_id(
@@ -133,7 +143,11 @@ class AuthRepository:
             user = session.scalar(
                 select(User).where(User.id == user_id).with_for_update()
             )
-            yield AuthUserTransaction(session, user) if user is not None else None
+            yield AuthUserTransaction(session, user, self._audit_writer) if user is not None else None
+
+    def record_audit(self, **event) -> None:
+        with self._session_factory() as session:
+            self._audit_writer.add(session, **event)
 
     def insert_session(
         self, user_id: int, token_hash: str, expires_at: datetime
@@ -297,6 +311,14 @@ class AuthRepository:
                         )
                     )
                 session.flush()
+                self._audit_writer.add(
+                    session,
+                    actor_id=actor_id,
+                    action="admin.user_import",
+                    subject_type="import",
+                    subject_id="student-batch",
+                    details={"created": len(records), "updated": 0, "failed": 0},
+                )
             return ()
         except SQLAlchemyError as exc:
             # session_scope 已完成回滚；这里转换异常以防 API 泄露数据库细节。

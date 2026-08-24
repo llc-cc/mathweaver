@@ -93,6 +93,13 @@ class AuthService:
             transaction.insert_session(
                 self._hash_token(raw_token), now + self._session_ttl
             )
+            transaction.add_audit(
+                actor_id=user.id,
+                action="auth.login",
+                subject_type="user",
+                subject_id=str(user.id),
+                details={"result": "success", "reason": "credentials_valid"},
+            )
             # 锁定实体不跨出事务；只复制 API 所需的不可变用户快照。
             result = LoginResult(
                 token=raw_token,
@@ -145,6 +152,13 @@ class AuthService:
                 new_token_hash=self._hash_token(raw_token),
                 new_token_expires_at=now + self._session_ttl,
             )
+            transaction.add_audit(
+                actor_id=user_id,
+                action="password.change",
+                subject_type="user",
+                subject_id=str(user_id),
+                details={"sessions_revoked": True},
+            )
             result = LoginResult(
                 token=raw_token,
                 user=self._to_authenticated_user(user),
@@ -162,6 +176,13 @@ class AuthService:
                 initial_password_pending=True,
                 now=utc_now(),
             )
+            transaction.add_audit(
+                actor_id=actor.id,
+                action="admin.password_reset",
+                subject_type="user",
+                subject_id=str(user_id),
+                details={"initial_password_pending": True},
+            )
         return temporary_password
 
     def set_user_active(
@@ -175,6 +196,13 @@ class AuthService:
             if transaction is None:
                 raise UserNotFoundError
             transaction.set_active_status(is_active, utc_now())
+            transaction.add_audit(
+                actor_id=actor.id,
+                action="admin.user_status",
+                subject_type="user",
+                subject_id=str(user_id),
+                details={"is_active": is_active},
+            )
             user = self._to_authenticated_user(transaction.user)
         return user
 

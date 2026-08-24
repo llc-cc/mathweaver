@@ -37,7 +37,7 @@ sys.modules.setdefault("JoinAgent", join_agent)
 import api_v2
 from storage import database as storage_database
 from storage.database import configure_database, get_engine, session_scope
-from storage.models import Base, History, StorageOutbox, User, UserSettings
+from storage.models import AuditLog, Base, History, StorageOutbox, User, UserSettings
 from storage.object_storage import ObjectStorageError, StoredVersion
 from storage.capacity import CapacityLimits
 
@@ -464,6 +464,11 @@ def test_soft_delete_hides_history_and_enqueues_cleanup(users):
         "delete_job_versions",
         "delete_local_cache",
     }
+    with session_scope() as session:
+        audit = session.scalar(
+            select(AuditLog).where(AuditLog.action == "history.delete")
+        )
+        assert audit.details == {"storage_status": "delete_pending"}
 
 
 def test_list_history_uses_summary_projection_without_large_json(users):

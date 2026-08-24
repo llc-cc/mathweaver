@@ -116,6 +116,9 @@ class _LoginResetTransaction:
         self._repository = repository
         self.user = repository.user
 
+    def add_audit(self, **_event):
+        return None
+
     def insert_session(self, token_hash, expires_at):
         self._repository.sessions[token_hash] = False
         self._repository.login_at_write.set()
@@ -196,6 +199,9 @@ class _ConcurrentChangeTransaction:
     def __init__(self, repository: "_ConcurrentChangeRepository") -> None:
         self._repository = repository
         self.user = repository.user
+
+    def add_audit(self, **_event):
+        return None
 
     def has_active_session(self, token_hash, _now):
         return self._repository.sessions.get(token_hash) is False
