@@ -82,6 +82,7 @@ from storage.learning_repository import (
     LearningRepository,
     sanitize_source_pdf_meta,
 )
+from storage.redaction import redact_structure, redact_text
 from storage.object_storage import (
     ObjectStorageConfig,
     ObjectStorageError,
@@ -991,11 +992,7 @@ def _classify_job_error(exc, stage=None, stage_label=None):
 
 
 def _redact_error_text(value, secrets_to_redact):
-    text = str(value or "")
-    for secret in secrets_to_redact:
-        if secret:
-            text = text.replace(str(secret), "***")
-    return text
+    return redact_text(value, secrets=tuple(secrets_to_redact))
 
 
 def _job_error_presentation(job):
@@ -3820,7 +3817,7 @@ def job_result(job_id):
         return error
     if job["status"] != "done":
         return jsonify({"error": "Job not complete"}), 400
-    return jsonify(job["result"])
+    return jsonify(redact_structure(job["result"]))
 
 
 def _source_pdf_context(job: dict) -> tuple[dict | None, list[dict]]:
@@ -4101,7 +4098,7 @@ def export_artifacts(job_id):
 
 
 def _export_json_bytes(items):
-    return json.dumps(items, ensure_ascii=False, indent=2).encode("utf-8")
+    return json.dumps(redact_structure(items), ensure_ascii=False, indent=2).encode("utf-8")
 
 
 def _export_artifact_zip(
