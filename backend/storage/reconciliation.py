@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from storage.audit_service import AuditWriter
 from storage.database import session_scope
+from storage.metrics import operational_metrics
 from storage.models import History, StorageOutbox, utc_now
 from storage.object_storage import ObjectStorageError
 
@@ -58,12 +59,19 @@ class StorageReconciler:
             except (ObjectStorageError, ValueError):
                 missing.append((int(row.user_id), str(row.id), str(row.storage_version)))
         committed = self._storage.list_committed_versions()
-        return ReconciliationReport(
+        report = ReconciliationReport(
             referenced_versions=len(referenced),
             committed_versions=len(committed),
             missing_or_corrupt_versions=tuple(sorted(missing)),
             orphan_versions=tuple(sorted(committed - referenced)),
         )
+        operational_metrics.set_reconciliation_drift(
+            "missing_or_corrupt", len(report.missing_or_corrupt_versions)
+        )
+        operational_metrics.set_reconciliation_drift(
+            "orphan", len(report.orphan_versions)
+        )
+        return report
 
     def enqueue_orphan_cleanup(self, report: ReconciliationReport) -> int:
         created = 0

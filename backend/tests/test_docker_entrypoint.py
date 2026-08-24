@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.docker_entrypoint import load_runtime_environment
+from scripts.docker_entrypoint import load_runtime_environment, prepare_metrics_directory
 
 
 def test_runtime_environment_loader_preserves_fixed_values_and_stays_silent(
@@ -39,4 +39,32 @@ def test_runtime_environment_loader_has_stable_missing_file_error(tmp_path: Path
         load_runtime_environment(missing)
 
     assert str(missing) not in str(error.value)
+
+
+def test_metrics_directory_is_bounded_and_migration_can_clear_stale_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    data_root = tmp_path / "data"
+    metrics_dir = data_root / "prometheus"
+    metrics_dir.mkdir(parents=True)
+    stale = metrics_dir / "counter_123.db"
+    stale.write_bytes(b"stale")
+    monkeypatch.setenv("MATHGRAPH_DATA_DIR", str(data_root))
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(metrics_dir))
+    monkeypatch.setenv("MATHWEAVER_RESET_PROMETHEUS_MULTIPROC_DIR", "1")
+
+    prepare_metrics_directory()
+
+    assert metrics_dir.is_dir()
+    assert not stale.exists()
+
+
+def test_metrics_directory_rejects_path_outside_data_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MATHGRAPH_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path / "outside"))
+
+    with pytest.raises(RuntimeError, match="outside the data root"):
+        prepare_metrics_directory()
 

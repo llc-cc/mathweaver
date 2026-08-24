@@ -100,6 +100,7 @@ def test_production_compose_forces_oss_and_runs_worker():
     )
 
     assert "MATHWEAVER_OBJECT_STORAGE: oss" in compose
+    assert "PROMETHEUS_MULTIPROC_DIR: /var/lib/mathweaver/prometheus" in compose
     assert "  storage-worker:" in compose
     worker = compose.split("  storage-worker:", 1)[1].split("  frontend:", 1)[0]
     assert "- python" in worker

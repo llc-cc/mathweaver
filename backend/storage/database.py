@@ -6,10 +6,12 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
+
+from storage.metrics import operational_metrics
 
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
@@ -51,6 +53,9 @@ def configure_database(url: str | None = None) -> None:
         pool_pre_ping=True,
         pool_recycle=1800,
     )
+    # 每个替换后的 engine 独立注册池事件，避免重配置时继续统计已释放连接池。
+    event.listen(new_engine, "checkout", lambda *_args: operational_metrics.pool_checkout())
+    event.listen(new_engine, "checkin", lambda *_args: operational_metrics.pool_checkin())
     new_session_factory = sessionmaker(bind=new_engine, expire_on_commit=False)
     previous_engine = _engine
     _engine = new_engine
@@ -102,9 +107,11 @@ def session_scope() -> Iterator[Session]:
     try:
         yield session
         session.commit()
+        operational_metrics.record_database_transaction("success")
     except Exception:
         # 异常路径必须撤销未提交数据，防止部分业务状态被持久化。
         session.rollback()
+        operational_metrics.record_database_transaction("failure")
         raise
     finally:
         session.close()

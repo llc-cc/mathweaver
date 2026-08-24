@@ -4,6 +4,7 @@ x-backend-environment: &backend-environment
   MATHWEAVER_DATABASE_NAME: mathweaver
   MATHWEAVER_OBJECT_STORAGE: oss
   MATHGRAPH_DATA_DIR: /var/lib/mathweaver
+  PROMETHEUS_MULTIPROC_DIR: /var/lib/mathweaver/prometheus
 
 x-backend-secrets: &backend-secrets
   - source: mathweaver_backend_env
@@ -19,10 +20,15 @@ services:
     # 入口只以 root 读取 0400 secret，随后在 exec 前立即降权到 UID/GID 10001。
     user: "0:0"
     secrets: *backend-secrets
-    environment: *backend-environment
+    environment:
+      <<: *backend-environment
+      MATHWEAVER_RESET_PROMETHEUS_MULTIPROC_DIR: "1"
+      MATHWEAVER_METRICS_PROCESS: migrate
     command:
       - python
       - scripts/production_migrate.py
+    volumes:
+      - mathweaver_artifacts:/var/lib/mathweaver
     restart: "no"
 
   backend:
@@ -32,7 +38,9 @@ services:
       dockerfile: Dockerfile
     user: "0:0"
     secrets: *backend-secrets
-    environment: *backend-environment
+    environment:
+      <<: *backend-environment
+      MATHWEAVER_METRICS_PROCESS: backend
     command:
       - gunicorn
       - --workers
@@ -69,7 +77,9 @@ services:
     image: ${MATHWEAVER_BACKEND_IMAGE:-mathweaver-backend:local}
     user: "0:0"
     secrets: *backend-secrets
-    environment: *backend-environment
+    environment:
+      <<: *backend-environment
+      MATHWEAVER_METRICS_PROCESS: storage_worker
     command:
       - python
       - scripts/storage_worker.py

@@ -33,7 +33,7 @@ from functools import wraps
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, g, jsonify, request, send_file
+from flask import Flask, Response, g, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -84,6 +84,7 @@ from storage.learning_repository import (
     LearningRepository,
     sanitize_source_pdf_meta,
 )
+from storage.metrics import METRICS_CONTENT_TYPE, operational_metrics
 from storage.redaction import redact_structure, redact_text
 from storage.object_storage import (
     ObjectStorageConfig,
@@ -4397,6 +4398,12 @@ network.on('click', params => {{
 </script>
 </body>
 </html>"""
+
+
+@app.get("/internal/metrics")
+def internal_metrics():
+    """仅供容器网络抓取；公网 Nginx 不为此前缀配置代理。"""
+    return Response(operational_metrics.render(), content_type=METRICS_CONTENT_TYPE)
 
 
 @app.route("/api/v2/ping")

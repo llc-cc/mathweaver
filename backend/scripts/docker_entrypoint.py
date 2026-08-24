@@ -45,6 +45,30 @@ def drop_root_privileges(user_name: str = "mathweaver") -> None:
     os.setuid(account.pw_uid)
 
 
+def prepare_metrics_directory(user_name: str = "mathweaver") -> None:
+    """在降权前创建共享指标目录，并拒绝写到数据卷边界之外。"""
+    configured = os.environ.get("PROMETHEUS_MULTIPROC_DIR", "").strip()
+    if not configured:
+        return
+    data_root = Path(os.environ.get("MATHGRAPH_DATA_DIR", "/var/lib/mathweaver")).resolve()
+    target = Path(configured).resolve()
+    try:
+        target.relative_to(data_root)
+    except ValueError:
+        raise RuntimeError("metrics directory is outside the data root") from None
+    target.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("MATHWEAVER_RESET_PROMETHEUS_MULTIPROC_DIR") == "1":
+        # migrate 是所有长期进程的串行前置服务，只能由它清除上次部署遗留的 mmap 文件。
+        for metric_file in target.glob("*.db"):
+            metric_file.unlink(missing_ok=True)
+    if getattr(os, "geteuid", lambda: 1)() == 0:
+        import pwd
+
+        account = pwd.getpwnam(user_name)
+        os.chown(target, account.pw_uid, account.pw_gid)
+    target.chmod(0o700)
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     command = list(arguments if arguments is not None else sys.argv[1:])
     if not command:
@@ -52,6 +76,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 64
     try:
         load_runtime_environment()
+        prepare_metrics_directory()
         drop_root_privileges()
     except (KeyError, RuntimeError):
         # 错误保持固定文本，不把 secret 路径、变量值或解析异常写入日志。

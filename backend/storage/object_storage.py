@@ -8,11 +8,14 @@ import os
 import re
 import shutil
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+from storage.metrics import operational_metrics
 
 
 _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -244,17 +247,23 @@ class OssObjectStorage:
             manifest_bytes = self._canonical_json(manifest)
             self._bucket.put_object(f"{prefix}manifest.json", manifest_bytes)
         except ObjectStorageError:
+            operational_metrics.record_storage_failure("upload", "object_storage_error")
             raise
         except Exception:
             # 未写 manifest 的残留版本不会被数据库引用，由孤儿扫描异步清理。
+            operational_metrics.record_storage_failure("upload", "object_storage_error")
             raise ObjectStorageError("OSS version upload failed") from None
-        return StoredVersion(
+        stored = StoredVersion(
             version_id,
             prefix,
             hashlib.sha256(manifest_bytes).hexdigest(),
             len(entries),
             total_bytes,
         )
+        operational_metrics.observe_storage_version(
+            file_count=stored.file_count, total_bytes=stored.total_bytes
+        )
+        return stored
 
     def verify_version(
         self,
@@ -326,11 +335,16 @@ class OssObjectStorage:
                 self._bucket.put_object_from_file(f"{prefix}{relative}", str(path))
         except Exception:
             # SDK 异常可能携带签名请求信息，不能原样进入 API 错误或日志。
+            operational_metrics.record_storage_failure("upload", "object_storage_error")
             raise ObjectStorageError("OSS object upload failed") from None
 
-        stale_keys = [key for key in self._list_keys(prefix) if key not in desired_keys]
-        if stale_keys:
-            self._delete_keys(stale_keys)
+        try:
+            stale_keys = [key for key in self._list_keys(prefix) if key not in desired_keys]
+            if stale_keys:
+                self._delete_keys(stale_keys)
+        except ObjectStorageError:
+            operational_metrics.record_storage_failure("upload", "object_storage_error")
+            raise
         return prefix
 
     @staticmethod
@@ -365,23 +379,36 @@ class OssObjectStorage:
         artifact_root: Path,
         source_pdf_root: Path,
     ) -> bool:
-        prefix = self.task_prefix(user_id, job_id)
-        keys = self._list_keys(prefix)
-        for key in keys:
-            target = self._restore_target(
-                prefix,
-                key,
-                Path(artifact_root),
-                Path(source_pdf_root),
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-            try:
+        started = time.monotonic()
+        temporary: Path | None = None
+        try:
+            prefix = self.task_prefix(user_id, job_id)
+            keys = self._list_keys(prefix)
+            for key in keys:
+                target = self._restore_target(
+                    prefix,
+                    key,
+                    Path(artifact_root),
+                    Path(source_pdf_root),
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
                 self._bucket.get_object_to_file(key, str(temporary))
                 os.replace(temporary, target)
-            except Exception:
+                temporary = None
+        except ObjectStorageError:
+            if temporary is not None:
                 temporary.unlink(missing_ok=True)
-                raise ObjectStorageError("OSS object download failed") from None
+            operational_metrics.record_storage_failure("restore", "object_storage_error")
+            operational_metrics.observe_restore("failure", time.monotonic() - started)
+            raise
+        except Exception:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            operational_metrics.record_storage_failure("restore", "object_storage_error")
+            operational_metrics.observe_restore("failure", time.monotonic() - started)
+            raise ObjectStorageError("OSS object download failed") from None
+        operational_metrics.observe_restore("success", time.monotonic() - started)
         return bool(keys)
 
     def restore_version(
@@ -393,18 +420,26 @@ class OssObjectStorage:
         artifact_root: Path,
         source_pdf_root: Path,
     ) -> bool:
-        lock_key = (int(user_id), _safe_job_id(job_id))
-        with self._restore_locks_guard:
-            lock = self._restore_locks.setdefault(lock_key, threading.Lock())
-        with lock:
-            return self._restore_version_locked(
-                user_id,
-                job_id,
-                version_id,
-                expected_checksum,
-                Path(artifact_root),
-                Path(source_pdf_root),
-            )
+        started = time.monotonic()
+        try:
+            lock_key = (int(user_id), _safe_job_id(job_id))
+            with self._restore_locks_guard:
+                lock = self._restore_locks.setdefault(lock_key, threading.Lock())
+            with lock:
+                restored = self._restore_version_locked(
+                    user_id,
+                    job_id,
+                    version_id,
+                    expected_checksum,
+                    Path(artifact_root),
+                    Path(source_pdf_root),
+                )
+        except Exception:
+            operational_metrics.record_storage_failure("restore", "object_storage_error")
+            operational_metrics.observe_restore("failure", time.monotonic() - started)
+            raise
+        operational_metrics.observe_restore("success", time.monotonic() - started)
+        return restored
 
     def _restore_version_locked(
         self,
@@ -487,23 +522,35 @@ class OssObjectStorage:
                 os.replace(backup, target)
 
     def delete_job(self, user_id: int, job_id: str) -> None:
-        prefix = self.task_prefix(user_id, job_id)
-        keys = self._list_keys(prefix)
-        if keys:
-            self._delete_keys(keys)
+        try:
+            prefix = self.task_prefix(user_id, job_id)
+            keys = self._list_keys(prefix)
+            if keys:
+                self._delete_keys(keys)
+        except Exception:
+            operational_metrics.record_storage_failure("delete", "object_storage_error")
+            raise
 
     def delete_version(self, user_id: int, job_id: str, version_id: str) -> None:
         """删除操作严格限制在单个不可变版本前缀，重复删除视为成功。"""
-        prefix = self.version_prefix(user_id, job_id, version_id)
-        keys = self._list_keys(prefix)
-        if keys:
-            self._delete_keys(keys)
+        try:
+            prefix = self.version_prefix(user_id, job_id, version_id)
+            keys = self._list_keys(prefix)
+            if keys:
+                self._delete_keys(keys)
+        except Exception:
+            operational_metrics.record_storage_failure("delete", "object_storage_error")
+            raise
 
     def delete_job_versions(self, user_id: int, job_id: str) -> None:
-        versions_prefix = f"{self.task_prefix(user_id, job_id)}versions/"
-        keys = self._list_keys(versions_prefix)
-        if keys:
-            self._delete_keys(keys)
+        try:
+            versions_prefix = f"{self.task_prefix(user_id, job_id)}versions/"
+            keys = self._list_keys(versions_prefix)
+            if keys:
+                self._delete_keys(keys)
+        except Exception:
+            operational_metrics.record_storage_failure("delete", "object_storage_error")
+            raise
 
     def list_committed_versions(self) -> set[tuple[int, str, str]]:
         """仅把存在 manifest 提交标记的版本暴露给漂移扫描。"""

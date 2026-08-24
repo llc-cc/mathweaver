@@ -6,9 +6,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from storage.database import session_scope
+from storage.metrics import OUTBOX_STATUSES, operational_metrics
 from storage.models import History, StorageOutbox
 
 
@@ -136,4 +137,21 @@ class StorageOutboxProcessor:
             else:
                 self._finish(row_id, now, succeeded=True)
                 succeeded += 1
+        self._refresh_status_metrics()
         return ProcessingSummary(claimed, succeeded, failed)
+
+    def _refresh_status_metrics(self) -> None:
+        """指标查询失败不能把已完成的幂等清理误报为 worker 业务失败。"""
+        try:
+            with session_scope() as session:
+                counts = dict(
+                    session.execute(
+                        select(StorageOutbox.status, func.count()).group_by(
+                            StorageOutbox.status
+                        )
+                    ).all()
+                )
+        except Exception:
+            return
+        for status in OUTBOX_STATUSES:
+            operational_metrics.set_outbox_status(status, int(counts.get(status, 0)))

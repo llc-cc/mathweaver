@@ -14,7 +14,6 @@
 | `MATHWEAVER_MAX_USER_HISTORY_BYTES` | 单用户未删除历史总字节 | 产品负责人、DBA |
 | `MATHWEAVER_HISTORY_RETENTION_DAYS` | 历史保留天数 | 产品、合规负责人 |
 | `MATHWEAVER_MIN_FREE_DISK_BYTES` | 本地缓存最低剩余空间 | 值班工程师 |
-| `MATHWEAVER_METRICS_BIND` | 仅容器网络可见的指标监听地址 | 平台负责人 |
 
 所有值必须是经过校验的正整数或明确的内部监听地址。上线前查询 MySQL `@@max_allowed_packet`，其值必须大于最大历史负载加 1 MiB 安全余量。配置变更需要关联压测证据、回滚值和生效时间。
 
@@ -45,6 +44,18 @@
 | 单用户历史字节 | 达到上限 80% | 达到 100% 并被拒绝 | 执行保留策略或审批扩容 |
 
 低基数指标标签只能包含操作、状态和稳定错误码；不得包含用户 ID、任务 ID、对象键、文件名、URL 或异常文本。
+
+Prometheus 只能通过 Compose 内部网络抓取 `http://backend:5001/internal/metrics`。Nginx 不代理 `/internal/metrics`，不得另行增加公网路由或把指标响应写入业务日志。
+
+backend、storage worker 与运维命令通过数据卷内的 `PROMETHEUS_MULTIPROC_DIR` 汇总指标。协调扫描必须在已启动的 backend 容器内执行，才能把本次孤儿/缺失计数写入同一指标目录：
+
+```bash
+docker compose -f deploy/docker-compose.web.yml exec \
+  -e MATHWEAVER_METRICS_PROCESS=reconciliation backend \
+  python scripts/reconcile_storage.py
+```
+
+生产迁移服务会在启动长期进程前清理上一轮部署遗留的 mmap 文件；不得让 backend 或 worker 在运行期间清理该目录。
 
 ## 4. 仪表盘与每日检查
 
