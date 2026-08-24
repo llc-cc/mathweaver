@@ -18,11 +18,23 @@ class FakeBucket:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.fail_upload = False
+        self.put_order: list[str] = []
 
     def put_object_from_file(self, key: str, filename: str) -> None:
         if self.fail_upload:
             raise RuntimeError("provider leaked-secret-value")
         self.objects[key] = Path(filename).read_bytes()
+        self.put_order.append(key)
+
+    def put_object(self, key: str, content: bytes) -> None:
+        self.objects[key] = bytes(content)
+        self.put_order.append(key)
+
+    def get_object(self, key: str):
+        return SimpleNamespace(read=lambda: self.objects[key])
+
+    def get_object_meta(self, key: str):
+        return SimpleNamespace(content_length=len(self.objects[key]))
 
     def get_object_to_file(self, key: str, filename: str) -> None:
         Path(filename).write_bytes(self.objects[key])
@@ -123,6 +135,43 @@ def test_sync_restore_and_delete_round_trip(tmp_path: Path) -> None:
 
     storage.delete_job(7, "job-1")
     assert not bucket.objects_with_prefix(prefix)
+
+
+def test_upload_creates_isolated_immutable_versions_and_commits_manifest_last(
+    tmp_path: Path,
+) -> None:
+    bucket = FakeBucket()
+    storage = configured_storage(bucket)
+    artifact_root = tmp_path / "job"
+    source_root = tmp_path / "source"
+    artifact_root.mkdir()
+    (artifact_root / "nodes.json").write_text('[{"id":1}]', encoding="utf-8")
+
+    first = storage.upload_version(7, "job-1", artifact_root, source_root)
+    (artifact_root / "nodes.json").write_text('[{"id":2}]', encoding="utf-8")
+    second = storage.upload_version(7, "job-1", artifact_root, source_root)
+
+    assert first.version_id != second.version_id
+    assert f"/versions/{first.version_id}/" in first.prefix
+    assert f"{first.prefix}artifacts/nodes.json" in bucket.objects
+    assert f"{second.prefix}artifacts/nodes.json" in bucket.objects
+    assert bucket.put_order[-1] == f"{second.prefix}manifest.json"
+    assert storage.verify_version(
+        7, "job-1", first.version_id, first.manifest_checksum
+    ) == first
+
+
+def test_verify_rejects_tampered_version(tmp_path: Path) -> None:
+    bucket = FakeBucket()
+    storage = configured_storage(bucket)
+    artifact_root = tmp_path / "job"
+    artifact_root.mkdir()
+    (artifact_root / "nodes.json").write_text("[]", encoding="utf-8")
+    stored = storage.upload_version(7, "job-1", artifact_root, tmp_path / "source")
+    bucket.objects[f"{stored.prefix}artifacts/nodes.json"] = b"tampered"
+
+    with pytest.raises(ObjectStorageError, match="verification failed"):
+        storage.verify_version(7, "job-1", stored.version_id, stored.manifest_checksum)
 
 
 def test_sync_skips_transient_files_and_removes_stale_remote_objects(tmp_path: Path) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import uuid
@@ -22,6 +24,15 @@ _OSS_REQUIRED_ENVIRONMENT = (
 
 class ObjectStorageError(RuntimeError):
     """对外隐藏 SDK 请求细节和凭据的稳定存储错误。"""
+
+
+@dataclass(frozen=True)
+class StoredVersion:
+    version_id: str
+    prefix: str
+    manifest_checksum: str
+    file_count: int
+    total_bytes: int
 
 
 def _normalized_prefix(value: str) -> str:
@@ -118,6 +129,11 @@ class OssObjectStorage:
             f"{_safe_job_id(job_id)}/"
         )
 
+    def version_prefix(self, user_id: int, job_id: str, version_id: str) -> str:
+        if not re.fullmatch(r"[a-f0-9]{32}", str(version_id or "")):
+            raise ValueError("version_id must be a lowercase UUID hex value")
+        return f"{self.task_prefix(user_id, job_id)}versions/{version_id}/"
+
     @staticmethod
     def _local_files(root: Path, remote_subdir: str) -> dict[str, Path]:
         if not root.is_dir():
@@ -169,6 +185,124 @@ class OssObjectStorage:
                 self._bucket.batch_delete_objects(keys[start : start + 1000])
         except Exception:
             raise ObjectStorageError("OSS object deletion failed") from None
+
+    @staticmethod
+    def _canonical_json(value: object) -> bytes:
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+
+    def _read_object(self, key: str) -> bytes:
+        try:
+            return bytes(self._bucket.get_object(key).read())
+        except Exception:
+            raise ObjectStorageError("OSS version verification failed") from None
+
+    def upload_version(
+        self,
+        user_id: int,
+        job_id: str,
+        artifact_root: Path,
+        source_pdf_root: Path,
+    ) -> StoredVersion:
+        """先上传不可变数据对象，全部校验后最后写 manifest 作为提交标记。"""
+        version_id = uuid.uuid4().hex
+        prefix = self.version_prefix(user_id, job_id, version_id)
+        relative_files = {
+            **self._local_files(Path(artifact_root), "artifacts"),
+            **self._local_files(Path(source_pdf_root), "source-pdf"),
+        }
+        entries: list[dict[str, object]] = []
+        total_bytes = 0
+        try:
+            for relative, path in sorted(relative_files.items()):
+                content = path.read_bytes()
+                size = len(content)
+                key = f"{prefix}{relative}"
+                self._bucket.put_object_from_file(key, str(path))
+                if int(self._bucket.get_object_meta(key).content_length) != size:
+                    raise ObjectStorageError("OSS object upload verification failed")
+                entries.append(
+                    {
+                        "path": relative,
+                        "size": size,
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    }
+                )
+                total_bytes += size
+            manifest = {
+                "schema_version": 1,
+                "user_id": int(user_id),
+                "job_id": _safe_job_id(job_id),
+                "version_id": version_id,
+                "files": entries,
+            }
+            manifest_bytes = self._canonical_json(manifest)
+            self._bucket.put_object(f"{prefix}manifest.json", manifest_bytes)
+        except ObjectStorageError:
+            raise
+        except Exception:
+            # 未写 manifest 的残留版本不会被数据库引用，由孤儿扫描异步清理。
+            raise ObjectStorageError("OSS version upload failed") from None
+        return StoredVersion(
+            version_id,
+            prefix,
+            hashlib.sha256(manifest_bytes).hexdigest(),
+            len(entries),
+            total_bytes,
+        )
+
+    def verify_version(
+        self,
+        user_id: int,
+        job_id: str,
+        version_id: str,
+        expected_checksum: str,
+    ) -> StoredVersion:
+        prefix = self.version_prefix(user_id, job_id, version_id)
+        manifest_bytes = self._read_object(f"{prefix}manifest.json")
+        checksum = hashlib.sha256(manifest_bytes).hexdigest()
+        if not re.fullmatch(r"[a-f0-9]{64}", str(expected_checksum or "")) or checksum != expected_checksum:
+            raise ObjectStorageError("OSS version verification failed")
+        try:
+            manifest = json.loads(manifest_bytes)
+            if (
+                manifest.get("schema_version") != 1
+                or manifest.get("user_id") != int(user_id)
+                or manifest.get("job_id") != _safe_job_id(job_id)
+                or manifest.get("version_id") != version_id
+                or not isinstance(manifest.get("files"), list)
+            ):
+                raise ValueError
+            entries = manifest["files"]
+            expected_keys = {f"{prefix}manifest.json"}
+            paths: set[str] = set()
+            total_bytes = 0
+            for entry in entries:
+                relative = str(entry["path"])
+                pure = PurePosixPath(relative)
+                if (
+                    len(pure.parts) < 2
+                    or pure.parts[0] not in {"artifacts", "source-pdf"}
+                    or any(part in {"", ".", ".."} for part in pure.parts)
+                    or relative in paths
+                ):
+                    raise ValueError
+                paths.add(relative)
+                content = self._read_object(f"{prefix}{relative}")
+                size = int(entry["size"])
+                digest = str(entry["sha256"])
+                if size < 0 or len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+                    raise ValueError
+                total_bytes += size
+                expected_keys.add(f"{prefix}{relative}")
+            if set(self._list_keys(prefix)) != expected_keys:
+                raise ValueError
+        except ObjectStorageError:
+            raise
+        except Exception:
+            raise ObjectStorageError("OSS version verification failed") from None
+        return StoredVersion(version_id, prefix, checksum, len(entries), total_bytes)
 
     def sync_job(
         self,
