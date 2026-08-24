@@ -75,6 +75,7 @@ from services.auth_service import (
 )
 from services.admin_user_service import AdminUserService
 from storage.auth_repository import AuthRepository
+from storage.credential_crypto import CredentialCipher, CredentialKeyring
 from storage.database import configure_database, database_is_ready
 from storage.learning_repository import (
     JobSnapshot,
@@ -278,9 +279,10 @@ if _desktop_legacy_auth:
     _learning_repository = None
 else:
     configure_database()
+    _credential_cipher = CredentialCipher(CredentialKeyring.from_environment())
     _auth_service = AuthService(AuthRepository())
     _admin_user_service = AdminUserService(AuthRepository())
-    _learning_repository = LearningRepository()
+    _learning_repository = LearningRepository(cipher=_credential_cipher)
 
 if _desktop_legacy_auth:
     _init_db()
@@ -449,7 +451,15 @@ def _complete_llm_config(config):
     model_name = (config.get("model_name") or "").strip()
     api_key = (config.get("api_key") or "").strip()
     if api_url and model_name and api_key:
-        return {"api_url": api_url, "model_name": model_name, "api_key": api_key}
+        # 运行时配置必须保留独立 Embedding 凭据；公开设置接口仍只返回掩码。
+        return {
+            "api_url": api_url,
+            "model_name": model_name,
+            "api_key": api_key,
+            "embedding_url": (config.get("embedding_url") or "").strip(),
+            "embedding_model": (config.get("embedding_model") or "").strip(),
+            "embedding_api_key": (config.get("embedding_api_key") or "").strip(),
+        }
     return None
 
 
@@ -457,7 +467,7 @@ def _active_user_llm_config(user):
     if not user:
         return None
     if not _desktop_legacy_auth:
-        data = _learning_repository.get_settings(int(user["id"]))
+        data = _learning_repository.get_runtime_settings(int(user["id"]))
         configs = data.get("configs") or []
         active_index = data.get("active_index", 0)
         active = configs[active_index] if configs and 0 <= active_index < len(configs) else (configs[0] if configs else {})
@@ -689,7 +699,7 @@ def settings_get():
     if not user:
         return jsonify({"error": "not authenticated"}), 401
     if not _desktop_legacy_auth:
-        return jsonify(_learning_repository.get_settings(int(user["id"])))
+        return jsonify(_learning_repository.get_public_settings(int(user["id"])))
     db = _get_db()
     row = db.execute(
         "SELECT llm_api_url, llm_model, llm_api_key, llm_configs_json FROM user_settings WHERE user_id = ?",
@@ -733,8 +743,10 @@ def settings_put():
     if not configs and active_index != 0:
         return jsonify({"error": "active_index must be zero when configs is empty"}), 400
     if not _desktop_legacy_auth:
-        _learning_repository.upsert_settings(int(user["id"]), configs, active_index)
-        return jsonify({"ok": True})
+        saved = _learning_repository.upsert_settings(
+            int(user["id"]), configs, active_index
+        )
+        return jsonify(saved)
     data_json = json.dumps({"configs": configs, "active_index": active_index}, ensure_ascii=False)
     # Also keep legacy columns from active config for backward compat
     active = configs[active_index] if configs and 0 <= active_index < len(configs) else {}
@@ -3262,6 +3274,16 @@ def create_job():
 
     if not text_content:
         return jsonify({"error": "No content provided"}), 400
+    if not _desktop_legacy_auth and user and not str(api_key or "").strip():
+        # 浏览器只知道“已配置”状态；实际 Key 始终由服务端按当前用户解密。
+        stored_config = _active_user_llm_config(user)
+        if stored_config:
+            api_url = stored_config["api_url"]
+            model_name = stored_config["model_name"]
+            api_key = stored_config["api_key"]
+            embedding_url = stored_config.get("embedding_url", "")
+            embedding_model = stored_config.get("embedding_model", embedding_model)
+            embedding_api_key = stored_config.get("embedding_api_key", "")
     if not all([api_url, model_name, api_key]):
         return jsonify({"error": "Incomplete LLM config (api_url, model_name, api_key required)"}), 400
     embedding_model = (embedding_model or "").strip()

@@ -65,22 +65,34 @@ type ViewMode = "graph" | "hierarchical" | "linear" | "docorder";
 type ResultLayout = "md-graph" | "full-graph" | "graph-node";
 
 export interface LLMConfig {
+  config_id?: string;
   api_url: string;
   model_name: string;
   api_key: string;
+  has_api_key?: boolean;
   embedding_url: string;
   embedding_model: string;
   embedding_api_key: string;
+  has_embedding_api_key?: boolean;
 }
 
 interface LLMProfile {
+  config_id?: string;
   name: string;
   api_url: string;
   model_name: string;
   api_key: string;
+  has_api_key?: boolean;
+  api_key_masked?: string;
   embedding_url: string;
   embedding_model: string;
   embedding_api_key: string;
+  has_embedding_api_key?: boolean;
+  embedding_api_key_masked?: string;
+}
+
+function hasChatApiKey(config: LLMConfig) {
+  return Boolean(config.api_key.trim() || config.has_api_key);
 }
 
 export interface JobStatus {
@@ -641,7 +653,7 @@ function UploadScreen({
   const ocrRetryableError = ocrDisposition === "retryable_error";
   const ocrBlocked = ocrDisposition === "unavailable" || ocrDisposition === "fatal_error";
   const isLlmComplete = Boolean(
-    llm.api_url.trim() && llm.model_name.trim() && llm.api_key.trim() && llm.embedding_model.trim(),
+    llm.api_url.trim() && llm.model_name.trim() && hasChatApiKey(llm) && llm.embedding_model.trim(),
   );
 
   useEffect(() => () => {
@@ -736,7 +748,7 @@ function UploadScreen({
     const hasText = textInput.trim().length > 0;
 
     if (!hasFile && !hasText) { setErr("请选择文件或输入文本"); return; }
-    if (!ocrPreview && !(file && isPdfFile(file)) && (!llm.api_url || !llm.model_name || !llm.api_key)) {
+    if (!ocrPreview && !(file && isPdfFile(file)) && (!llm.api_url || !llm.model_name || !hasChatApiKey(llm))) {
       setErr("LLM 配置尚未完成，可使用新手向导逐步填写。");
       setConfigOpen(true);
       onShowApiGuide("chat");
@@ -974,7 +986,7 @@ function UploadScreen({
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <Settings size={13} style={{ color: "var(--muted)" }} />
                 <span style={{ fontSize: 13, fontWeight: 500, color: "var(--ink)" }}>LLM 配置</span>
-                {llm.api_url && llm.model_name && llm.api_key && llm.embedding_model
+                {llm.api_url && llm.model_name && hasChatApiKey(llm) && llm.embedding_model
                   ? <span style={{ fontSize: 11, color: "var(--ok)", fontWeight: 500 }}>✓ 已填写</span>
                   : <span style={{ fontSize: 11, color: "var(--danger)" }}>未填写</span>}
               </div>
@@ -2787,7 +2799,15 @@ function SettingsModal({
       }, auth.token);
       if (!isAuthRequestIdentityCurrent(requestIdentity)) return;
       if (!res.ok) { setErr("保存失败，请重试"); return; }
-      onSave(drafts, activeIdx);
+      const savedPayload = await res.json();
+      const savedProfiles: LLMProfile[] = Array.isArray(savedPayload.configs)
+        ? savedPayload.configs.map((profile: LLMProfile) => ({
+            ...profile,
+            api_key: "",
+            embedding_api_key: "",
+          }))
+        : drafts;
+      onSave(savedProfiles, savedPayload.active_index ?? activeIdx);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch {
@@ -2923,7 +2943,7 @@ function SettingsModal({
                   </div>
                   <div className="mg-field">
                     <label className="mg-label">API Key</label>
-                    <input className="mg-input" type="password" placeholder="sk-…"
+                    <input className="mg-input" type="password" placeholder={p.has_api_key ? "已配置，留空保持不变" : "sk-…"}
                       value={p.api_key} onChange={e => updateDraft(i, { api_key: e.target.value })} />
                   </div>
                   <div className="mg-field">
@@ -2938,7 +2958,7 @@ function SettingsModal({
                   </div>
                   <div className="mg-field">
                     <label className="mg-label">Embedding API Key（可选）</label>
-                    <input className="mg-input" type="password" placeholder="默认使用 LLM API Key"
+                    <input className="mg-input" type="password" placeholder={p.has_embedding_api_key ? "Embedding Key 已配置，留空保持不变" : "默认使用 LLM API Key"}
                       value={p.embedding_api_key} onChange={e => updateDraft(i, { embedding_api_key: e.target.value })} />
                   </div>
                 </div>
@@ -3078,13 +3098,18 @@ export default function Home() {
       const s = await res.json();
       if (!isAuthRequestIdentityCurrent(requestIdentity)) return;
       const profiles: LLMProfile[] = (Array.isArray(s.configs) ? s.configs : []).map((profile: Partial<LLMProfile>) => ({
+        config_id: profile.config_id,
         name: profile.name ?? "",
         api_url: profile.api_url ?? "",
         model_name: profile.model_name ?? "",
-        api_key: profile.api_key ?? "",
+        api_key: "",
+        has_api_key: Boolean(profile.has_api_key),
+        api_key_masked: profile.api_key_masked ?? "",
         embedding_url: profile.embedding_url ?? "",
         embedding_model: profile.embedding_model ?? "",
-        embedding_api_key: profile.embedding_api_key ?? "",
+        embedding_api_key: "",
+        has_embedding_api_key: Boolean(profile.has_embedding_api_key),
+        embedding_api_key_masked: profile.embedding_api_key_masked ?? "",
       }));
       const idx: number = s.active_index ?? 0;
       setLlmProfiles(profiles);
@@ -3092,9 +3117,12 @@ export default function Home() {
       if (profiles.length > 0) {
         const active = profiles[Math.min(idx, profiles.length - 1)];
         const cfg: LLMConfig = {
+          config_id: active.config_id,
           api_url: active.api_url, model_name: active.model_name, api_key: active.api_key,
+          has_api_key: active.has_api_key,
           embedding_url: active.embedding_url, embedding_model: active.embedding_model,
           embedding_api_key: active.embedding_api_key,
+          has_embedding_api_key: active.has_embedding_api_key,
         };
         setLlm(cfg);
         saveLlm(cfg);
@@ -3534,9 +3562,12 @@ export default function Home() {
             if (profiles.length > 0) {
               const active = profiles[Math.min(idx, profiles.length - 1)];
               const cfg: LLMConfig = {
+                config_id: active.config_id,
                 api_url: active.api_url, model_name: active.model_name, api_key: active.api_key,
+                has_api_key: active.has_api_key,
                 embedding_url: active.embedding_url, embedding_model: active.embedding_model,
                 embedding_api_key: active.embedding_api_key,
+                has_embedding_api_key: active.has_embedding_api_key,
               };
               setLlm(cfg); saveLlm(cfg);
             }

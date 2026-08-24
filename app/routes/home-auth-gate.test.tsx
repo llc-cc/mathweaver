@@ -103,13 +103,16 @@ describe("Home Web authentication gate", () => {
       const url = String(input);
       if (url.includes("/api/v2/settings")) return new Response(JSON.stringify({
         configs: [{
+          config_id: "home-config",
           name: "默认配置",
           api_url: "https://llm.example/v1",
           model_name: "model",
-          api_key: "key",
+          has_api_key: true,
+          api_key_masked: "********",
           embedding_url: "https://embed.example/v1",
           embedding_model: "embedding",
-          embedding_api_key: "embed-key",
+          has_embedding_api_key: true,
+          embedding_api_key_masked: "********",
         }],
         active_index: 0,
       }), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -182,13 +185,16 @@ describe("Home Web authentication gate", () => {
       if (url.endsWith("/api/v2/settings")) {
         const token = new Headers(init?.headers).get("Authorization");
         const configs = token === "Bearer home-token" ? [{
+          config_id: "account-a-config",
           name: "A 配置",
           api_url: "https://a.example/v1",
           model_name: "a-model",
-          api_key: "account-a-ui-secret",
+          has_api_key: true,
+          api_key_masked: "********",
           embedding_url: "https://a.example/embed",
           embedding_model: "a-embed",
-          embedding_api_key: "account-a-ui-embed-secret",
+          has_embedding_api_key: true,
+          embedding_api_key_masked: "********",
         }] : [];
         return new Response(JSON.stringify({ configs, active_index: 0 }), {
           status: 200,
@@ -211,6 +217,8 @@ describe("Home Web authentication gate", () => {
       && new Headers(init?.headers).get("Authorization") === "Bearer home-token"
     ))).toBe(true));
     fireEvent.click(screen.getAllByRole("button", { name: /设置/ })[0]);
+    fireEvent.click(await screen.findByText("A 配置"));
+    expect((await screen.findByPlaceholderText("已配置，留空保持不变") as HTMLInputElement).value).toBe("");
     fireEvent.click(await screen.findByRole("button", { name: /退出登录/ }));
     fireEvent.click((await screen.findAllByRole("button", { name: "登录" }))[0]);
     fireEvent.change(screen.getByPlaceholderText("学号或邮箱"), { target: { value: "20260018" } });
@@ -382,13 +390,16 @@ describe("Home Web authentication gate", () => {
       const url = String(input);
       if (url.endsWith("/api/v2/settings")) return new Response(JSON.stringify({
         configs: [{
+          config_id: "ready-config",
           name: "ready",
           api_url: "https://llm.example/v1",
           model_name: "model",
-          api_key: "key",
+          has_api_key: true,
+          api_key_masked: "********",
           embedding_url: "",
           embedding_model: "embed",
-          embedding_api_key: "",
+          has_embedding_api_key: false,
+          embedding_api_key_masked: "",
         }],
         active_index: 0,
       }), { status: 200, headers: { "Content-Type": "application/json" } });

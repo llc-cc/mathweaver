@@ -36,7 +36,7 @@ sys.modules.setdefault("JoinAgent", join_agent)
 import api_v2
 from storage import database as storage_database
 from storage.database import configure_database, get_engine, session_scope
-from storage.models import Base, History, User
+from storage.models import Base, History, User, UserSettings
 from storage.object_storage import ObjectStorageError
 
 
@@ -251,6 +251,50 @@ def test_settings_route_rejects_malformed_json(authenticated_clients, payload):
     client, _users, tokens = authenticated_clients
     response = client.put("/api/v2/settings", json=payload, headers=_headers(tokens[0]))
     assert response.status_code == 400
+
+
+def test_settings_route_never_returns_key_and_blank_update_preserves_it(
+    authenticated_clients,
+):
+    client, users, tokens = authenticated_clients
+    initial = {
+        "configs": [
+            {
+                "name": "Primary",
+                "api_url": "https://api.example/v1",
+                "model_name": "chat-model",
+                "api_key": "browser-must-not-see",
+                "embedding_model": "embed-model",
+            }
+        ],
+        "active_index": 0,
+    }
+    saved_response = client.put(
+        "/api/v2/settings", json=initial, headers=_headers(tokens[0])
+    )
+    assert saved_response.status_code == 200
+    assert saved_response.get_json()["configs"][0]["has_api_key"] is True
+    assert "browser-must-not-see" not in saved_response.get_data(as_text=True)
+
+    response = client.get("/api/v2/settings", headers=_headers(tokens[0]))
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "browser-must-not-see" not in response.get_data(as_text=True)
+    assert payload["configs"][0]["has_api_key"] is True
+    assert "api_key" not in payload["configs"][0]
+    payload["configs"][0]["api_key"] = ""
+    assert client.put(
+        "/api/v2/settings", json=payload, headers=_headers(tokens[0])
+    ).status_code == 200
+    runtime = api_v2._learning_repository.get_runtime_settings(users[0][0])
+    assert runtime["configs"][0]["api_key"] == "browser-must-not-see"
+    with session_scope() as session:
+        row = session.get(UserSettings, users[0][0])
+        assert row is not None
+        assert row.llm_api_key == ""
+        assert "browser-must-not-see" not in json.dumps(row.llm_configs_json)
+        assert "browser-must-not-see" not in json.dumps(row.llm_secrets_encrypted_json)
 
 
 @pytest.mark.parametrize("invalid", ["bad", [], None, False])
@@ -532,6 +576,44 @@ def test_job_creation_surfaces_progress_failure_without_marking_persisted(
         )
     assert response.status_code == 500
     assert all(not job.get("_history_persisted") for job in api_v2._jobs.values())
+
+
+def test_authenticated_job_uses_stored_key_when_browser_sends_blank(
+    authenticated_clients,
+):
+    client, users, tokens = authenticated_clients
+    api_v2._learning_repository.upsert_settings(
+        users[0][0],
+        [{
+            "name": "Stored",
+            "api_url": "https://stored.example/v1",
+            "model_name": "stored-model",
+            "api_key": "stored-secret",
+            "embedding_url": "https://stored.example/embed",
+            "embedding_model": "stored-embedding",
+            "embedding_api_key": "stored-embedding-secret",
+        }],
+        0,
+    )
+
+    with patch.object(api_v2, "_start_pipeline_attempt"):
+        response = client.post(
+            "/api/v2/jobs",
+            json={
+                "text": "# demo",
+                "api_url": "https://stored.example/v1",
+                "model_name": "stored-model",
+                "api_key": "",
+                "embedding_model": "stored-embedding",
+            },
+            headers=_headers(tokens[0]),
+        )
+
+    assert response.status_code == 202
+    job = api_v2._jobs[response.get_json()["job_id"]]
+    assert job["_llm_config"]["api_key"] == "stored-secret"
+    assert job["_llm_config"]["embedding_url"] == "https://stored.example/embed"
+    assert job["_llm_config"]["embedding_api_key"] == "stored-embedding-secret"
 
 
 def _install_persisted_live_job(owner_id: int, tmp_path: Path, status: str = "running") -> dict:
