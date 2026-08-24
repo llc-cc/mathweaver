@@ -200,7 +200,8 @@ class StorageOutbox(Base):
     id: Mapped[int] = mapped_column(
         BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
     )
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # outbox 必须在账号删除后仍可完成对象清理，因此只保存不可变 owner ID，不设级联外键。
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
     history_id: Mapped[str] = mapped_column(String(64), nullable=False)
     version_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     operation: Mapped[str] = mapped_column(String(32), nullable=False)

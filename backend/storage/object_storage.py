@@ -504,3 +504,18 @@ class OssObjectStorage:
         keys = self._list_keys(versions_prefix)
         if keys:
             self._delete_keys(keys)
+
+    def list_committed_versions(self) -> set[tuple[int, str, str]]:
+        """仅把存在 manifest 提交标记的版本暴露给漂移扫描。"""
+        root = f"{self._config.prefix}users/"
+        pattern = re.compile(
+            rf"^{re.escape(root)}([1-9][0-9]*)/jobs/"
+            rf"([A-Za-z0-9][A-Za-z0-9_.-]{{0,127}})/versions/"
+            rf"([a-f0-9]{{32}})/manifest\.json$"
+        )
+        versions: set[tuple[int, str, str]] = set()
+        for key in self._list_keys(root):
+            match = pattern.fullmatch(key)
+            if match:
+                versions.add((int(match.group(1)), match.group(2), match.group(3)))
+        return versions
