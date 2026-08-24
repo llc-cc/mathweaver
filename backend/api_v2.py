@@ -1207,7 +1207,13 @@ def _history_item_payload(row):
     }
 
 
-def _upsert_job_history(job: dict, status: str, user_id: int | None = None) -> bool:
+def _upsert_job_history(
+    job: dict,
+    status: str,
+    user_id: int | None = None,
+    *,
+    stored_version=None,
+) -> bool:
     owner_id = user_id if user_id is not None else job.get("_user_id")
     if owner_id is None:
         return False
@@ -1245,7 +1251,13 @@ def _upsert_job_history(job: dict, status: str, user_id: int | None = None) -> b
             object_storage_prefix=job.get("_object_storage_prefix"),
         )
         try:
-            persisted = _learning_repository.upsert_job_progress(int(owner_id), snapshot)
+            persisted = (
+                _learning_repository.commit_storage_version(
+                    int(owner_id), snapshot, stored_version
+                )
+                if stored_version is not None
+                else _learning_repository.upsert_job_progress(int(owner_id), snapshot)
+            )
         except Exception:
             return False
         if persisted:
@@ -1675,6 +1687,19 @@ def history_delete(hist_id):
         if live_job and live_job.get("status") == "running":
             return jsonify({"error": "Pause the running task before deleting it"}), 409
         artifact_dir = live_job.get("_artifact_dir") if live_job else None
+    if not _desktop_legacy_auth:
+        # 请求事务只做软删除和 outbox；OSS 与本地缓存清理由可重试 worker 完成。
+        if not _learning_repository.soft_delete_history(int(user["id"]), hist_id):
+            return jsonify({"error": "not found"}), 404
+        with _jobs_lock:
+            _jobs.pop(hist_id, None)
+            runtime = _job_runtimes.pop(hist_id, None)
+        if runtime and runtime.get("queue"):
+            try:
+                runtime["queue"].close()
+            except Exception:
+                pass
+        return jsonify({"ok": True, "cleanup_status": "pending"})
     try:
         _cancel_job_record(
             hist_id,
@@ -3014,7 +3039,7 @@ def _persist_job_with_files(
         return False
     if not _desktop_legacy_auth and _object_storage is not None:
         try:
-            prefix = _object_storage.sync_job(
+            stored_version = _object_storage.upload_version(
                 int(owner_id),
                 str(job["job_id"]),
                 _persistent_job_dir(str(job["job_id"])),
@@ -3022,7 +3047,10 @@ def _persist_job_with_files(
             )
         except (ObjectStorageError, OSError, ValueError):
             return False
-        job["_object_storage_prefix"] = prefix
+        job["_object_storage_prefix"] = stored_version.prefix
+        return _upsert_job_history(
+            job, status, int(owner_id), stored_version=stored_version
+        )
     return _upsert_job_history(job, status, int(owner_id))
 
 

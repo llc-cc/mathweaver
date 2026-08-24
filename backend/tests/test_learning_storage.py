@@ -149,6 +149,21 @@ class FakeObjectStorage:
         (source_pdf_root / "compile.log").write_text("restored log", encoding="utf-8")
         return True
 
+    def upload_version(
+        self,
+        user_id: int,
+        job_id: str,
+        artifact_root: Path,
+        source_pdf_root: Path,
+    ) -> StoredVersion:
+        del artifact_root, source_pdf_root
+        if self.fail_sync:
+            raise ObjectStorageError("OSS object upload failed")
+        self.synced.append((user_id, job_id))
+        version_id = "f" * 32
+        prefix = f"{self.task_prefix(user_id, job_id)}versions/{version_id}/"
+        return StoredVersion(version_id, prefix, "9" * 64, 2, 10)
+
     def delete_job(self, user_id: int, job_id: str) -> None:
         self.deleted.append((user_id, job_id))
 
@@ -426,10 +441,13 @@ def test_soft_delete_hides_history_and_enqueues_cleanup(users):
     assert repository.get_owned_history(owner_id, "job-delete") is None
     assert repository.list_history(owner_id) == []
     with session_scope() as session:
-        operation = session.scalar(
+        operations = session.scalars(
             select(StorageOutbox).where(StorageOutbox.history_id == "job-delete")
-        )
-    assert operation.operation == "delete_job_versions"
+        ).all()
+    assert {item.operation for item in operations} == {
+        "delete_job_versions",
+        "delete_local_cache",
+    }
 
 
 def test_list_history_uses_summary_projection_without_large_json(users):
@@ -750,7 +768,7 @@ def test_async_persistence_failure_is_exposed_without_false_success(
     assert job.get("result") is None
 
 
-def test_web_job_syncs_oss_before_database_success(users, tmp_path, monkeypatch):
+def test_web_job_verifies_new_oss_version_before_database_pointer_switch(users, tmp_path, monkeypatch):
     owner_id = users[0][0]
     job = _install_persisted_live_job(owner_id, tmp_path)
     storage = FakeObjectStorage()
@@ -769,7 +787,10 @@ def test_web_job_syncs_oss_before_database_success(users, tmp_path, monkeypatch)
     row = _repository().get_owned_history(owner_id, job["job_id"])
 
     assert order == ["database"]
-    assert row["object_storage_prefix"] == storage.task_prefix(owner_id, job["job_id"])
+    assert row["object_storage_prefix"].startswith(
+        f"{storage.task_prefix(owner_id, job['job_id'])}versions/"
+    )
+    assert row["storage_version"] == "f" * 32
 
 
 def test_oss_failure_never_reports_persistence_success(users, tmp_path, monkeypatch):
@@ -944,7 +965,7 @@ def test_history_resume_restores_cache_before_availability_check(
     assert forbidden.status_code == 404
 
 
-def test_history_delete_removes_owned_oss_prefix(authenticated_clients, monkeypatch):
+def test_history_delete_soft_deletes_before_async_object_cleanup(authenticated_clients, monkeypatch):
     client, users, tokens = authenticated_clients
     owner_id = users[0][0]
     storage = FakeObjectStorage()
@@ -964,7 +985,9 @@ def test_history_delete_removes_owned_oss_prefix(authenticated_clients, monkeypa
     )
 
     assert response.status_code == 200
-    assert storage.deleted == [(owner_id, "delete-oss-job")]
+    assert response.get_json()["cleanup_status"] == "pending"
+    assert storage.deleted == []
+    assert _repository().get_owned_history(owner_id, "delete-oss-job") is None
 
 
 def test_explicit_desktop_mode_restores_sqlite_source_pdf_and_artifact_fallback(

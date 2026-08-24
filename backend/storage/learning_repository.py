@@ -422,6 +422,17 @@ class LearningRepository:
                     next_attempt_at=utc_now(),
                 )
             )
+            session.add(
+                StorageOutbox(
+                    user_id=user_id,
+                    history_id=history_id,
+                    version_id=None,
+                    operation="delete_local_cache",
+                    idempotency_key=f"delete-local-cache:{user_id}:{history_id}",
+                    payload_json={},
+                    next_attempt_at=utc_now(),
+                )
+            )
             return True
 
     def update_source_pdf(self, user_id: int, history_id: str, safe_meta: dict) -> bool:
