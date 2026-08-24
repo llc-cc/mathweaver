@@ -189,6 +189,60 @@ def test_delete_version_removes_only_the_selected_immutable_version(tmp_path: Pa
     assert bucket.objects_with_prefix(second.prefix)
 
 
+def test_corrupt_restore_keeps_existing_cache_unchanged(tmp_path: Path) -> None:
+    bucket = FakeBucket()
+    storage = configured_storage(bucket)
+    source_artifacts = tmp_path / "source-artifacts"
+    source_pdf = tmp_path / "source-pdf"
+    source_artifacts.mkdir()
+    source_pdf.mkdir()
+    (source_artifacts / "nodes.json").write_text('[{"id":1}]', encoding="utf-8")
+    (source_pdf / "source.pdf").write_bytes(b"new-pdf")
+    stored = storage.upload_version(7, "job-1", source_artifacts, source_pdf)
+    bucket.objects[f"{stored.prefix}artifacts/nodes.json"] = b"corrupt"
+    target_artifacts = tmp_path / "target-artifacts"
+    target_pdf = tmp_path / "target-pdf"
+    target_artifacts.mkdir()
+    target_pdf.mkdir()
+    (target_artifacts / "marker.txt").write_text("old-artifacts", encoding="utf-8")
+    (target_pdf / "marker.txt").write_text("old-pdf", encoding="utf-8")
+
+    with pytest.raises(ObjectStorageError, match="verification failed"):
+        storage.restore_version(
+            7, "job-1", stored.version_id, stored.manifest_checksum,
+            target_artifacts, target_pdf,
+        )
+
+    assert (target_artifacts / "marker.txt").read_text(encoding="utf-8") == "old-artifacts"
+    assert (target_pdf / "marker.txt").read_text(encoding="utf-8") == "old-pdf"
+
+
+def test_verified_restore_replaces_both_cache_roots(tmp_path: Path) -> None:
+    bucket = FakeBucket()
+    storage = configured_storage(bucket)
+    source_artifacts = tmp_path / "source-artifacts"
+    source_pdf = tmp_path / "source-pdf"
+    source_artifacts.mkdir()
+    source_pdf.mkdir()
+    (source_artifacts / "nodes.json").write_text('[{"id":1}]', encoding="utf-8")
+    (source_pdf / "source.pdf").write_bytes(b"new-pdf")
+    stored = storage.upload_version(7, "job-1", source_artifacts, source_pdf)
+    target_artifacts = tmp_path / "target-artifacts"
+    target_pdf = tmp_path / "target-pdf"
+    target_artifacts.mkdir()
+    target_pdf.mkdir()
+    (target_artifacts / "stale.txt").write_text("stale", encoding="utf-8")
+
+    assert storage.restore_version(
+        7, "job-1", stored.version_id, stored.manifest_checksum,
+        target_artifacts, target_pdf,
+    ) is True
+
+    assert not (target_artifacts / "stale.txt").exists()
+    assert (target_artifacts / "nodes.json").read_text(encoding="utf-8") == '[{"id":1}]'
+    assert (target_pdf / "source.pdf").read_bytes() == b"new-pdf"
+
+
 def test_sync_skips_transient_files_and_removes_stale_remote_objects(tmp_path: Path) -> None:
     bucket = FakeBucket()
     storage = configured_storage(bucket)

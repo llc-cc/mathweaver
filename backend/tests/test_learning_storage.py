@@ -116,6 +116,9 @@ class FakeObjectStorage:
     def task_prefix(user_id: int, job_id: str) -> str:
         return f"mathweaver/users/{user_id}/jobs/{job_id}/"
 
+    def version_prefix(self, user_id: int, job_id: str, version_id: str) -> str:
+        return f"{self.task_prefix(user_id, job_id)}versions/{version_id}/"
+
     def sync_job(
         self,
         user_id: int,
@@ -148,6 +151,18 @@ class FakeObjectStorage:
         (source_pdf_root / "source.tex").write_text("\\begin{document}x\\end{document}", encoding="utf-8")
         (source_pdf_root / "compile.log").write_text("restored log", encoding="utf-8")
         return True
+
+    def restore_version(
+        self,
+        user_id: int,
+        job_id: str,
+        version_id: str,
+        expected_checksum: str,
+        artifact_root: Path,
+        source_pdf_root: Path,
+    ) -> bool:
+        del version_id, expected_checksum
+        return self.restore_job(user_id, job_id, artifact_root, source_pdf_root)
 
     def upload_version(
         self,

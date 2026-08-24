@@ -1147,9 +1147,26 @@ def _restore_job_files(job: dict) -> bool:
     stored_prefix = job.get("_object_storage_prefix")
     if owner_id is None or not job_id or not stored_prefix:
         return False
-    expected_prefix = _object_storage.task_prefix(int(owner_id), job_id)
+    storage_version = job.get("_storage_version")
+    storage_checksum = job.get("_storage_checksum")
+    expected_prefix = (
+        _object_storage.version_prefix(int(owner_id), job_id, storage_version)
+        if storage_version
+        else _object_storage.task_prefix(int(owner_id), job_id)
+    )
     if stored_prefix != expected_prefix:
         raise ObjectStorageError("stored OSS task prefix does not match task ownership")
+    if storage_version:
+        if not storage_checksum:
+            raise ObjectStorageError("stored OSS version checksum is missing")
+        return _object_storage.restore_version(
+            int(owner_id),
+            job_id,
+            storage_version,
+            storage_checksum,
+            _persistent_job_dir(job_id),
+            _source_pdf_dir(job_id),
+        )
     return _object_storage.restore_job(
         int(owner_id),
         job_id,
@@ -1356,6 +1373,8 @@ def _history_job_resource(row: dict) -> dict:
         "_history_persisted": True,
         "_persistent_artifacts": True,
         "_object_storage_prefix": row.get("object_storage_prefix"),
+        "_storage_version": row.get("storage_version"),
+        "_storage_checksum": row.get("storage_checksum"),
         "_artifact_dir": str(_persistent_job_dir(row["id"])),
         "_is_live": False,
         "created_at": row.get("created_at"),
@@ -1543,6 +1562,8 @@ def history_resume(hist_id):
                 "job_id": hist_id,
                 "_user_id": int(user["id"]),
                 "_object_storage_prefix": row.get("object_storage_prefix"),
+                "_storage_version": row.get("storage_version"),
+                "_storage_checksum": row.get("storage_checksum"),
             })
         except ObjectStorageError:
             return jsonify({"error": "Task files could not be restored from OSS"}), 503

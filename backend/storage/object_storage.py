@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import threading
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -120,6 +122,8 @@ class OssObjectStorage:
             self._bucket = factory(config)
         except Exception:
             raise ObjectStorageError("OSS client initialization failed") from None
+        self._restore_locks: dict[tuple[int, str], threading.Lock] = {}
+        self._restore_locks_guard = threading.Lock()
 
     def task_prefix(self, user_id: int, job_id: str) -> str:
         if isinstance(user_id, bool) or int(user_id) <= 0:
@@ -379,6 +383,108 @@ class OssObjectStorage:
                 temporary.unlink(missing_ok=True)
                 raise ObjectStorageError("OSS object download failed") from None
         return bool(keys)
+
+    def restore_version(
+        self,
+        user_id: int,
+        job_id: str,
+        version_id: str,
+        expected_checksum: str,
+        artifact_root: Path,
+        source_pdf_root: Path,
+    ) -> bool:
+        lock_key = (int(user_id), _safe_job_id(job_id))
+        with self._restore_locks_guard:
+            lock = self._restore_locks.setdefault(lock_key, threading.Lock())
+        with lock:
+            return self._restore_version_locked(
+                user_id,
+                job_id,
+                version_id,
+                expected_checksum,
+                Path(artifact_root),
+                Path(source_pdf_root),
+            )
+
+    def _restore_version_locked(
+        self,
+        user_id: int,
+        job_id: str,
+        version_id: str,
+        expected_checksum: str,
+        artifact_root: Path,
+        source_pdf_root: Path,
+    ) -> bool:
+        self.verify_version(user_id, job_id, version_id, expected_checksum)
+        prefix = self.version_prefix(user_id, job_id, version_id)
+        manifest = json.loads(self._read_object(f"{prefix}manifest.json"))
+        restore_id = uuid.uuid4().hex
+        staging = {
+            "artifacts": artifact_root.parent / f".{artifact_root.name}.restore.{restore_id}",
+            "source-pdf": source_pdf_root.parent / f".{source_pdf_root.name}.restore.{restore_id}",
+        }
+        backups = {
+            artifact_root: artifact_root.parent / f".{artifact_root.name}.backup.{restore_id}",
+            source_pdf_root: source_pdf_root.parent / f".{source_pdf_root.name}.backup.{restore_id}",
+        }
+        installed: list[Path] = []
+        moved_backups: list[Path] = []
+        try:
+            for stage in staging.values():
+                stage.mkdir(parents=True)
+            for entry in manifest["files"]:
+                relative = PurePosixPath(str(entry["path"]))
+                stage = staging[relative.parts[0]]
+                target = stage.joinpath(*relative.parts[1:])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                content = self._read_object(f"{prefix}{relative.as_posix()}")
+                if (
+                    len(content) != int(entry["size"])
+                    or hashlib.sha256(content).hexdigest() != str(entry["sha256"])
+                ):
+                    raise ObjectStorageError("OSS version verification failed")
+                target.write_bytes(content)
+
+            for target, stage in (
+                (artifact_root, staging["artifacts"]),
+                (source_pdf_root, staging["source-pdf"]),
+            ):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                backup = backups[target]
+                if target.exists():
+                    os.replace(target, backup)
+                    moved_backups.append(target)
+                os.replace(stage, target)
+                installed.append(target)
+        except ObjectStorageError:
+            self._rollback_restore(installed, moved_backups, backups)
+            raise
+        except Exception:
+            self._rollback_restore(installed, moved_backups, backups)
+            raise ObjectStorageError("OSS version restore failed") from None
+        finally:
+            for stage in staging.values():
+                if stage.exists():
+                    shutil.rmtree(stage, ignore_errors=True)
+        for backup in backups.values():
+            if backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+        return True
+
+    @staticmethod
+    def _rollback_restore(
+        installed: list[Path], moved_backups: list[Path], backups: dict[Path, Path]
+    ) -> None:
+        # 两个根目录视为一个恢复单元，任一安装失败都恢复旧缓存。
+        for target in reversed(installed):
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            elif target.exists():
+                target.unlink(missing_ok=True)
+        for target in reversed(moved_backups):
+            backup = backups[target]
+            if backup.exists():
+                os.replace(backup, target)
 
     def delete_job(self, user_id: int, job_id: str) -> None:
         prefix = self.task_prefix(user_id, job_id)
