@@ -187,6 +187,10 @@ class UserSettings(Base):
     llm_model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     llm_api_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
     llm_configs_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    # 凭据与公开配置分列保存，避免读取普通设置 JSON 时意外带出模型密钥。
+    llm_secrets_encrypted_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
     )
