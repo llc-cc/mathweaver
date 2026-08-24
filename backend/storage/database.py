@@ -78,6 +78,18 @@ def database_is_ready() -> bool:
         return False
 
 
+def validate_mysql_packet(engine: Engine, required_bytes: int) -> int:
+    """校验大 JSON 上限并预留 1 MiB 协议开销，只返回数值而不泄露连接信息。"""
+    required = int(required_bytes)
+    if required <= 0:
+        raise ValueError("required_bytes must be positive")
+    with engine.connect() as connection:
+        configured = int(connection.execute(text("SELECT @@max_allowed_packet")).scalar_one())
+    if configured < required + 1024 * 1024:
+        raise RuntimeError("max_allowed_packet is below the required payload boundary")
+    return configured
+
+
 @contextmanager
 def session_scope() -> Iterator[Session]:
     """提供原子事务：成功提交，异常时回滚所有本次写入。"""
