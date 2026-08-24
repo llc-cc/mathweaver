@@ -12,13 +12,14 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from storage.credential_crypto import CredentialCipher, CredentialConfigurationError
 from storage.database import session_scope
-from storage.models import History, ProofWorkspace, UserSettings, utc_now
+from storage.models import History, ProofWorkspace, StorageOutbox, UserSettings, utc_now
+from storage.object_storage import StoredVersion
 
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
@@ -275,54 +276,153 @@ class LearningRepository:
     def list_history(self, user_id: int, limit: int = 50) -> list[dict]:
         safe_limit = min(max(int(limit), 1), 200)
         with self._session_factory() as session:
-            rows = session.scalars(
-                select(History)
-                .where(History.user_id == user_id)
+            # 列表只取摘要列，避免每次打开历史页加载节点、边和正文大 JSON。
+            rows = session.execute(
+                select(
+                    History.id,
+                    History.filename,
+                    History.node_count,
+                    History.edge_count,
+                    History.status,
+                    History.stage,
+                    History.stage_label,
+                    History.stage_index,
+                    History.total_stages,
+                    History.stages_done_json,
+                    History.experimental_logic_ir,
+                    History.updated_at,
+                    History.created_at,
+                )
+                .where(History.user_id == user_id, History.deleted_at.is_(None))
                 .order_by(History.created_at.desc(), History.id.desc())
                 .limit(safe_limit)
             ).all()
-            return [self._history_dict(row) for row in rows]
+            return [
+                {
+                    **dict(row._mapping),
+                    "stages_done": list(row.stages_done_json or []),
+                    "updated_at": _iso(row.updated_at),
+                    "created_at": _iso(row.created_at),
+                }
+                for row in rows
+            ]
 
     def get_owned_history(self, user_id: int, history_id: str) -> dict | None:
         with self._session_factory() as session:
             row = session.scalar(
-                select(History).where(History.id == history_id, History.user_id == user_id)
+                select(History).where(
+                    History.id == history_id,
+                    History.user_id == user_id,
+                    History.deleted_at.is_(None),
+                )
             )
             return self._history_dict(row) if row is not None else None
+
+    @staticmethod
+    def _apply_snapshot(row: History, snapshot: JobSnapshot) -> None:
+        row.filename = snapshot.filename
+        row.node_count = len(snapshot.nodes)
+        row.edge_count = len(snapshot.edges)
+        row.nodes_json = deepcopy(snapshot.nodes)
+        row.edges_json = deepcopy(snapshot.edges)
+        row.source_markdown = snapshot.source_markdown
+        row.latex_macros = json.dumps(snapshot.latex_macros or {}, ensure_ascii=False)
+        row.source_pdf_json = sanitize_source_pdf_meta(snapshot.source_pdf)
+        row.status = snapshot.status
+        row.stage = snapshot.stage
+        row.stage_label = snapshot.stage_label
+        row.stage_index = int(snapshot.stage_index)
+        row.total_stages = int(snapshot.total_stages)
+        row.stages_done_json = list(snapshot.stages_done)
+        row.source_format = snapshot.source_format
+        row.experimental_logic_ir = bool(snapshot.experimental_logic_ir)
+        row.created_at = snapshot.created_at
+        row.updated_at = utc_now()
 
     def upsert_job_progress(self, user_id: int, snapshot: JobSnapshot) -> bool:
         try:
             with self._session_factory() as session:
                 row = session.get(History, snapshot.job_id)
-                if row is not None and int(row.user_id) != int(user_id):
+                if row is not None and (
+                    int(row.user_id) != int(user_id) or row.deleted_at is not None
+                ):
                     # 主键全局唯一，已有记录的归属不能被新请求覆盖或转移。
                     return False
                 if row is None:
                     row = History(id=snapshot.job_id, user_id=user_id, filename=snapshot.filename)
                     session.add(row)
-                row.filename = snapshot.filename
-                row.node_count = len(snapshot.nodes)
-                row.edge_count = len(snapshot.edges)
-                row.nodes_json = deepcopy(snapshot.nodes)
-                row.edges_json = deepcopy(snapshot.edges)
-                row.source_markdown = snapshot.source_markdown
-                row.latex_macros = json.dumps(snapshot.latex_macros or {}, ensure_ascii=False)
-                row.source_pdf_json = sanitize_source_pdf_meta(snapshot.source_pdf)
-                row.status = snapshot.status
-                row.stage = snapshot.stage
-                row.stage_label = snapshot.stage_label
-                row.stage_index = int(snapshot.stage_index)
-                row.total_stages = int(snapshot.total_stages)
-                row.stages_done_json = list(snapshot.stages_done)
-                row.source_format = snapshot.source_format
-                row.experimental_logic_ir = bool(snapshot.experimental_logic_ir)
+                self._apply_snapshot(row, snapshot)
                 row.object_storage_prefix = snapshot.object_storage_prefix
-                row.created_at = snapshot.created_at
-                row.updated_at = utc_now()
             return True
         except IntegrityError:
             # 并发插入同一任务 ID 时由数据库唯一键兜底，调用方得到稳定冲突结果。
             return False
+
+    def commit_storage_version(
+        self, user_id: int, snapshot: JobSnapshot, stored: StoredVersion
+    ) -> bool:
+        """任务快照、版本指针和旧版本清理事件必须在同一数据库事务提交。"""
+        try:
+            with self._session_factory() as session:
+                row = session.get(History, snapshot.job_id)
+                if row is not None and (
+                    int(row.user_id) != int(user_id) or row.deleted_at is not None
+                ):
+                    return False
+                if row is None:
+                    row = History(id=snapshot.job_id, user_id=user_id, filename=snapshot.filename)
+                    session.add(row)
+                old_version = row.storage_version
+                self._apply_snapshot(row, snapshot)
+                row.object_storage_prefix = stored.prefix
+                row.storage_version = stored.version_id
+                row.storage_status = "ready"
+                row.storage_checksum = stored.manifest_checksum
+                row.storage_file_count = int(stored.file_count)
+                row.storage_bytes = int(stored.total_bytes)
+                if old_version and old_version != stored.version_id:
+                    session.add(
+                        StorageOutbox(
+                            user_id=user_id,
+                            history_id=snapshot.job_id,
+                            version_id=old_version,
+                            operation="delete_version",
+                            idempotency_key=(
+                                f"delete-version:{user_id}:{snapshot.job_id}:{old_version}"
+                            ),
+                            payload_json={"version_id": old_version},
+                            next_attempt_at=utc_now(),
+                        )
+                    )
+            return True
+        except IntegrityError:
+            return False
+
+    def soft_delete_history(self, user_id: int, history_id: str) -> bool:
+        with self._session_factory() as session:
+            row = session.scalar(
+                select(History).where(
+                    History.id == history_id,
+                    History.user_id == user_id,
+                    History.deleted_at.is_(None),
+                )
+            )
+            if row is None:
+                return False
+            row.deleted_at = utc_now()
+            row.storage_status = "delete_pending"
+            session.add(
+                StorageOutbox(
+                    user_id=user_id,
+                    history_id=history_id,
+                    version_id=row.storage_version,
+                    operation="delete_job_versions",
+                    idempotency_key=f"delete-job-versions:{user_id}:{history_id}",
+                    payload_json={},
+                    next_attempt_at=utc_now(),
+                )
+            )
+            return True
 
     def update_source_pdf(self, user_id: int, history_id: str, safe_meta: dict) -> bool:
         with self._session_factory() as session:
@@ -336,11 +436,7 @@ class LearningRepository:
             return True
 
     def delete_owned_history(self, user_id: int, history_id: str) -> bool:
-        with self._session_factory() as session:
-            result = session.execute(
-                delete(History).where(History.id == history_id, History.user_id == user_id)
-            )
-            return bool(result.rowcount)
+        return self.soft_delete_history(user_id, history_id)
 
     def list_proof_workspaces(self, user_id: int, graph_id: str) -> list[dict]:
         with self._session_factory() as session:
@@ -393,6 +489,11 @@ class LearningRepository:
             "source_format": row.source_format,
             "experimental_logic_ir": bool(row.experimental_logic_ir),
             "object_storage_prefix": row.object_storage_prefix,
+            "storage_version": row.storage_version,
+            "storage_status": row.storage_status,
+            "storage_checksum": row.storage_checksum,
+            "storage_file_count": row.storage_file_count,
+            "storage_bytes": row.storage_bytes,
             "updated_at": _iso(row.updated_at),
             "created_at": _iso(row.created_at),
         }

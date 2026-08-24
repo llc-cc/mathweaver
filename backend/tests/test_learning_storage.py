@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy import event, select
 from werkzeug.security import generate_password_hash
 
 
@@ -36,8 +37,8 @@ sys.modules.setdefault("JoinAgent", join_agent)
 import api_v2
 from storage import database as storage_database
 from storage.database import configure_database, get_engine, session_scope
-from storage.models import Base, History, User, UserSettings
-from storage.object_storage import ObjectStorageError
+from storage.models import Base, History, StorageOutbox, User, UserSettings
+from storage.object_storage import ObjectStorageError, StoredVersion
 
 
 @pytest.fixture(autouse=True)
@@ -393,6 +394,64 @@ def test_history_round_trips_object_storage_prefix(users):
     ) is True
 
     assert repository.get_owned_history(owner_id, "job-oss")["object_storage_prefix"] == prefix
+
+
+def test_version_switch_and_old_cleanup_outbox_commit_together(users):
+    repository = _repository()
+    owner_id = users[0][0]
+    first = StoredVersion("a" * 32, "prefix-a/", "1" * 64, 2, 10)
+    second = StoredVersion("b" * 32, "prefix-b/", "2" * 64, 3, 20)
+
+    assert repository.commit_storage_version(owner_id, _snapshot("job-version"), first)
+    assert repository.commit_storage_version(owner_id, _snapshot("job-version"), second)
+
+    row = repository.get_owned_history(owner_id, "job-version")
+    assert row["storage_version"] == second.version_id
+    assert row["storage_checksum"] == second.manifest_checksum
+    with session_scope() as session:
+        operations = session.scalars(select(StorageOutbox)).all()
+    assert [(item.operation, item.version_id) for item in operations] == [
+        ("delete_version", first.version_id)
+    ]
+
+
+def test_soft_delete_hides_history_and_enqueues_cleanup(users):
+    repository = _repository()
+    owner_id = users[0][0]
+    stored = StoredVersion("c" * 32, "prefix-c/", "3" * 64, 1, 5)
+    assert repository.commit_storage_version(owner_id, _snapshot("job-delete"), stored)
+
+    assert repository.soft_delete_history(owner_id, "job-delete") is True
+
+    assert repository.get_owned_history(owner_id, "job-delete") is None
+    assert repository.list_history(owner_id) == []
+    with session_scope() as session:
+        operation = session.scalar(
+            select(StorageOutbox).where(StorageOutbox.history_id == "job-delete")
+        )
+    assert operation.operation == "delete_job_versions"
+
+
+def test_list_history_uses_summary_projection_without_large_json(users):
+    repository = _repository()
+    owner_id = users[0][0]
+    assert repository.upsert_job_progress(owner_id, _snapshot("job-summary", "done"))
+    statements: list[str] = []
+
+    def capture(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement.lower())
+
+    event.listen(get_engine(), "before_cursor_execute", capture)
+    try:
+        rows = repository.list_history(owner_id)
+    finally:
+        event.remove(get_engine(), "before_cursor_execute", capture)
+
+    assert rows[0]["id"] == "job-summary"
+    select_sql = next(item for item in statements if item.lstrip().startswith("select"))
+    assert "nodes_json" not in select_sql
+    assert "edges_json" not in select_sql
+    assert "source_pdf_json" not in select_sql
 
 
 def test_persisted_status_and_result_are_available_after_jobs_clear(authenticated_clients):
