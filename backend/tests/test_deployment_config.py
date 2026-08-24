@@ -141,6 +141,25 @@ def test_backend_quality_workflow_contains_release_gates():
         assert job in workflow
 
 
+def test_core_data_cli_contracts_are_deferred_without_swallowing_failures():
+    workflow = (
+        PROJECT_ROOT / ".github" / "workflows" / "backend-quality.yml"
+    ).read_text(encoding="utf-8")
+    deployment = (PROJECT_ROOT / "docs" / "WEB_DEPLOYMENT.md").read_text(
+        encoding="utf-8"
+    )
+
+    for command in (
+        "python backend/scripts/production_migrate.py",
+        "python backend/scripts/storage_worker.py --once",
+        "python backend/scripts/verify_restored_data.py --help",
+    ):
+        assert command in workflow
+        assert command in deployment
+    assert 'CORE_DATA_INTERFACES_REQUIRED: "false"' in workflow
+    assert "|| true" not in workflow
+
+
 def test_backend_image_uses_non_logging_runtime_environment_entrypoint():
     dockerfile = (PROJECT_ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
     entrypoint = (

@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Flip to true in this file when feat/data-storage-hardening is integrated.
+  CORE_DATA_INTERFACES_REQUIRED: "false"
+
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
@@ -77,9 +81,37 @@ jobs:
                       raise
                   time.sleep(2)
           PY
-      - name: Apply Alembic migrations
-        working-directory: backend
-        run: python -m alembic -c migrations/alembic.ini upgrade head
+      - name: Apply production migration contract when available
+        run: |
+          if [[ -f backend/scripts/production_migrate.py ]]; then
+            python backend/scripts/production_migrate.py
+          elif [[ "$CORE_DATA_INTERFACES_REQUIRED" == "true" ]]; then
+            echo "::error::backend/scripts/production_migrate.py is required"
+            exit 1
+          else
+            echo "::notice::production migration interface deferred until the core branch is integrated"
+            cd backend
+            python -m alembic -c migrations/alembic.ini upgrade head
+          fi
+      - name: Check deferred worker and recovery CLI contracts
+        run: |
+          if [[ -f backend/scripts/storage_worker.py ]]; then
+            python backend/scripts/storage_worker.py --once
+          elif [[ "$CORE_DATA_INTERFACES_REQUIRED" == "true" ]]; then
+            echo "::error::adjust this step to the merged storage worker entry point"
+            exit 1
+          else
+            echo "::notice::storage worker CLI contract deferred until its final entry point is known"
+          fi
+
+          if [[ -f backend/scripts/verify_restored_data.py ]]; then
+            python backend/scripts/verify_restored_data.py --help
+          elif [[ "$CORE_DATA_INTERFACES_REQUIRED" == "true" ]]; then
+            echo "::error::backend/scripts/verify_restored_data.py is required"
+            exit 1
+          else
+            echo "::notice::restored-data verification interface deferred until the core branch is integrated"
+          fi
       - name: Generate offline Alembic SQL
         working-directory: backend
         run: python -m alembic -c migrations/alembic.ini upgrade head --sql > ../alembic-upgrade.sql

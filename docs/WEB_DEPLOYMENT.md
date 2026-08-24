@@ -283,3 +283,19 @@ docker compose -f deploy/docker-compose.web.yml \
 
 CI 通过只能证明仓库内迁移、Fake OSS、类型和容器门禁，不替代真实 RDS/OSS 恢复证据。没有最近一次合格联合恢复演练、生产容量值和告警接收人时，不得将部署标记为生产数据就绪。
 
+## 10. 核心数据命令接口交接
+
+当前门禁分支不拥有核心数据实现。合并 `feat/data-storage-hardening` 后，集成负责人必须在 `.github/workflows/backend-quality.yml` 将 `CORE_DATA_INTERFACES_REQUIRED` 从 `"false"` 改为 `"true"`，并按核心分支的最终入口校准以下命令：
+
+```bash
+python backend/scripts/production_migrate.py
+python backend/scripts/storage_worker.py --once
+python backend/scripts/verify_restored_data.py --help
+```
+
+已知核心分支当前计划把 worker 实现在 `backend/storage/storage_worker.py`；在其 CLI 入口和 `--once` 语义确定前，不得在本分支创建转发脚本或假实现。若最终采用模块入口，应同时修改 CI 契约步骤和 `deploy/docker-compose.web.yml` 的 `storage-worker.command`，保持单一正式入口。
+
+命令从后端 secret 环境读取 `MATHWEAVER_DATABASE_URL`、OSS 配置、凭据密钥环和容量限制，不得通过命令行传递或打印秘密。退出码 `0` 表示完成；任何非零退出码必须终止门禁，不允许使用 `|| true`、忽略退出码或回退到未迁移状态。
+
+上线顺序固定为：校验 secret 与目标数据库，执行生产迁移，运行一次 worker/recovery CLI 契约检查，启动常驻 storage worker，启动 backend，最后启动 frontend/proxy 并检查 `/health`。生产 Compose 中 backend 和 storage worker 都依赖 `migrate: condition: service_completed_successfully`；迁移失败时不得继续启动应用服务。
+

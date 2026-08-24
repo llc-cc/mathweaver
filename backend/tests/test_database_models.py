@@ -192,7 +192,7 @@ def test_reconfiguration_disposes_prior_engine_after_success(monkeypatch):
     original_create_engine = database.create_engine
     monkeypatch.setattr(database, "create_engine", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("bad URL")))
     with pytest.raises(RuntimeError, match="bad URL"):
-        configure_database("not-a-database-url")
+        configure_database("sqlite+pysqlite:///:memory:")
     assert get_engine() is prior_engine
     assert not disposed
 
