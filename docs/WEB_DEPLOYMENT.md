@@ -285,15 +285,15 @@ CI 通过只能证明仓库内迁移、Fake OSS、类型和容器门禁，不替
 
 ## 10. 核心数据命令接口交接
 
-当前门禁分支不拥有核心数据实现。合并 `feat/data-storage-hardening` 后，集成负责人必须在 `.github/workflows/backend-quality.yml` 将 `CORE_DATA_INTERFACES_REQUIRED` 从 `"false"` 改为 `"true"`，并按核心分支的最终入口校准以下命令：
+核心数据接口已经纳入门禁，`.github/workflows/backend-quality.yml` 中 `CORE_DATA_INTERFACES_REQUIRED` 固定为 `"true"`。以下正式入口缺失或返回非零退出码时，CI 必须失败：
 
 ```bash
 python backend/scripts/production_migrate.py
-python backend/scripts/storage_worker.py --once
+python backend/scripts/storage_worker.py --help
 python backend/scripts/verify_restored_data.py --help
 ```
 
-已知核心分支当前计划把 worker 实现在 `backend/storage/storage_worker.py`；在其 CLI 入口和 `--once` 语义确定前，不得在本分支创建转发脚本或假实现。若最终采用模块入口，应同时修改 CI 契约步骤和 `deploy/docker-compose.web.yml` 的 `storage-worker.command`，保持单一正式入口。
+常驻 worker 的正式容器入口是 `python scripts/storage_worker.py`；人工执行单轮处理时使用 `python backend/scripts/storage_worker.py --once`。CI 的 MySQL 任务不注入 OSS 凭据，因此只通过 `--help` 校验 CLI 入口，实际 outbox 行为由 Fake OSS 单元测试覆盖。
 
 命令从后端 secret 环境读取 `MATHWEAVER_DATABASE_URL`、OSS 配置、凭据密钥环和容量限制，不得通过命令行传递或打印秘密。退出码 `0` 表示完成；任何非零退出码必须终止门禁，不允许使用 `|| true`、忽略退出码或回退到未迁移状态。
 

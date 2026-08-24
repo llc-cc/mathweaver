@@ -22,8 +22,12 @@ os.environ.setdefault("MATHWEAVER_CREDENTIAL_ACTIVE_KEY_ID", "test")
 
 
 @pytest.fixture(autouse=True)
-def database(monkeypatch):
+def database(monkeypatch, request):
     """每个测试使用独立内存库，避免事务结果跨测试泄漏。"""
+    if request.node.get_closest_marker("mysql") is not None:
+        # MySQL 门禁必须使用迁移生成的真实表，不能被通用 SQLite fixture 覆盖或在结束时删表。
+        yield
+        return
     monkeypatch.setenv("MATHWEAVER_DATABASE_URL", "sqlite+pysqlite:///:memory:")
     monkeypatch.delenv("MATHWEAVER_SESSION_TTL_SECONDS", raising=False)
     configure_database(os.environ["MATHWEAVER_DATABASE_URL"])

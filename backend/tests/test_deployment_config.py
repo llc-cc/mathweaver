@@ -103,8 +103,8 @@ def test_production_compose_forces_oss_and_runs_worker():
     assert "  storage-worker:" in compose
     worker = compose.split("  storage-worker:", 1)[1].split("  frontend:", 1)[0]
     assert "- python" in worker
-    assert "- -m" in worker
-    assert "- storage.storage_worker" in worker
+    assert "- scripts/storage_worker.py" in worker
+    assert "- --once" not in worker
 
 
 def test_test_compose_uses_local_storage_and_disables_worker():
@@ -141,7 +141,7 @@ def test_backend_quality_workflow_contains_release_gates():
         assert job in workflow
 
 
-def test_core_data_cli_contracts_are_deferred_without_swallowing_failures():
+def test_core_data_cli_contracts_are_required_without_swallowing_failures():
     workflow = (
         PROJECT_ROOT / ".github" / "workflows" / "backend-quality.yml"
     ).read_text(encoding="utf-8")
@@ -151,12 +151,12 @@ def test_core_data_cli_contracts_are_deferred_without_swallowing_failures():
 
     for command in (
         "python backend/scripts/production_migrate.py",
-        "python backend/scripts/storage_worker.py --once",
+        "python backend/scripts/storage_worker.py --help",
         "python backend/scripts/verify_restored_data.py --help",
     ):
         assert command in workflow
         assert command in deployment
-    assert 'CORE_DATA_INTERFACES_REQUIRED: "false"' in workflow
+    assert 'CORE_DATA_INTERFACES_REQUIRED: "true"' in workflow
     assert "|| true" not in workflow
 
 

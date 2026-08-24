@@ -8,8 +8,7 @@ permissions:
   contents: read
 
 env:
-  # Flip to true in this file when feat/data-storage-hardening is integrated.
-  CORE_DATA_INTERFACES_REQUIRED: "false"
+  CORE_DATA_INTERFACES_REQUIRED: "true"
 
 jobs:
   backend-tests:
@@ -49,6 +48,9 @@ jobs:
       MATHWEAVER_DATABASE_NAME: mathweaver
       MATHWEAVER_DATABASE_URL: mysql+pymysql://root:ci-root-password@127.0.0.1:3306/mathweaver?charset=utf8mb4
       MATHWEAVER_OBJECT_STORAGE: local
+      # CI 仅使用固定测试密钥迁移空库；生产密钥必须来自受保护的 secret。
+      MATHWEAVER_CREDENTIAL_KEYS_JSON: '{"ci":"dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHQ="}'
+      MATHWEAVER_CREDENTIAL_ACTIVE_KEY_ID: ci
       PYTHONPATH: backend
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +83,7 @@ jobs:
                       raise
                   time.sleep(2)
           PY
-      - name: Apply production migration contract when available
+      - name: Apply required production migration contract
         run: |
           if [[ -f backend/scripts/production_migrate.py ]]; then
             python backend/scripts/production_migrate.py
@@ -93,10 +95,11 @@ jobs:
             cd backend
             python -m alembic -c migrations/alembic.ini upgrade head
           fi
-      - name: Check deferred worker and recovery CLI contracts
+      - name: Check required worker and recovery CLI contracts
         run: |
           if [[ -f backend/scripts/storage_worker.py ]]; then
-            python backend/scripts/storage_worker.py --once
+            # MySQL 门禁不持有 OSS 凭据；处理器行为由 Fake OSS 单测覆盖，这里验证正式 CLI 入口。
+            python backend/scripts/storage_worker.py --help
           elif [[ "$CORE_DATA_INTERFACES_REQUIRED" == "true" ]]; then
             echo "::error::adjust this step to the merged storage worker entry point"
             exit 1
@@ -151,6 +154,8 @@ jobs:
             'MATHWEAVER_DATABASE_URL=sqlite:////var/lib/mathweaver/smoke.db' \
             'MATHWEAVER_DATABASE_NAME=mathweaver' \
             'MATHWEAVER_OBJECT_STORAGE=local' \
+            'MATHWEAVER_CREDENTIAL_KEYS_JSON={"ci":"dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHQ="}' \
+            'MATHWEAVER_CREDENTIAL_ACTIVE_KEY_ID=ci' \
             > .env.production
       - name: Validate test Compose
         run: docker compose -f deploy/docker-compose.web.yml -f deploy/docker-compose.test.yml config --quiet
