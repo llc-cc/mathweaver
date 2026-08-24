@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
@@ -149,6 +149,10 @@ class History(Base):
     __tablename__ = "history"
     __table_args__ = (
         Index("ix_history_user_created_at", "user_id", "created_at"),
+        CheckConstraint(
+            "storage_file_count >= 0", name="ck_history_storage_file_count_nonnegative"
+        ),
+        CheckConstraint("storage_bytes >= 0", name="ck_history_storage_bytes_nonnegative"),
         MYSQL_TABLE_OPTIONS,
     )
 
@@ -172,10 +176,46 @@ class History(Base):
     experimental_logic_ir: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # 只记录所属任务前缀，访问凭据和服务器绝对路径都不进入业务数据库。
     object_storage_prefix: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    storage_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    storage_status: Mapped[str] = mapped_column(String(32), nullable=False, default="legacy")
+    storage_checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    storage_file_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    storage_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+
+class StorageOutbox(Base):
+    __tablename__ = "storage_outbox"
+    __table_args__ = (
+        Index("ux_storage_outbox_idempotency_key", "idempotency_key", unique=True),
+        Index("ix_storage_outbox_status_next_attempt", "status", "next_attempt_at"),
+        CheckConstraint("attempts >= 0", name="ck_storage_outbox_attempts_nonnegative"),
+        MYSQL_TABLE_OPTIONS,
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    history_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    version_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
 
 
 class UserSettings(Base):

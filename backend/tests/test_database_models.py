@@ -13,7 +13,7 @@ from sqlalchemy.schema import CreateTable
 
 from storage import database
 from storage.database import configure_database, get_engine, session_scope
-from storage.models import History, User
+from storage.models import History, StorageOutbox, User
 
 
 def create_teacher(email: str = "teacher@example.edu") -> User:
@@ -61,6 +61,28 @@ def test_history_object_storage_prefix_is_optional() -> None:
 
     assert column.nullable is True
     assert column.type.length == 1024
+
+
+def test_history_has_versioned_storage_state_columns() -> None:
+    columns = History.__table__.c
+
+    assert columns.storage_version.type.length == 32
+    assert columns.storage_status.default.arg == "legacy"
+    assert columns.storage_checksum.type.length == 64
+    assert columns.deleted_at.nullable is True
+
+
+def test_storage_outbox_idempotency_key_is_unique() -> None:
+    duplicate = {
+        "user_id": 7,
+        "history_id": "job-1",
+        "operation": "delete_version",
+        "idempotency_key": "delete-version:7:job-1:v1",
+        "payload_json": {"version_id": "a" * 32},
+    }
+    with pytest.raises(IntegrityError):
+        with session_scope() as session:
+            session.add_all([StorageOutbox(**duplicate), StorageOutbox(**duplicate)])
 
 
 def test_whitespace_emails_normalize_before_unique_indexing():
