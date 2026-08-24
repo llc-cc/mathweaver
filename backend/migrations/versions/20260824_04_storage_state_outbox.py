@@ -19,25 +19,26 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     # 历史数据先标记为 legacy，只有经过 manifest 校验的新版本才进入 ready 状态。
-    op.add_column("history", sa.Column("storage_version", sa.String(32), nullable=True))
-    op.add_column(
-        "history",
-        sa.Column("storage_status", sa.String(32), nullable=False, server_default="legacy"),
-    )
-    op.add_column("history", sa.Column("storage_checksum", sa.String(64), nullable=True))
-    op.add_column(
-        "history", sa.Column("storage_file_count", sa.Integer(), nullable=False, server_default="0")
-    )
-    op.add_column(
-        "history", sa.Column("storage_bytes", sa.BigInteger(), nullable=False, server_default="0")
-    )
-    op.add_column("history", sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True))
-    op.create_check_constraint(
-        "ck_history_storage_file_count_nonnegative", "history", "storage_file_count >= 0"
-    )
-    op.create_check_constraint(
-        "ck_history_storage_bytes_nonnegative", "history", "storage_bytes >= 0"
-    )
+    # batch 模式在 SQLite 恢复演练中重建表，在 MySQL 仍生成普通 ALTER TABLE。
+    with op.batch_alter_table("history") as batch_op:
+        batch_op.add_column(sa.Column("storage_version", sa.String(32), nullable=True))
+        batch_op.add_column(
+            sa.Column("storage_status", sa.String(32), nullable=False, server_default="legacy")
+        )
+        batch_op.add_column(sa.Column("storage_checksum", sa.String(64), nullable=True))
+        batch_op.add_column(
+            sa.Column("storage_file_count", sa.Integer(), nullable=False, server_default="0")
+        )
+        batch_op.add_column(
+            sa.Column("storage_bytes", sa.BigInteger(), nullable=False, server_default="0")
+        )
+        batch_op.add_column(sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True))
+        batch_op.create_check_constraint(
+            "ck_history_storage_file_count_nonnegative", "storage_file_count >= 0"
+        )
+        batch_op.create_check_constraint(
+            "ck_history_storage_bytes_nonnegative", "storage_bytes >= 0"
+        )
 
     op.create_table(
         "storage_outbox",
@@ -78,11 +79,12 @@ def downgrade() -> None:
     op.drop_index("ix_storage_outbox_status_next_attempt", table_name="storage_outbox")
     op.drop_index("ux_storage_outbox_idempotency_key", table_name="storage_outbox")
     op.drop_table("storage_outbox")
-    op.drop_constraint("ck_history_storage_bytes_nonnegative", "history", type_="check")
-    op.drop_constraint("ck_history_storage_file_count_nonnegative", "history", type_="check")
-    op.drop_column("history", "deleted_at")
-    op.drop_column("history", "storage_bytes")
-    op.drop_column("history", "storage_file_count")
-    op.drop_column("history", "storage_checksum")
-    op.drop_column("history", "storage_status")
-    op.drop_column("history", "storage_version")
+    with op.batch_alter_table("history") as batch_op:
+        batch_op.drop_constraint("ck_history_storage_bytes_nonnegative", type_="check")
+        batch_op.drop_constraint("ck_history_storage_file_count_nonnegative", type_="check")
+        batch_op.drop_column("deleted_at")
+        batch_op.drop_column("storage_bytes")
+        batch_op.drop_column("storage_file_count")
+        batch_op.drop_column("storage_checksum")
+        batch_op.drop_column("storage_status")
+        batch_op.drop_column("storage_version")
