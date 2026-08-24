@@ -385,3 +385,16 @@ class OssObjectStorage:
         keys = self._list_keys(prefix)
         if keys:
             self._delete_keys(keys)
+
+    def delete_version(self, user_id: int, job_id: str, version_id: str) -> None:
+        """删除操作严格限制在单个不可变版本前缀，重复删除视为成功。"""
+        prefix = self.version_prefix(user_id, job_id, version_id)
+        keys = self._list_keys(prefix)
+        if keys:
+            self._delete_keys(keys)
+
+    def delete_job_versions(self, user_id: int, job_id: str) -> None:
+        versions_prefix = f"{self.task_prefix(user_id, job_id)}versions/"
+        keys = self._list_keys(versions_prefix)
+        if keys:
+            self._delete_keys(keys)

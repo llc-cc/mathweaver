@@ -174,6 +174,21 @@ def test_verify_rejects_tampered_version(tmp_path: Path) -> None:
         storage.verify_version(7, "job-1", stored.version_id, stored.manifest_checksum)
 
 
+def test_delete_version_removes_only_the_selected_immutable_version(tmp_path: Path) -> None:
+    bucket = FakeBucket()
+    storage = configured_storage(bucket)
+    artifact_root = tmp_path / "job"
+    artifact_root.mkdir()
+    (artifact_root / "nodes.json").write_text("[]", encoding="utf-8")
+    first = storage.upload_version(7, "job-1", artifact_root, tmp_path / "source")
+    second = storage.upload_version(7, "job-1", artifact_root, tmp_path / "source")
+
+    storage.delete_version(7, "job-1", first.version_id)
+
+    assert not bucket.objects_with_prefix(first.prefix)
+    assert bucket.objects_with_prefix(second.prefix)
+
+
 def test_sync_skips_transient_files_and_removes_stale_remote_objects(tmp_path: Path) -> None:
     bucket = FakeBucket()
     storage = configured_storage(bucket)
