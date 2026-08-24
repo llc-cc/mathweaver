@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import base64
 import json
 import os
 import subprocess
@@ -22,6 +23,11 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 os.environ.setdefault("MATHWEAVER_DATABASE_URL", "sqlite+pysqlite:///:memory:")
+os.environ.setdefault(
+    "MATHWEAVER_CREDENTIAL_KEYS_JSON",
+    json.dumps({"test": base64.b64encode(b"t" * 32).decode("ascii")}),
+)
+os.environ.setdefault("MATHWEAVER_CREDENTIAL_ACTIVE_KEY_ID", "test")
 join_agent = types.ModuleType("JoinAgent")
 for name in ("LLMParser", "SimpleLLM", "TextDivider", "MultiProcessor"):
     setattr(join_agent, name, type(name, (), {}))
@@ -183,22 +189,49 @@ def _repository():
         from storage.learning_repository import LearningRepository
     except ImportError as exc:
         pytest.fail(f"LearningRepository 尚未实现: {exc}")
-    return LearningRepository()
+    from storage.credential_crypto import CredentialCipher, CredentialKeyring
+
+    return LearningRepository(
+        cipher=CredentialCipher(
+            CredentialKeyring(keys={"test": b"t" * 32}, active_key_id="test")
+        )
+    )
 
 
 def test_settings_persist_across_repository_replacement_and_are_isolated(
     isolated_web_storage, users
 ):
     first = _repository()
-    first.upsert_settings(users[0][0], [{"name": "A", "api_key": "secret"}], 0)
+    saved = first.upsert_settings(
+        users[0][0], [{"name": "A", "api_key": "secret"}], 0
+    )
+    config_id = saved["configs"][0]["config_id"]
 
     configure_database(isolated_web_storage)
     replacement = _repository()
-    assert replacement.get_settings(users[0][0]) == {
-        "configs": [{"name": "A", "api_key": "secret"}],
+    assert replacement.get_public_settings(users[0][0]) == {
+        "configs": [{
+            "name": "A",
+            "config_id": config_id,
+            "has_api_key": True,
+            "api_key_masked": "********",
+            "has_embedding_api_key": False,
+            "embedding_api_key_masked": "",
+        }],
         "active_index": 0,
     }
-    assert replacement.get_settings(users[1][0]) == {"configs": [], "active_index": 0}
+    assert replacement.get_runtime_settings(users[0][0]) == {
+        "configs": [{
+            "name": "A",
+            "config_id": config_id,
+            "api_key": "secret",
+            "embedding_api_key": "",
+        }],
+        "active_index": 0,
+    }
+    assert replacement.get_public_settings(users[1][0]) == {
+        "configs": [], "active_index": 0
+    }
 
 
 @pytest.mark.parametrize(
@@ -225,7 +258,53 @@ def test_settings_repository_defensively_rejects_non_object_configs(users, inval
     repository = _repository()
     with pytest.raises(ValueError, match="config must be a JSON object"):
         repository.upsert_settings(users[0][0], [invalid], 0)
-    assert repository.get_settings(users[0][0]) == {"configs": [], "active_index": 0}
+    assert repository.get_public_settings(users[0][0]) == {
+        "configs": [], "active_index": 0
+    }
+
+
+def test_settings_blank_update_preserves_key_by_config_id_after_reorder(users):
+    repository = _repository()
+    saved = repository.upsert_settings(
+        users[0][0],
+        [
+            {"name": "A", "api_key": "key-a"},
+            {"name": "B", "api_key": "key-b"},
+        ],
+        0,
+    )
+
+    repository.upsert_settings(
+        users[0][0],
+        [
+            {**saved["configs"][1], "api_key": ""},
+            {**saved["configs"][0], "api_key": ""},
+        ],
+        0,
+    )
+
+    runtime = repository.get_runtime_settings(users[0][0])["configs"]
+    assert [config["api_key"] for config in runtime] == ["key-b", "key-a"]
+
+
+def test_settings_requires_explicit_clear_and_rejects_foreign_config_id(users):
+    repository = _repository()
+    saved = repository.upsert_settings(
+        users[0][0], [{"name": "A", "api_key": "key-a"}], 0
+    )
+    config = saved["configs"][0]
+
+    cleared = repository.upsert_settings(
+        users[0][0], [{**config, "clear_api_key": True}], 0
+    )
+    assert cleared["configs"][0]["has_api_key"] is False
+
+    with pytest.raises(ValueError, match="config_id is not owned by this user"):
+        repository.upsert_settings(
+            users[0][0],
+            [{"config_id": "foreign", "name": "X", "api_key": "key-x"}],
+            0,
+        )
 
 
 def test_proof_workspaces_persist_and_are_isolated(authenticated_clients):

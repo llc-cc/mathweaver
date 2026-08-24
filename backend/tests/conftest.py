@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import base64
+import json
 
 import pytest
 
@@ -12,6 +14,11 @@ from storage.models import Base
 
 # API 模块会在测试收集阶段完成数据库启动，因此预先提供显式测试 URL。
 os.environ.setdefault("MATHWEAVER_DATABASE_URL", "sqlite+pysqlite:///:memory:")
+os.environ.setdefault(
+    "MATHWEAVER_CREDENTIAL_KEYS_JSON",
+    json.dumps({"test": base64.b64encode(b"t" * 32).decode("ascii")}),
+)
+os.environ.setdefault("MATHWEAVER_CREDENTIAL_ACTIVE_KEY_ID", "test")
 
 
 @pytest.fixture(autouse=True)

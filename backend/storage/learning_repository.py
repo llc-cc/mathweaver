@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -15,6 +16,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from storage.credential_crypto import CredentialCipher, CredentialConfigurationError
 from storage.database import session_scope
 from storage.models import History, ProofWorkspace, UserSettings, utc_now
 
@@ -90,10 +92,63 @@ def sanitize_source_pdf_meta(meta: dict | None) -> dict | None:
 class LearningRepository:
     """按显式用户身份读写设置、任务历史和证明工作区。"""
 
-    def __init__(self, session_factory: SessionFactory = session_scope) -> None:
+    def __init__(
+        self,
+        session_factory: SessionFactory = session_scope,
+        *,
+        cipher: CredentialCipher | None = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._cipher = cipher
 
-    def get_settings(self, user_id: int) -> dict:
+    def _credential_cipher(self) -> CredentialCipher:
+        if self._cipher is None:
+            raise CredentialConfigurationError("credential cipher is required")
+        return self._cipher
+
+    @staticmethod
+    def _settings_aad(user_id: int) -> str:
+        return f"user:{int(user_id)}:llm-settings:v1"
+
+    def _decrypt_settings_secrets(self, row: UserSettings) -> dict[str, dict[str, str]]:
+        if row.llm_secrets_encrypted_json is None:
+            # Web 模式不兼容读取历史明文；必须先运行显式数据迁移。
+            raise CredentialConfigurationError("stored credentials require migration")
+        value = self._credential_cipher().decrypt_json(
+            row.llm_secrets_encrypted_json,
+            aad=self._settings_aad(row.user_id),
+        )
+        if any(
+            not isinstance(config_id, str) or not isinstance(secret, dict)
+            for config_id, secret in value.items()
+        ):
+            raise CredentialConfigurationError("stored credential payload is invalid")
+        return value
+
+    @staticmethod
+    def _public_settings(
+        descriptors: list[dict],
+        secrets: dict[str, dict[str, str]],
+        active_index: int,
+    ) -> dict:
+        configs: list[dict] = []
+        for descriptor in descriptors:
+            public = deepcopy(descriptor)
+            config_secrets = secrets.get(str(public.get("config_id") or ""), {})
+            has_api_key = bool(config_secrets.get("api_key"))
+            has_embedding_key = bool(config_secrets.get("embedding_api_key"))
+            public.update(
+                {
+                    "has_api_key": has_api_key,
+                    "api_key_masked": "********" if has_api_key else "",
+                    "has_embedding_api_key": has_embedding_key,
+                    "embedding_api_key_masked": "********" if has_embedding_key else "",
+                }
+            )
+            configs.append(public)
+        return {"configs": configs, "active_index": active_index}
+
+    def get_public_settings(self, user_id: int) -> dict:
         with self._session_factory() as session:
             row = session.get(UserSettings, user_id)
             if row is None:
@@ -103,31 +158,119 @@ class LearningRepository:
             active_index = data.get("active_index")
             if not isinstance(active_index, int) or isinstance(active_index, bool):
                 active_index = 0
-            if not configs and row.llm_api_url:
-                configs = [{
-                    "name": "默认配置",
-                    "api_url": row.llm_api_url,
-                    "model_name": row.llm_model,
-                    "api_key": row.llm_api_key,
-                }]
+            return self._public_settings(
+                configs,
+                self._decrypt_settings_secrets(row),
+                active_index,
+            )
+
+    def get_runtime_settings(self, user_id: int) -> dict:
+        with self._session_factory() as session:
+            row = session.get(UserSettings, user_id)
+            if row is None:
+                return {"configs": [], "active_index": 0}
+            data = deepcopy(row.llm_configs_json) if isinstance(row.llm_configs_json, dict) else {}
+            descriptors = data.get("configs") if isinstance(data.get("configs"), list) else []
+            active_index = data.get("active_index")
+            if not isinstance(active_index, int) or isinstance(active_index, bool):
                 active_index = 0
+            secrets = self._decrypt_settings_secrets(row)
+            configs: list[dict] = []
+            for descriptor in descriptors:
+                runtime = deepcopy(descriptor)
+                config_secrets = secrets.get(str(runtime.get("config_id") or ""), {})
+                runtime["api_key"] = str(config_secrets.get("api_key") or "")
+                runtime["embedding_api_key"] = str(
+                    config_secrets.get("embedding_api_key") or ""
+                )
+                configs.append(runtime)
             return {"configs": configs, "active_index": active_index}
 
-    def upsert_settings(self, user_id: int, configs: list[dict], active_index: int) -> None:
+    def upsert_settings(self, user_id: int, configs: list[dict], active_index: int) -> dict:
         if any(not isinstance(config, dict) for config in configs):
             # 仓储也拒绝错误类型，防止绕过 HTTP 校验的内部调用产生半写入或 500。
             raise ValueError("config must be a JSON object")
-        normalized = deepcopy(configs)
-        active = normalized[active_index] if normalized and 0 <= active_index < len(normalized) else {}
+        if (
+            not isinstance(active_index, int)
+            or isinstance(active_index, bool)
+            or (configs and not 0 <= active_index < len(configs))
+            or (not configs and active_index != 0)
+        ):
+            raise ValueError("active_index is out of range")
         with self._session_factory() as session:
             row = session.get(UserSettings, user_id)
             if row is None:
                 row = UserSettings(user_id=user_id)
                 session.add(row)
+                existing_descriptors: list[dict] = []
+                existing_secrets: dict[str, dict[str, str]] = {}
+            else:
+                data = row.llm_configs_json if isinstance(row.llm_configs_json, dict) else {}
+                existing_descriptors = (
+                    deepcopy(data.get("configs"))
+                    if isinstance(data.get("configs"), list)
+                    else []
+                )
+                existing_secrets = self._decrypt_settings_secrets(row)
+            owned_ids = {
+                str(config.get("config_id"))
+                for config in existing_descriptors
+                if isinstance(config, dict) and config.get("config_id")
+            }
+            normalized: list[dict] = []
+            next_secrets: dict[str, dict[str, str]] = {}
+            seen_ids: set[str] = set()
+            for raw_config in configs:
+                descriptor = deepcopy(raw_config)
+                supplied_id = str(descriptor.get("config_id") or "").strip()
+                if supplied_id:
+                    if supplied_id not in owned_ids:
+                        raise ValueError("config_id is not owned by this user")
+                    config_id = supplied_id
+                else:
+                    config_id = uuid.uuid4().hex
+                if config_id in seen_ids:
+                    raise ValueError("config_id must be unique")
+                seen_ids.add(config_id)
+
+                previous = deepcopy(existing_secrets.get(config_id, {}))
+                api_key = str(descriptor.pop("api_key", "") or "").strip()
+                embedding_key = str(
+                    descriptor.pop("embedding_api_key", "") or ""
+                ).strip()
+                if api_key:
+                    previous["api_key"] = api_key
+                elif descriptor.pop("clear_api_key", False) is True:
+                    previous.pop("api_key", None)
+                if embedding_key:
+                    previous["embedding_api_key"] = embedding_key
+                elif descriptor.pop("clear_embedding_api_key", False) is True:
+                    previous.pop("embedding_api_key", None)
+                if not supplied_id and not previous.get("api_key"):
+                    raise ValueError("api_key is required for a new config")
+                if previous:
+                    next_secrets[config_id] = previous
+
+                for public_only in (
+                    "has_api_key",
+                    "api_key_masked",
+                    "has_embedding_api_key",
+                    "embedding_api_key_masked",
+                ):
+                    descriptor.pop(public_only, None)
+                descriptor["config_id"] = config_id
+                normalized.append(descriptor)
+
+            active = normalized[active_index] if normalized else {}
             row.llm_api_url = str(active.get("api_url") or "")
             row.llm_model = str(active.get("model_name") or "")
-            row.llm_api_key = str(active.get("api_key") or "")
+            row.llm_api_key = ""
             row.llm_configs_json = {"configs": normalized, "active_index": active_index}
+            row.llm_secrets_encrypted_json = self._credential_cipher().encrypt_json(
+                next_secrets,
+                aad=self._settings_aad(user_id),
+            )
+            return self._public_settings(normalized, next_secrets, active_index)
 
     def list_history(self, user_id: int, limit: int = 50) -> list[dict]:
         safe_limit = min(max(int(limit), 1), 200)
