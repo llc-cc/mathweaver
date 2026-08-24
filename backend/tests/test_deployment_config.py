@@ -118,6 +118,29 @@ def test_test_compose_uses_local_storage_and_disables_worker():
     assert "disabled" in worker
 
 
+def test_backend_quality_workflow_contains_release_gates():
+    workflow = (
+        PROJECT_ROOT / ".github" / "workflows" / "backend-quality.yml"
+    ).read_text(encoding="utf-8")
+
+    for gate in (
+        "pytest",
+        "alembic",
+        "mysql",
+        "tsc --noemit",
+        "docker build",
+        "health",
+    ):
+        assert gate in workflow.lower()
+    for job in (
+        "backend-tests:",
+        "mysql-integration:",
+        "frontend-types:",
+        "container-smoke:",
+    ):
+        assert job in workflow
+
+
 def test_backend_image_uses_non_logging_runtime_environment_entrypoint():
     dockerfile = (PROJECT_ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
     entrypoint = (
