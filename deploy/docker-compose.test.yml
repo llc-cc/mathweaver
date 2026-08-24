@@ -1,0 +1,22 @@
+services:
+  migrate:
+    environment:
+      MATHWEAVER_OBJECT_STORAGE: local
+    command:
+      - python
+      - -m
+      - alembic
+      - -c
+      - migrations/alembic.ini
+      - upgrade
+      - head
+
+  backend:
+    environment:
+      MATHWEAVER_OBJECT_STORAGE: local
+
+  storage-worker:
+    environment:
+      MATHWEAVER_OBJECT_STORAGE: local
+    profiles:
+      - disabled

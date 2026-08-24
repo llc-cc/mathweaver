@@ -94,6 +94,30 @@ def test_oss_runtime_configuration_stays_in_backend_secret():
     assert "target: mathweaver_backend.env" in compose
 
 
+def test_production_compose_forces_oss_and_runs_worker():
+    compose = (PROJECT_ROOT / "deploy" / "docker-compose.web.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "MATHWEAVER_OBJECT_STORAGE: oss" in compose
+    assert "  storage-worker:" in compose
+    worker = compose.split("  storage-worker:", 1)[1].split("  frontend:", 1)[0]
+    assert "- python" in worker
+    assert "- -m" in worker
+    assert "- storage.storage_worker" in worker
+
+
+def test_test_compose_uses_local_storage_and_disables_worker():
+    compose = (PROJECT_ROOT / "deploy" / "docker-compose.test.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "MATHWEAVER_OBJECT_STORAGE: local" in compose
+    worker = compose.split("  storage-worker:", 1)[1]
+    assert "profiles:" in worker
+    assert "disabled" in worker
+
+
 def test_backend_image_uses_non_logging_runtime_environment_entrypoint():
     dockerfile = (PROJECT_ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
     entrypoint = (

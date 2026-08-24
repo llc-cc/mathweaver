@@ -2,6 +2,7 @@ name: mathweaver
 
 x-backend-environment: &backend-environment
   MATHWEAVER_DATABASE_NAME: mathweaver
+  MATHWEAVER_OBJECT_STORAGE: oss
   MATHGRAPH_DATA_DIR: /var/lib/mathweaver
 
 x-backend-secrets: &backend-secrets
@@ -21,12 +22,7 @@ services:
     environment: *backend-environment
     command:
       - python
-      - -m
-      - alembic
-      - -c
-      - migrations/alembic.ini
-      - upgrade
-      - head
+      - scripts/production_migrate.py
     restart: "no"
 
   backend:
@@ -65,6 +61,24 @@ services:
       timeout: 6s
       retries: 8
       start_period: 30s
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  storage-worker:
+    image: ${MATHWEAVER_BACKEND_IMAGE:-mathweaver-backend:local}
+    user: "0:0"
+    secrets: *backend-secrets
+    environment: *backend-environment
+    command:
+      - python
+      - -m
+      - storage.storage_worker
+    volumes:
+      - mathweaver_artifacts:/var/lib/mathweaver
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
