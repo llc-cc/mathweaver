@@ -39,6 +39,7 @@ from storage import database as storage_database
 from storage.database import configure_database, get_engine, session_scope
 from storage.models import Base, History, StorageOutbox, User, UserSettings
 from storage.object_storage import ObjectStorageError, StoredVersion
+from storage.capacity import CapacityLimits
 
 
 @pytest.fixture(autouse=True)
@@ -487,6 +488,20 @@ def test_list_history_uses_summary_projection_without_large_json(users):
     assert "source_pdf_json" not in select_sql
 
 
+def test_user_storage_bytes_excludes_deleted_and_replaced_history(users):
+    repository = _repository()
+    owner_id = users[0][0]
+    first = StoredVersion("1" * 32, "prefix-1/", "1" * 64, 1, 100)
+    second = StoredVersion("2" * 32, "prefix-2/", "2" * 64, 1, 250)
+    assert repository.commit_storage_version(owner_id, _snapshot("job-1"), first)
+    assert repository.commit_storage_version(owner_id, _snapshot("job-2"), second)
+
+    assert repository.user_storage_bytes(owner_id) == 350
+    assert repository.user_storage_bytes(owner_id, exclude_history_id="job-2") == 100
+    assert repository.soft_delete_history(owner_id, "job-1")
+    assert repository.user_storage_bytes(owner_id) == 250
+
+
 def test_persisted_status_and_result_are_available_after_jobs_clear(authenticated_clients):
     client, users, tokens = authenticated_clients
     repository = _repository()
@@ -601,6 +616,35 @@ def test_anonymous_web_processing_creates_no_job_or_artifact(authenticated_clien
     assert set(api_v2._jobs) == before
     assert not (api_v2._DATA_ROOT / "jobs").exists()
     assert _repository().list_history(users[0][0]) == []
+
+
+def test_job_upload_limit_rejects_before_creating_artifacts(
+    authenticated_clients, monkeypatch
+):
+    client, _users, tokens = authenticated_clients
+    monkeypatch.setattr(
+        api_v2,
+        "_capacity_limits",
+        CapacityLimits(
+            max_upload_bytes=4,
+            max_node_count=10,
+            max_edge_count=10,
+            max_history_json_bytes=100,
+            max_user_history_bytes=100,
+            min_free_disk_bytes=1,
+            retention_days=1,
+        ),
+    )
+
+    response = client.post(
+        "/api/v2/jobs",
+        json={"text": "too large"},
+        headers=_headers(tokens[0]),
+    )
+
+    assert response.status_code == 413
+    assert response.get_json() == {"error": "upload_too_large"}
+    assert api_v2._jobs == {}
 
 
 def test_anonymous_agent_import_is_rejected(authenticated_clients):

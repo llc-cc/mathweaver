@@ -76,6 +76,7 @@ from services.auth_service import (
 from services.admin_user_service import AdminUserService
 from storage.auth_repository import AuthRepository
 from storage.credential_crypto import CredentialCipher, CredentialKeyring
+from storage.capacity import CapacityExceeded, CapacityLimits
 from storage.database import configure_database, database_is_ready
 from storage.learning_repository import (
     JobSnapshot,
@@ -116,7 +117,14 @@ def _configure_cors(flask_app: Flask) -> None:
 
 
 app = Flask(__name__)
+_capacity_limits = CapacityLimits.from_environment()
+app.config["MAX_CONTENT_LENGTH"] = _capacity_limits.max_upload_bytes
 _configure_cors(app)
+
+
+@app.errorhandler(CapacityExceeded)
+def _capacity_error_response(exc: CapacityExceeded):
+    return jsonify({"error": exc.code}), exc.http_status
 
 # ── SQLite auth / history ────────────────────────────────────────────────────
 
@@ -1473,6 +1481,9 @@ def history_save():
     if not _desktop_legacy_auth and int(job.get("_user_id") or -1) != int(user["id"]):
         return jsonify({"error": "job not done or not found"}), 400
     if not _persist_job_with_files(job, "done", int(user["id"])):
+        if job.get("_capacity_error"):
+            code, http_status = job["_capacity_error"]
+            return jsonify({"error": code}), http_status
         return jsonify({"error": "unable to save history"}), 500
     return jsonify({"ok": True, "id": job_id}), 201
 
@@ -3058,6 +3069,35 @@ def _persist_job_with_files(
     owner_id = user_id if user_id is not None else job.get("_user_id")
     if owner_id is None:
         return False
+    result = job.get("result") if status == "done" else job.get("partial")
+    result = result if isinstance(result, dict) else {}
+    try:
+        _capacity_limits.validate_history_payload(
+            result.get("nodes") if isinstance(result.get("nodes"), list) else [],
+            result.get("edges") if isinstance(result.get("edges"), list) else [],
+            job.get("source_markdown"),
+            job.get("source_pdf"),
+        )
+        local_bytes = sum(
+            path.stat().st_size
+            for root in (
+                _persistent_job_dir(str(job["job_id"])),
+                _source_pdf_dir(str(job["job_id"])),
+            )
+            if root.is_dir()
+            for path in root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        )
+        if not _desktop_legacy_auth:
+            _capacity_limits.ensure_user_storage_capacity(
+                _learning_repository,
+                int(owner_id),
+                local_bytes,
+                replacing_history_id=str(job["job_id"]),
+            )
+    except CapacityExceeded as exc:
+        job["_capacity_error"] = (exc.code, exc.http_status)
+        return False
     if not _desktop_legacy_auth and _object_storage is not None:
         try:
             stored_version = _object_storage.upload_version(
@@ -3320,6 +3360,9 @@ def create_job():
 
     if not text_content:
         return jsonify({"error": "No content provided"}), 400
+    encoded_input_bytes = len(str(text_content).encode("utf-8"))
+    _capacity_limits.validate_upload_size(encoded_input_bytes)
+    _capacity_limits.ensure_disk_capacity(_DATA_ROOT, encoded_input_bytes)
     if not _desktop_legacy_auth and user and not str(api_key or "").strip():
         # 浏览器只知道“已配置”状态；实际 Key 始终由服务端按当前用户解密。
         stored_config = _active_user_llm_config(user)
@@ -3396,6 +3439,9 @@ def create_job():
                 _remove_job_artifacts(job_id, failed_job.get("_artifact_dir"))
             except (OSError, ValueError):
                 pass
+            if failed_job.get("_capacity_error"):
+                code, http_status = failed_job["_capacity_error"]
+                return jsonify({"error": code}), http_status
             return jsonify({"error": "Unable to persist job progress"}), 500
 
     _start_pipeline_attempt(job_id, resume=False)

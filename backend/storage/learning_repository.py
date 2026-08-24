@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -317,6 +317,22 @@ class LearningRepository:
                 )
             )
             return self._history_dict(row) if row is not None else None
+
+    def user_storage_bytes(
+        self, user_id: int, *, exclude_history_id: str | None = None
+    ) -> int:
+        conditions = [History.user_id == user_id, History.deleted_at.is_(None)]
+        if exclude_history_id:
+            conditions.append(History.id != exclude_history_id)
+        with self._session_factory() as session:
+            return int(
+                session.scalar(
+                    select(func.coalesce(func.sum(History.storage_bytes), 0)).where(
+                        *conditions
+                    )
+                )
+                or 0
+            )
 
     @staticmethod
     def _apply_snapshot(row: History, snapshot: JobSnapshot) -> None:
