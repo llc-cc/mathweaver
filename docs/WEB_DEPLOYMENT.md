@@ -274,3 +274,12 @@ docker compose -f deploy/docker-compose.web.yml \
 
 当前 `backend/requirements.txt` 仍同时包含生产运行、测试和桌面打包依赖（如 `pytest`、`pyinstaller`）。这会扩大生产镜像和供应链扫描面，但本轮不拆分依赖文件；后续应拆成 runtime/dev requirements，并对精简镜像补完整导入与流水线 smoke test。
 
+## 9. 数据运维门禁
+
+正式切换流量前，部署负责人必须完成以下两份手册中的生产门槛，并把证据关联到发布记录：
+
+- [数据备份、恢复与演练手册](operations/DATA_BACKUP_RECOVERY.md)：RDS 自动备份/PITR、OSS 版本与复制、季度恢复演练、RPO/RTO、行数、manifest checksum 和对象哈希验收。
+- [存储容量、保留与告警手册](operations/STORAGE_CAPACITY_AND_ALERTS.md)：任务/用户容量、保留与软删除顺序、孤儿宽限期、磁盘、outbox、恢复、事务和连接池告警。
+
+CI 通过只能证明仓库内迁移、Fake OSS、类型和容器门禁，不替代真实 RDS/OSS 恢复证据。没有最近一次合格联合恢复演练、生产容量值和告警接收人时，不得将部署标记为生产数据就绪。
+
