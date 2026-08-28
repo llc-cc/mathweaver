@@ -27,12 +27,12 @@
 
 **Files:**
 
-- Modify: `requirements.txt`
+- Modify: `backend/requirements.txt`
 - Create: `backend/storage/__init__.py`
 - Create: `backend/storage/database.py`
 - Create: `backend/tests/conftest.py`
 - Create: `backend/tests/test_database_config.py`
-- Modify: `.env.example`
+- Create: `.env.example`
 
 **Step 1: 写失败测试**
 
@@ -61,7 +61,7 @@ Expected: 因 `backend.storage.database` 不存在而失败。
 
 MySQL Engine 固定启用 `pool_pre_ping=True`、合理的 `pool_recycle`，Web 模式缺少 `MATHWEAVER_DATABASE_URL` 时立即失败，不回退到本地文件。
 
-`requirements.txt` 增加并固定兼容版本的 `SQLAlchemy`、`PyMySQL`、`alembic`、`gunicorn`；`.env.example` 只写变量名和占位值。
+`backend/requirements.txt` 增加并固定兼容版本的 `SQLAlchemy`、`PyMySQL`、`alembic`、`gunicorn`；根目录 `.env.example` 只写变量名和占位值。
 
 **Step 4: 运行测试**
 
@@ -72,7 +72,7 @@ Expected: PASS。
 **Step 5: 提交**
 
 ```bash
-git add requirements.txt .env.example backend/storage backend/tests/conftest.py backend/tests/test_database_config.py
+git add backend/requirements.txt .env.example backend/storage backend/tests/conftest.py backend/tests/test_database_config.py
 git commit -m "feat(storage): establish mysql session boundary"
 ```
 
@@ -530,7 +530,7 @@ git commit -m "feat(graph): add idempotent mysql seed import"
 
 **Step 2: 运行前端基线**
 
-Run: `npm test -- --run`
+Run: `npx vitest run --config vitest.config.ts`
 
 Run: `npm run build`
 
@@ -542,7 +542,7 @@ Expected: 若契约不兼容则先得到确定失败；若已经兼容，不制�
 
 **Step 4: 再次验证**
 
-Run: `npm test -- --run`
+Run: `npx vitest run --config vitest.config.ts`
 
 Run: `npm run build`
 
@@ -625,7 +625,7 @@ Run: `git status --short`
 
 Run: `python -m pytest backend/tests -q`
 
-Run: `npm test -- --run`
+Run: `npx vitest run --config vitest.config.ts`
 
 Run: `npm run build`
 
@@ -696,7 +696,7 @@ Expected: 工作树干净，全部通过。
 
 Run: `python -m pytest backend/tests -q`
 
-Run: `npm test -- --run`
+Run: `npx vitest run --config vitest.config.ts`
 
 Run: `npm run build`
 
