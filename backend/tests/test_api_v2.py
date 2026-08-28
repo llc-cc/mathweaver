@@ -24,11 +24,6 @@ def test_settings_history_markdown_and_proof_routes_avoid_sqlite(
     monkeypatch.setenv("MATHGRAPH_DATA_DIR", str(Path(database.url.database).parent))
     import api_v2
 
-    monkeypatch.setattr(
-        api_v2,
-        "_get_db",
-        lambda: (_ for _ in ()).throw(AssertionError("core route called SQLite")),
-    )
     client = api_v2.app.test_client()
     token = _register(client, "routes@example.com")
     headers = {"Authorization": f"Bearer {token}"}

@@ -87,15 +87,10 @@ def test_teacher_whitelist_sync_never_downgrades_admin(database) -> None:
 
 
 def test_web_auth_never_calls_sqlite(database, monkeypatch: pytest.MonkeyPatch) -> None:
-    # 教学域 SQLite 会在 Task 5-8 继续迁移；本用例只禁止认证路由触碰它。
     monkeypatch.setenv("MATHGRAPH_DATA_DIR", str(Path(database.url.database).parent))
     import api_v2
 
-    monkeypatch.setattr(
-        api_v2,
-        "_get_db",
-        lambda: (_ for _ in ()).throw(AssertionError("Web auth called SQLite")),
-    )
+    assert not hasattr(api_v2, "_get_db")
     client = api_v2.app.test_client()
 
     registered = client.post(
