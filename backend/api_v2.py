@@ -67,19 +67,7 @@ from education_service import (
     merge_ai_path,
     run_structured_education_tasks,
 )
-from student_context import (
-    build_student_context_overview,
-    build_student_context_packet,
-    build_teacher_context_summary,
-    context_preview,
-    delete_student_context,
-    export_student_context,
-    load_idempotent_result,
-    run_structured_proof_assist,
-    save_interaction_result,
-    store_interaction_with_evidence,
-    update_evidence_status,
-)
+from student_context import context_preview, run_structured_proof_assist
 from ocr_runtime import (
     CHUNK_SIZE,
     IMAGE_MAX_BYTES,
@@ -107,6 +95,7 @@ from storage.education_repository import (
     StudentNumberConflictError,
 )
 from storage.learning_repository import JobSnapshot, LearningRepository
+from storage.student_context_repository import StudentContextRepository
 
 app = Flask(__name__)
 CORS(app)
@@ -117,6 +106,7 @@ _learning_repository = LearningRepository()
 _education_repository = EducationRepository()
 _education_access_service = EducationAccessService(_education_repository)
 _assessment_repository = AssessmentRepository()
+_student_context_repository = StudentContextRepository()
 _teacher_sync_lock = threading.Lock()
 _teacher_sync_engine_id: int | None = None
 
@@ -4041,14 +4031,9 @@ def education_student_context(assignment_id: str):
         return jsonify({"error": "only students can view their context"}), 403
     raw_node_id = request.args.get("nodeId")
     if raw_node_id is None or raw_node_id == "":
-        db = _get_db()
-        overview = build_student_context_overview(
-            db,
-            assignment=assignment,
-            snapshot=snapshot,
-            user_id=int(user["id"]),
+        overview = _student_context_repository.build_overview(
+            assignment, snapshot, int(user["id"])
         )
-        db.commit()
         return jsonify(overview)
     try:
         node_id = int(raw_node_id)
@@ -4057,17 +4042,11 @@ def education_student_context(assignment_id: str):
     if node_id not in set(_education_path_node_ids(_education_json(assignment["base_path_json"], {}))):
         return jsonify({"error": "node is outside the frozen learning path"}), 400
     try:
-        db = _get_db()
-        packet = build_student_context_packet(
-            db,
-            assignment=assignment,
-            snapshot=snapshot,
-            user_id=int(user["id"]),
-            node_id=node_id,
+        packet = _student_context_repository.build_packet(
+            assignment, snapshot, int(user["id"]), node_id
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
-    db.commit()
     return jsonify({
         "contextVersion": packet["contextVersion"],
         "contextPreview": context_preview(packet),
@@ -4107,20 +4086,14 @@ def education_proof_assist(assignment_id: str):
     if len(user_proof) > 200000:
         return jsonify({"error": "userProof is too large"}), 413
 
-    db = _get_db()
-    existing = load_idempotent_result(
-        db,
-        assignment_id=assignment_id,
-        user_id=int(user["id"]),
-        client_interaction_id=client_interaction_id,
+    existing = _student_context_repository.load_idempotent_result(
+        assignment_id, int(user["id"]), client_interaction_id
     )
     if existing:
         return jsonify(existing)
-    incomplete = db.execute(
-        """SELECT id FROM learning_interactions
-            WHERE assignment_id = ? AND user_id = ? AND client_interaction_id = ?""",
-        (assignment_id, user["id"], client_interaction_id),
-    ).fetchone()
+    incomplete = _student_context_repository.interaction_exists(
+        assignment_id, int(user["id"]), client_interaction_id
+    )
     if incomplete:
         return jsonify({
             "error": "interaction is still being finalized",
@@ -4133,41 +4106,37 @@ def education_proof_assist(assignment_id: str):
             "error": "education AI is not configured",
             "code": "education_ai_unconfigured",
         }), 503
-    allowed, _remaining = _education_consume_ai_quota(int(user["id"]))
-    if not allowed:
+    task_key = f"proof:{assignment_id}:{int(user['id'])}:{client_interaction_id}"
+    claim = _assessment_repository.claim_ai_task(
+        task_key,
+        int(user["id"]),
+        "student_proof_assist",
+        f"assignments/{assignment_id}/student-context",
+        _education_daily_limit(),
+    )
+    if not claim["claimed"] and claim.get("reason") == "limit":
         return jsonify({
             "error": "education AI daily limit reached",
             "code": "education_ai_limit_reached",
         }), 429
+    if not claim["claimed"]:
+        return jsonify({
+            "error": "interaction is still being finalized",
+            "code": "interaction_incomplete",
+        }), 409
     try:
-        packet = build_student_context_packet(
-            db,
-            assignment=assignment,
-            snapshot=snapshot,
-            user_id=int(user["id"]),
-            node_id=node_id,
+        packet = _student_context_repository.build_packet(
+            assignment,
+            snapshot,
+            int(user["id"]),
+            node_id,
             user_proof=user_proof,
             action=action,
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
     related_node_ids = _education_context_node_ids(snapshot, node_id)
-    task_record_id = uuid.uuid4().hex
-    now = datetime.utcnow().isoformat()
-    db.execute(
-        """INSERT INTO education_ai_tasks
-             (id, task_key, user_id, task_kind, scope, status, created_at, updated_at)
-           VALUES (?, ?, ?, 'student_proof_assist', ?, 'running', ?, ?)""",
-        (
-            task_record_id,
-            client_interaction_id,
-            user["id"],
-            f"assignments/{assignment_id}/student-context",
-            now,
-            now,
-        ),
-    )
-    db.commit()
+    task_record_id = claim.get("id")
     try:
         llm_context = create_education_context(_DATA_ROOT, config)
         assist_result = run_structured_proof_assist(
@@ -4176,8 +4145,7 @@ def education_proof_assist(assignment_id: str):
             packet=packet,
             allowed_related_node_ids=related_node_ids,
         )
-        stored = store_interaction_with_evidence(
-            db,
+        stored = _student_context_repository.store_interaction_with_evidence(
             assignment=assignment,
             snapshot=snapshot,
             user_id=int(user["id"]),
@@ -4190,12 +4158,11 @@ def education_proof_assist(assignment_id: str):
             learning_delta=assist_result["learningDelta"],
             classification_status=assist_result["classificationStatus"],
         )
-        refreshed_packet = build_student_context_packet(
-            db,
-            assignment=assignment,
-            snapshot=snapshot,
-            user_id=int(user["id"]),
-            node_id=node_id,
+        refreshed_packet = _student_context_repository.build_packet(
+            assignment,
+            snapshot,
+            int(user["id"]),
+            node_id,
             user_proof=user_proof,
             action=action,
         )
@@ -4214,22 +4181,18 @@ def education_proof_assist(assignment_id: str):
                 and requested_context_version != packet["contextVersion"]
             ),
         }
-        save_interaction_result(db, interaction_id=stored["interactionId"], result=result)
-        db.execute(
-            "UPDATE education_ai_tasks SET status = 'done', updated_at = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), task_record_id),
+        _student_context_repository.save_interaction_result(
+            stored["interactionId"], result
         )
-        db.commit()
+        if task_record_id:
+            _assessment_repository.finish_ai_task(task_record_id)
         return jsonify(result)
     except Exception as exc:
         safe_error = _education_safe_error_message(exc, config)
-        db.rollback()
-        db.execute(
-            """UPDATE education_ai_tasks
-               SET status = 'failed', error = ?, updated_at = ? WHERE id = ?""",
-            (safe_error[:1000], datetime.utcnow().isoformat(), task_record_id),
-        )
-        db.commit()
+        if task_record_id:
+            _assessment_repository.finish_ai_task(
+                task_record_id, error=safe_error[:1000]
+            )
         return jsonify({"error": "student proof assistance failed", "message": safe_error}), 502
 
 
@@ -4241,18 +4204,16 @@ def education_context_evidence_feedback(evidence_id: str):
     body = request.get_json(silent=True) or {}
     status = str(body.get("status") or "").strip()
     try:
-        evidence = update_evidence_status(
-            _get_db(),
-            evidence_id=evidence_id,
-            user_id=int(user["id"]),
-            new_status=status,
-            note=str(body.get("note") or ""),
+        evidence = _student_context_repository.update_evidence_status(
+            evidence_id,
+            int(user["id"]),
+            status,
+            str(body.get("note") or ""),
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     if not evidence:
         return jsonify({"error": "evidence not found"}), 404
-    _get_db().commit()
     return jsonify({"evidence": evidence})
 
 
@@ -4269,26 +4230,17 @@ def education_teacher_student_context_summary(assignment_id: str, student_user_i
         return error
     if membership["role"] != "teacher":
         return jsonify({"error": "forbidden"}), 403
-    student = _get_db().execute(
-        """SELECT u.id, m.student_name, m.student_number
-             FROM education_memberships m
-             JOIN users u ON u.id = m.user_id
-            WHERE m.class_id = ? AND m.user_id = ? AND m.role = 'student'
-              AND m.removed_at IS NULL""",
-        (assignment["class_id"], student_user_id),
-    ).fetchone()
-    if not student:
-        return jsonify({"error": "student not found", "code": "student_not_found"}), 404
-    summary = build_teacher_context_summary(
-        _get_db(),
-        assignment=assignment,
-        snapshot=snapshot,
-        student_user_id=student_user_id,
+    student = _education_repository.get_membership(
+        assignment["class_id"], student_user_id
     )
-    _get_db().commit()
+    if not student or student["role"] != "student" or student.get("removed_at"):
+        return jsonify({"error": "student not found", "code": "student_not_found"}), 404
+    summary = _student_context_repository.teacher_summary(
+        assignment, snapshot, student_user_id
+    )
     return jsonify({
         "student": {
-            "userId": student["id"],
+            "userId": student_user_id,
             "studentName": student["student_name"],
             "studentNumber": student["student_number"],
         },
@@ -4297,14 +4249,10 @@ def education_teacher_student_context_summary(assignment_id: str, student_user_i
 
 
 def _education_student_context_owner(class_id: str, user):
-    # Data-rights endpoints remain available after a class is archived or a
-    # student is removed; ownership is still constrained by user_id + class_id.
-    membership = _get_db().execute(
-        """SELECT m.role FROM education_memberships m
-            JOIN education_classes c ON c.id = m.class_id
-            WHERE m.class_id = ? AND m.user_id = ?""",
-        (class_id, user["id"]),
-    ).fetchone()
+    # 数据权利接口在班级归档或学生被移除后仍可用，但只能访问本人数据。
+    membership = _student_context_repository.data_rights_membership(
+        class_id, int(user["id"])
+    )
     if not membership:
         return None, (jsonify({"error": "class not found"}), 404)
     if membership["role"] != "student":
@@ -4320,8 +4268,8 @@ def education_student_context_export(class_id: str):
     _membership, error = _education_student_context_owner(class_id, user)
     if error:
         return error
-    payload = export_student_context(
-        _get_db(), class_id=class_id, user_id=int(user["id"])
+    payload = _student_context_repository.export_student_context(
+        class_id, int(user["id"])
     )
     response = jsonify(payload)
     response.headers["Content-Disposition"] = (
@@ -4344,15 +4292,9 @@ def education_student_context_delete(class_id: str):
             "error": "confirmClassId must match the course",
             "code": "context_delete_confirmation_required",
         }), 400
-    db = _get_db()
-    try:
-        counts = delete_student_context(
-            db, class_id=class_id, user_id=int(user["id"])
-        )
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
+    counts = _student_context_repository.delete_student_context(
+        class_id, int(user["id"])
+    )
     return jsonify({"ok": True, **counts})
 
 
