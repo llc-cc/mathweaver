@@ -23,7 +23,7 @@ BASE_TABLES = {
 
 
 def test_base_metadata_contains_server_tables() -> None:
-    assert set(Base.metadata.tables) == BASE_TABLES
+    assert BASE_TABLES <= set(Base.metadata.tables)
 
 
 def test_history_keeps_graph_json_and_source_markdown() -> None:

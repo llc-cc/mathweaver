@@ -53,3 +53,16 @@ def test_alembic_offline_sql_does_not_expose_runtime_password() -> None:
     assert result.returncode == 0, result.stderr
     assert "do-not-print" not in result.stdout
     assert "do-not-print" not in result.stderr
+
+
+def test_teaching_migration_is_forward_only_and_reaches_new_head() -> None:
+    result = _offline_upgrade_sql()
+
+    assert result.returncode == 0, result.stderr
+    assert "20260828_03" in result.stdout
+    assert "ALTER TABLE teaching_classes ADD COLUMN public_id" in result.stdout
+    assert "ALTER TABLE history MODIFY source_markdown LONGTEXT" in result.stdout
+    assert "CREATE TABLE education_snapshots" in result.stdout
+    assert "source_markdown LONGTEXT" in result.stdout
+    assert "CREATE TABLE learning_context_summaries" in result.stdout
+    assert "DROP TABLE" not in result.stdout
