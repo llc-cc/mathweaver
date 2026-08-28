@@ -648,6 +648,9 @@ class EducationRepository:
                 created_by=actor_id,
             )
             session.add(assignment)
+            # 评测节点与作业没有 ORM relationship；严格外键库不会据此推导父子刷新顺序，
+            # 因此先落父记录，再在同一事务中批量写入子节点。
+            session.flush()
             for node_id in path_node_ids:
                 session.add(
                     EducationAssessmentNode(

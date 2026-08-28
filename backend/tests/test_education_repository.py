@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from storage.database import session_scope
 from storage.education_repository import EducationRepository
@@ -148,3 +148,57 @@ def test_assignment_write_rolls_back_when_path_validation_fails(database) -> Non
 
     with session_scope() as session:
         assert session.scalar(select(func.count()).select_from(EducationAssignment)) == 0
+
+
+def test_assignment_parent_is_flushed_before_assessments_with_foreign_keys(
+    database,
+) -> None:
+    """严格外键环境必须先落作业父记录，避免 MySQL 拒绝评测节点。"""
+
+    def enable_foreign_keys(dbapi_connection, _connection_record) -> None:
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    event.listen(database, "connect", enable_foreign_keys)
+    with database.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+    teacher_id = _user("strict-fk-teacher@example.com", "teacher")
+    repository = EducationRepository()
+    class_row = repository.create_class(teacher_id, "严格外键班级")
+    snapshot, _created = repository.create_snapshot(
+        public_class_id=class_row["id"],
+        actor_id=teacher_id,
+        source_graph_id="strict-fk-v1",
+        source_history_id=None,
+        filename="strict-fk.md",
+        nodes=[{"id": 1, "global_id": "strict-fk:1"}],
+        edges=[],
+        source_markdown="# strict foreign keys",
+        latex_macros={},
+        source_pdf=None,
+    )
+
+    assignment = repository.create_assignment(
+        public_class_id=class_row["id"],
+        snapshot_id=snapshot["id"],
+        actor_id=teacher_id,
+        title="严格外键作业",
+        target_node_id=1,
+        due_at=None,
+        path={
+            "targetNodeId": 1,
+            "steps": [
+                {
+                    "nodeId": 1,
+                    "order": 0,
+                    "stage": 0,
+                    "role": "target",
+                    "required": True,
+                    "cycle": False,
+                }
+            ],
+            "edges": [],
+        },
+    )
+
+    assert assignment["target_node_id"] == 1
