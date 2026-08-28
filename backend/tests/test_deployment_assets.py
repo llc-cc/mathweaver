@@ -28,6 +28,8 @@ def test_units_bind_only_to_127_0_0_1_sidecar_ports() -> None:
     assert "127.0.0.1" in frontend and "5174" in frontend
     assert "0.0.0.0" not in backend + frontend
     assert "/opt/mathweaver/.env.teaching" in backend
+    assert "User=nginx" in backend and "Group=nginx" in backend
+    assert "User=nginx" in frontend and "Group=nginx" in frontend
 
 
 def test_nginx_uses_18080_and_proxies_api_to_5002() -> None:

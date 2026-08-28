@@ -65,6 +65,7 @@ preflight() {
   command -v nginx >/dev/null
   command -v curl >/dev/null
   command -v ss >/dev/null
+  getent passwd nginx >/dev/null || { echo "required nginx service account is missing" >&2; exit 73; }
   check_sidecar_ports_free
   df -Pk "$ROOT" | awk 'NR==2 { if ($4 < 2097152) exit 1 }'
   echo "preflight ok: $RELEASE_DIR"

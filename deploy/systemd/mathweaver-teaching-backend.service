@@ -4,8 +4,8 @@ After=network.target mysql.service
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=nginx
+Group=nginx
 WorkingDirectory=/opt/mathweaver/current-teaching/backend
 EnvironmentFile=/opt/mathweaver/.env.teaching
 ExecStart=/opt/mathweaver/current-teaching/.venv/bin/gunicorn --bind 127.0.0.1:5002 --workers 2 --threads 2 --timeout 180 --access-logfile - --error-logfile - api_v2:app

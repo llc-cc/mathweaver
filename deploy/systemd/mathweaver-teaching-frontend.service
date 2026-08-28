@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=nginx
+Group=nginx
 WorkingDirectory=/opt/mathweaver/current-teaching
 Environment=HOST=127.0.0.1
 Environment=PORT=5174
