@@ -18,10 +18,25 @@ class _MineruHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         return
 
+    def _consume_request_body(self) -> None:
+        """消费测试请求体，避免服务端提前关连接掩盖真实协议行为。"""
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            while True:
+                chunk_size = int(self.rfile.readline().split(b";", 1)[0], 16)
+                if chunk_size == 0:
+                    self.rfile.readline()
+                    return
+                self.rfile.read(chunk_size)
+                self.rfile.read(2)
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length:
+            self.rfile.read(content_length)
+
     def do_POST(self):
         if self.path != "/tasks":
             self.send_error(404)
             return
+        self._consume_request_body()
         payload = {"task_id": "mock-task"}
         self.send_response(202)
         self.send_header("Content-Type", "application/json")
