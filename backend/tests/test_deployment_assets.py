@@ -52,6 +52,14 @@ def test_deploy_script_never_overwrites_3000_or_5001_services() -> None:
     assert ":3000" not in deploy
 
 
+def test_deploy_uses_python_311_instead_of_the_legacy_python3_alias() -> None:
+    deploy = _text(DEPLOY)
+
+    assert "PYTHON_BIN=python3.11" in deploy
+    assert '"$PYTHON_BIN" -m venv' in deploy
+    assert "python3 -m venv" not in deploy
+
+
 def test_release_uses_version_directory_and_atomic_symlink() -> None:
     deploy = _text(DEPLOY)
 

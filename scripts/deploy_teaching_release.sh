@@ -9,6 +9,8 @@ ENV_FILE=/opt/mathweaver/.env.teaching
 BACKEND_UNIT=mathweaver-teaching-backend.service
 FRONTEND_UNIT=mathweaver-teaching-frontend.service
 NGINX_CONFIG=/etc/nginx/conf.d/mathweaver-teaching-18080.conf
+# 目标服务器的 python3 仍指向 3.6；固定使用已安装的 3.11，避免 pip 静默降级依赖。
+PYTHON_BIN=python3.11
 
 usage() {
   echo "usage: $0 {preflight|migrate|start|rollback} [release-directory]" >&2
@@ -60,7 +62,7 @@ preflight() {
     600|640) ;;
     *) echo "teaching environment file permissions must be 600 or 640" >&2; exit 68 ;;
   esac
-  command -v python3 >/dev/null
+  command -v "$PYTHON_BIN" >/dev/null
   command -v npm >/dev/null
   command -v nginx >/dev/null
   command -v curl >/dev/null
@@ -73,7 +75,7 @@ preflight() {
 
 migrate() {
   resolve_release "$1"
-  python3 -m venv "$RELEASE_DIR/.venv"
+  "$PYTHON_BIN" -m venv "$RELEASE_DIR/.venv"
   "$RELEASE_DIR/.venv/bin/pip" install --disable-pip-version-check -r "$RELEASE_DIR/backend/requirements.txt"
   npm --prefix "$RELEASE_DIR" ci
   npm --prefix "$RELEASE_DIR" run build
