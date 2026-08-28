@@ -599,6 +599,7 @@ export function educationErrorMessage(cause: unknown) {
     case "education_ai_unconfigured": return "课程 AI 尚未配置，请联系教师或管理员。";
     case "education_ai_limit_reached": return "今天的课程 AI 使用次数已达上限。";
     case "interaction_incomplete": return "上一次请求仍在保存，请稍后重试。";
+    case "database_unavailable": return "教学服务暂不可用，请稍后重试。";
     default: return error.message || "操作失败，请稍后重试。";
   }
 }

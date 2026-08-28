@@ -154,6 +154,8 @@ describe("education action feedback", () => {
     expect(educationErrorMessage({ code: "education_role_forbidden" })).toContain("没有执行此操作的权限");
     expect(educationErrorMessage({ code: "assessment_draft_changed" })).toContain("其他窗口");
     expect(educationErrorMessage({ code: "assessment_invalid_result" })).toContain("结构校验");
+    expect(educationErrorMessage({ code: "interaction_incomplete" })).toContain("稍后重试");
+    expect(educationErrorMessage({ code: "database_unavailable" })).toContain("服务暂不可用");
   });
 
   it("identifies missing, pending, failed, and empty assessment nodes", () => {
