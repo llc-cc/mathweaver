@@ -93,8 +93,18 @@ from services.auth_service import (
     InvalidCredentialsError,
     PasswordPolicyError,
 )
+from services.education_access_service import (
+    EducationAccessError,
+    EducationAccessService,
+)
 from storage.auth_repository import AuthRepository
 from storage.database import get_engine
+from storage.education_repository import (
+    ClassRoleConflictError,
+    EducationRepository,
+    MembershipRemovedError,
+    StudentNumberConflictError,
+)
 from storage.learning_repository import JobSnapshot, LearningRepository
 
 app = Flask(__name__)
@@ -103,6 +113,8 @@ CORS(app)
 _auth_repository = AuthRepository()
 _auth_service = AuthService(_auth_repository)
 _learning_repository = LearningRepository()
+_education_repository = EducationRepository()
+_education_access_service = EducationAccessService(_education_repository)
 _teacher_sync_lock = threading.Lock()
 _teacher_sync_engine_id: int | None = None
 
@@ -1832,37 +1844,33 @@ def _education_student_profile(body: dict) -> tuple[str | None, str | None, tupl
 
 
 def _education_membership(class_id: str, user_id: int):
-    return _get_db().execute(
-        """SELECT m.role, m.student_name, m.student_number, c.* FROM education_memberships m
-           JOIN education_classes c ON c.id = m.class_id
-           WHERE m.class_id = ? AND m.user_id = ? AND m.removed_at IS NULL
-             AND c.archived_at IS NULL""",
-        (class_id, user_id),
-    ).fetchone()
+    return _education_repository.get_membership(class_id, user_id)
 
 
 def _education_require_membership(class_id: str, user, allowed_roles=None, *, require_student_profile=True):
-    membership = _education_membership(class_id, int(user["id"]))
-    if not membership:
-        return None, (jsonify({"error": "class not found"}), 404)
-    if membership["role"] != user["education_role"]:
-        return None, (jsonify({"error": "class is not available in the selected education role", "code": "education_role_forbidden"}), 403)
-    if allowed_roles and membership["role"] not in allowed_roles:
-        return None, (jsonify({"error": "forbidden"}), 403)
-    if require_student_profile and membership["role"] == "student" and (
-        not membership["student_name"] or not membership["student_number"]
-    ):
-        return None, (jsonify({
-            "error": "student profile is incomplete",
-            "code": "student_profile_required",
-            "classId": class_id,
-        }), 409)
-    return membership, None
+    try:
+        membership = _education_access_service.membership(
+            class_id,
+            user_id=int(user["id"]),
+            selected_role=user["education_role"],
+            allowed_roles=set(allowed_roles) if allowed_roles else None,
+            require_student_profile=require_student_profile,
+        )
+        return membership, None
+    except EducationAccessError as exc:
+        payload = {"error": exc.message}
+        if exc.code:
+            payload["code"] = exc.code
+        if exc.code == "student_profile_required":
+            payload["classId"] = class_id
+        return None, (jsonify(payload), exc.status)
 
 
 def _education_json(raw, default):
     if not raw:
         return default
+    if isinstance(raw, type(default)):
+        return raw
     try:
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
@@ -1936,37 +1944,13 @@ def _education_public_snapshot(row, include_graph=False) -> dict:
 
 
 def _education_public_assessments(assignment_id: str, *, role: str | None, user_id: int | None = None) -> list[dict]:
-    db = _get_db()
-    node_rows = db.execute(
-        """SELECT assignment_id, node_id, status, last_error, updated_at
-             FROM education_assessment_nodes
-            WHERE assignment_id = ? ORDER BY node_id""",
-        (assignment_id,),
-    ).fetchall()
-    question_rows = db.execute(
-        """SELECT * FROM education_assessment_questions
-            WHERE assignment_id = ? ORDER BY node_id, sort_order""",
-        (assignment_id,),
-    ).fetchall()
-    questions_by_node: dict[int, list] = defaultdict(list)
-    for question in question_rows:
-        questions_by_node[int(question["node_id"])].append(question)
-    attempts_by_node = {}
-    if role == "student" and user_id is not None:
-        attempts_by_node = {
-            int(attempt["node_id"]): attempt
-            for attempt in db.execute(
-                """SELECT node_id, status, updated_at, completed_at
-                     FROM education_assessment_attempts
-                    WHERE assignment_id = ? AND user_id = ?""",
-                (assignment_id, user_id),
-            ).fetchall()
-        }
-
+    node_rows = _education_repository.list_assessments(
+        assignment_id, role=role, user_id=user_id
+    )
     assessments = []
     for node_row in node_rows:
         node_id = int(node_row["node_id"])
-        questions = questions_by_node.get(node_id, [])
+        questions = node_row.get("questions") or []
         payload = {
             "nodeId": node_id,
             "status": node_row["status"],
@@ -1995,7 +1979,7 @@ def _education_public_assessments(assignment_id: str, *, role: str | None, user_
                 for question in questions
             ]
         elif role == "student":
-            attempt = attempts_by_node.get(node_id)
+            attempt = node_row.get("attempt")
             payload["attemptStatus"] = attempt["status"] if attempt else "not_started"
             payload["attemptUpdatedAt"] = attempt["updated_at"] if attempt else None
         assessments.append(payload)
@@ -2003,23 +1987,7 @@ def _education_public_assessments(assignment_id: str, *, role: str | None, user_
 
 
 def _education_public_submission_summary(assignment_id: str, user_id: int) -> dict | None:
-    row = _get_db().execute(
-        "SELECT * FROM education_assignment_submissions WHERE assignment_id = ? AND user_id = ?",
-        (assignment_id, user_id),
-    ).fetchone()
-    if not row:
-        return None
-    payload = {
-        "id": row["id"],
-        "status": row["status"],
-        "submittedAt": row["submitted_at"],
-        "updatedAt": row["updated_at"],
-        "releasedAt": row["released_at"],
-    }
-    if row["status"] == "released":
-        payload["teacherTotal"] = float(row["teacher_total"] or 0)
-        payload["teacherSummary"] = row["teacher_summary"] or ""
-    return payload
+    return _education_repository.get_submission_summary(assignment_id, user_id)
 
 
 def _education_public_assignment(row, *, snapshot=None, path=None, role=None, user_id=None) -> dict:
@@ -2051,20 +2019,7 @@ def _education_public_assignment(row, *, snapshot=None, path=None, role=None, us
 
 
 def _education_progress_map(assignment_id: str, user_id: int) -> dict[int, dict]:
-    rows = _get_db().execute(
-        """SELECT node_id, state, mastery_source, diagnostic_summary, updated_at
-           FROM education_node_progress WHERE assignment_id = ? AND user_id = ?""",
-        (assignment_id, user_id),
-    ).fetchall()
-    return {
-        int(row["node_id"]): {
-            "state": row["state"],
-            "masterySource": row["mastery_source"],
-            "diagnosticSummary": row["diagnostic_summary"],
-            "updatedAt": row["updated_at"],
-        }
-        for row in rows
-    }
+    return _education_repository.get_progress_map(assignment_id, user_id)
 
 
 def _education_consume_ai_quota(user_id: int) -> tuple[bool, int]:
@@ -2500,14 +2455,13 @@ def _education_generate_initial_assessments(*, assignment_id: str, user_id: int,
 @app.route("/api/v2/edu/status", methods=["GET"])
 def education_status():
     user = _current_user()
-    used = 0
-    if user:
-        today = datetime.utcnow().date().isoformat()
-        row = _get_db().execute(
-            "SELECT request_count FROM education_ai_usage WHERE user_id = ? AND usage_day = ?",
-            (user["id"], today),
-        ).fetchone()
-        used = int(row["request_count"] or 0) if row else 0
+    used = (
+        _education_repository.ai_usage_count(
+            int(user["id"]), datetime.utcnow().date()
+        )
+        if user
+        else 0
+    )
     limit = _education_daily_limit()
     return jsonify({
         "enabled": _education_enabled(),
@@ -2522,53 +2476,27 @@ def education_classes():
     user, error = _education_require_user("teacher" if request.method == "POST" else None)
     if error:
         return error
-    db = _get_db()
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
         title = str(body.get("title") or "").strip()
         if not title:
             return jsonify({"error": "class title is required"}), 400
-        class_id = uuid.uuid4().hex
-        invite_code = secrets.token_hex(4).upper()
-        now = datetime.utcnow().isoformat()
-        db.execute(
-            """INSERT INTO education_classes
-                 (id, owner_user_id, title, invite_code, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (class_id, user["id"], title[:120], invite_code, now),
-        )
-        db.execute(
-            """INSERT INTO education_memberships (class_id, user_id, role, joined_at)
-               VALUES (?, ?, 'teacher', ?)""",
-            (class_id, user["id"], now),
-        )
-        db.commit()
+        created = _education_repository.create_class(int(user["id"]), title)
         return jsonify({
             "class": {
-                "id": class_id,
-                "title": title[:120],
-                "inviteCode": invite_code,
+                "id": created["id"],
+                "title": created["title"],
+                "inviteCode": created["invite_code"],
                 "role": "teacher",
                 "memberCount": 1,
                 "assignmentCount": 0,
-                "createdAt": now,
+                "createdAt": created["created_at"],
             },
         }), 201
 
-    assignment_count_filter = "ca.status = 'published'" if user["education_role"] == "student" else "ca.status != 'archived'"
-    rows = db.execute(
-        f"""SELECT c.*, m.role, m.student_name, m.student_number,
-                  (SELECT COUNT(*) FROM education_memberships cm
-                   WHERE cm.class_id = c.id AND cm.removed_at IS NULL) AS member_count,
-                  (SELECT COUNT(*) FROM education_assignments ca
-                   WHERE ca.class_id = c.id AND {assignment_count_filter}) AS assignment_count
-           FROM education_memberships m
-           JOIN education_classes c ON c.id = m.class_id
-           WHERE m.user_id = ? AND m.role = ? AND m.removed_at IS NULL
-             AND c.archived_at IS NULL
-           ORDER BY c.created_at DESC""",
-        (user["id"], user["education_role"]),
-    ).fetchall()
+    rows = _education_repository.list_user_classes(
+        int(user["id"]), user["education_role"]
+    )
     return jsonify({
         "classes": [
             {
@@ -2598,71 +2526,36 @@ def education_class_join(class_id: str):
         return error
     body = request.get_json(silent=True) or {}
     invite_code = str(body.get("inviteCode") or class_id).strip().upper()
-    db = _get_db()
-    class_row = db.execute(
-        """SELECT * FROM education_classes
-           WHERE archived_at IS NULL AND (id = ? OR invite_code = ?)""",
-        (class_id, invite_code),
-    ).fetchone()
-    if not class_row or invite_code != class_row["invite_code"]:
+    student_name, student_number, error = _education_student_profile(body)
+    if error:
+        return error
+    try:
+        class_row = _education_repository.join_student(
+            class_id,
+            invite_code,
+            int(user["id"]),
+            student_name,
+            student_number,
+        )
+    except LookupError:
         return jsonify({"error": "invalid invite code", "code": "invalid_invite_code"}), 404
-    existing = db.execute(
-        "SELECT role, removed_at FROM education_memberships WHERE class_id = ? AND user_id = ?",
-        (class_row["id"], user["id"]),
-    ).fetchone()
-    if existing:
-        if existing["role"] != "student":
-            return jsonify({"error": "this account is already the teacher of this class", "code": "class_role_conflict"}), 409
-        if existing["removed_at"]:
-            return jsonify({
-                "error": "this account has been removed from the class",
-                "code": "class_membership_removed",
-            }), 403
-        role = "student"
-        student_name, student_number, error = _education_student_profile(body)
-        if error:
-            return error
-        try:
-            db.execute(
-                """UPDATE education_memberships
-                   SET student_name = ?, student_number = ?
-                   WHERE class_id = ? AND user_id = ?""",
-                (student_name, student_number, class_row["id"], user["id"]),
-            )
-            db.commit()
-        except sqlite3.IntegrityError:
-            db.rollback()
-            return jsonify({
-                "error": "student number is already used in this class",
-                "code": "student_number_conflict",
-            }), 409
-    else:
-        role = "student"
-        student_name, student_number, error = _education_student_profile(body)
-        if error:
-            return error
-        try:
-            db.execute(
-                """INSERT INTO education_memberships
-                     (class_id, user_id, role, student_name, student_number, joined_at)
-                   VALUES (?, ?, 'student', ?, ?, ?)""",
-                (
-                    class_row["id"], user["id"], student_name, student_number,
-                    datetime.utcnow().isoformat(),
-                ),
-            )
-            db.commit()
-        except sqlite3.IntegrityError:
-            db.rollback()
-            return jsonify({
-                "error": "student number is already used in this class",
-                "code": "student_number_conflict",
-            }), 409
+    except ClassRoleConflictError:
+        return jsonify({"error": "this account is already the teacher of this class", "code": "class_role_conflict"}), 409
+    except MembershipRemovedError:
+        return jsonify({
+            "error": "this account has been removed from the class",
+            "code": "class_membership_removed",
+        }), 403
+    except StudentNumberConflictError:
+        return jsonify({
+            "error": "student number is already used in this class",
+            "code": "student_number_conflict",
+        }), 409
     return jsonify({
         "class": {
             "id": class_row["id"],
             "title": class_row["title"],
-            "role": role,
+            "role": "student",
             "studentName": student_name,
             "studentNumber": student_number,
             "profileComplete": True,
@@ -2685,17 +2578,14 @@ def education_class_membership_update(class_id: str):
     student_name, student_number, error = _education_student_profile(body)
     if error:
         return error
-    db = _get_db()
     try:
-        db.execute(
-            """UPDATE education_memberships
-               SET student_name = ?, student_number = ?
-               WHERE class_id = ? AND user_id = ?""",
-            (student_name, student_number, class_id, user["id"]),
+        membership = _education_repository.update_student_profile(
+            class_id,
+            int(user["id"]),
+            student_name,
+            student_number,
         )
-        db.commit()
-    except sqlite3.IntegrityError:
-        db.rollback()
+    except StudentNumberConflictError:
         return jsonify({
             "error": "student number is already used in this class",
             "code": "student_number_conflict",
@@ -2713,12 +2603,12 @@ def education_class_membership_update(class_id: str):
 
 
 def _education_require_class_teacher(class_id: str, user):
-    membership, error = _education_require_membership(class_id, user, {"teacher"})
-    if error:
-        return None, error
-    if int(membership["owner_user_id"]) != int(user["id"]):
-        return None, (jsonify({"error": "forbidden"}), 403)
-    return membership, None
+    try:
+        return _education_access_service.class_teacher(
+            class_id, user_id=int(user["id"])
+        ), None
+    except EducationAccessError as exc:
+        return None, (jsonify({"error": exc.message}), exc.status)
 
 
 @app.route("/api/v2/edu/classes/<class_id>", methods=["PATCH", "DELETE"])
@@ -2729,27 +2619,17 @@ def education_class_manage(class_id: str):
     _membership, error = _education_require_class_teacher(class_id, user)
     if error:
         return error
-    db = _get_db()
     if request.method == "PATCH":
         body = request.get_json(silent=True) or {}
         title = str(body.get("title") or "").strip()
         if not title:
             return jsonify({"error": "class title is required", "code": "class_title_required"}), 400
         title = title[:120]
-        db.execute(
-            "UPDATE education_classes SET title = ? WHERE id = ?",
-            (title, class_id),
-        )
-        db.commit()
+        _education_repository.rename_class(class_id, title)
         return jsonify({"class": {"id": class_id, "title": title}})
 
-    now = datetime.utcnow().isoformat()
-    db.execute(
-        "UPDATE education_classes SET archived_at = ? WHERE id = ? AND archived_at IS NULL",
-        (now, class_id),
-    )
-    db.commit()
-    return jsonify({"ok": True, "archivedAt": now})
+    archived_at = _education_repository.archive_class(class_id)
+    return jsonify({"ok": True, "archivedAt": archived_at})
 
 
 @app.route("/api/v2/edu/classes/<class_id>/members", methods=["GET"])
@@ -2760,14 +2640,7 @@ def education_class_members(class_id: str):
     _membership, error = _education_require_class_teacher(class_id, user)
     if error:
         return error
-    rows = _get_db().execute(
-        """SELECT m.user_id, m.student_name, m.student_number, m.joined_at, m.removed_at
-           FROM education_memberships m
-           WHERE m.class_id = ? AND m.role = 'student'
-           ORDER BY CASE WHEN m.removed_at IS NULL THEN 0 ELSE 1 END,
-                    m.student_number COLLATE NOCASE, m.user_id""",
-        (class_id,),
-    ).fetchall()
+    rows = _education_repository.list_class_students(class_id)
     return jsonify({
         "members": [
             {
@@ -2792,21 +2665,14 @@ def education_class_remove_member(class_id: str, user_id: int):
     _membership, error = _education_require_class_teacher(class_id, user)
     if error:
         return error
-    db = _get_db()
-    target = db.execute(
-        "SELECT role, removed_at FROM education_memberships WHERE class_id = ? AND user_id = ?",
-        (class_id, user_id),
-    ).fetchone()
+    target = _education_repository.get_membership(
+        class_id, user_id, include_removed=True
+    )
     if not target or target["role"] != "student":
         return jsonify({"error": "student not found", "code": "student_not_found"}), 404
     if target["removed_at"]:
         return jsonify({"ok": True, "status": "removed"})
-    removed_at = datetime.utcnow().isoformat()
-    db.execute(
-        "UPDATE education_memberships SET removed_at = ? WHERE class_id = ? AND user_id = ?",
-        (removed_at, class_id, user_id),
-    )
-    db.commit()
+    removed_at = _education_repository.remove_student(class_id, user_id)
     return jsonify({"ok": True, "status": "removed", "removedAt": removed_at})
 
 
@@ -2818,18 +2684,12 @@ def education_class_restore_member(class_id: str, user_id: int):
     _membership, error = _education_require_class_teacher(class_id, user)
     if error:
         return error
-    db = _get_db()
-    target = db.execute(
-        "SELECT role, removed_at FROM education_memberships WHERE class_id = ? AND user_id = ?",
-        (class_id, user_id),
-    ).fetchone()
+    target = _education_repository.get_membership(
+        class_id, user_id, include_removed=True
+    )
     if not target or target["role"] != "student":
         return jsonify({"error": "student not found", "code": "student_not_found"}), 404
-    db.execute(
-        "UPDATE education_memberships SET removed_at = NULL WHERE class_id = ? AND user_id = ?",
-        (class_id, user_id),
-    )
-    db.commit()
+    _education_repository.restore_student(class_id, user_id)
     return jsonify({"ok": True, "status": "active"})
 
 
@@ -2841,17 +2701,8 @@ def education_class_snapshots(class_id: str):
     membership, error = _education_require_membership(class_id, user)
     if error:
         return error
-    db = _get_db()
     if request.method == "GET":
-        rows = db.execute(
-            """SELECT s.*,
-                      (SELECT COUNT(*) FROM education_assignments a WHERE a.snapshot_id = s.id)
-                        AS bound_assignment_count
-                 FROM education_snapshots s
-                WHERE s.class_id = ?
-                ORDER BY s.created_at DESC""",
-            (class_id,),
-        ).fetchall()
+        rows = _education_repository.list_snapshots(class_id)
         return jsonify({"snapshots": [_education_public_snapshot(row) for row in rows]})
     if membership["role"] != "teacher":
         return jsonify({"error": "forbidden"}), 403
@@ -2867,78 +2718,57 @@ def education_class_snapshots(class_id: str):
     if len(set(node_ids)) != len(node_ids):
         return jsonify({"error": "snapshot node ids must be unique"}), 400
 
-    snapshot_id = uuid.uuid4().hex
     source_graph_id = str(body.get("sourceGraphId") or "").strip() or None
-    if source_graph_id:
-        existing = db.execute(
-            "SELECT * FROM education_snapshots WHERE class_id = ? AND source_graph_id = ? ORDER BY created_at ASC LIMIT 1",
-            (class_id, source_graph_id),
-        ).fetchone()
-        if existing:
-            return jsonify({
-                "snapshot": _education_public_snapshot(existing, include_graph=True),
-                "created": False,
-            })
     source_pdf = None
+    source_meta = None
     source_job_id = str(body.get("sourceJobId") or "").strip() or None
     source_history_id = source_job_id or source_graph_id
     if source_history_id:
-        history_row = db.execute(
-            "SELECT id, source_pdf_json FROM history WHERE id = ? AND user_id = ?",
-            (source_history_id, user["id"]),
-        ).fetchone()
+        history_row = _learning_repository.get_owned_history(
+            int(user["id"]), source_history_id
+        )
         source_meta = _read_source_pdf_meta(history_row) if history_row else None
         if source_meta:
-            target_dir = _EDUCATION_SNAPSHOT_ROOT / snapshot_id
-            target_dir.mkdir(parents=True, exist_ok=True)
             source_pdf = _stored_source_pdf_meta(source_meta) or {}
-            for path_key, name_key in (
-                ("pdf_path", "pdf_name"),
-                ("source_path", "source_name"),
-                ("log_path", "log_name"),
-            ):
-                source_path = Path(str(source_meta.get(path_key) or ""))
-                if source_path.is_file():
-                    safe_name = Path(str(source_pdf.get(name_key) or source_path.name)).name
-                    shutil.copy2(source_path, target_dir / safe_name)
-                    source_pdf[name_key] = safe_name
-            source_pdf["pdf_url"] = f"/api/v2/edu/snapshots/{snapshot_id}/source-pdf"
-            source_pdf["compile_log_url"] = f"/api/v2/edu/snapshots/{snapshot_id}/compile-log"
-
-    now = datetime.utcnow().isoformat()
-    db.execute(
-        """INSERT INTO education_snapshots
-             (id, class_id, source_graph_id, filename, nodes_json, edges_json,
-              source_markdown, latex_macros_json, source_pdf_json, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            snapshot_id,
-            class_id,
-            source_graph_id,
-            str(body.get("filename") or "教学图谱")[:255],
-            json.dumps(nodes, ensure_ascii=False),
-            json.dumps(edges, ensure_ascii=False),
-            str(body.get("sourceMarkdown") or ""),
-            json.dumps(body.get("latexMacros") if isinstance(body.get("latexMacros"), dict) else {}, ensure_ascii=False),
-            json.dumps(source_pdf, ensure_ascii=False) if source_pdf else None,
-            user["id"],
-            now,
-        ),
-    )
-    db.commit()
-    row = db.execute("SELECT * FROM education_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+    try:
+        row, created = _education_repository.create_snapshot(
+            public_class_id=class_id,
+            actor_id=int(user["id"]),
+            source_graph_id=source_graph_id,
+            source_history_id=source_history_id,
+            filename=str(body.get("filename") or "教学图谱"),
+            nodes=nodes,
+            edges=edges,
+            source_markdown=str(body.get("sourceMarkdown") or ""),
+            latex_macros=(
+                body.get("latexMacros")
+                if isinstance(body.get("latexMacros"), dict)
+                else {}
+            ),
+            source_pdf=source_pdf,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if created and source_history_id and source_meta:
+        target_dir = _EDUCATION_SNAPSHOT_ROOT / row["id"]
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for path_key, name_key in (
+            ("pdf_path", "pdf_name"),
+            ("source_path", "source_name"),
+            ("log_path", "log_name"),
+        ):
+            source_path = Path(str(source_meta.get(path_key) or ""))
+            if source_path.is_file():
+                safe_name = Path(str(source_pdf.get(name_key) or source_path.name)).name
+                shutil.copy2(source_path, target_dir / safe_name)
     return jsonify({
         "snapshot": _education_public_snapshot(row, include_graph=True),
-        "created": True,
-    }), 201
+        "created": created,
+    }), 201 if created else 200
 
 
 def _education_assignment_rows(class_id: str, role: str):
-    where = "class_id = ? AND status != 'archived'" if role == "teacher" else "class_id = ? AND status = 'published'"
-    return _get_db().execute(
-        f"SELECT * FROM education_assignments WHERE {where} ORDER BY updated_at DESC",
-        (class_id,),
-    ).fetchall()
+    return _education_repository.list_assignments(class_id, role)
 
 
 @app.route("/api/v2/edu/classes/<class_id>/assignments", methods=["GET", "POST"])
@@ -2965,12 +2795,8 @@ def education_class_assignments(class_id: str):
         target_node_id = int(body.get("targetNodeId"))
     except (TypeError, ValueError):
         return jsonify({"error": "targetNodeId must be an integer"}), 400
-    db = _get_db()
-    snapshot = db.execute(
-        "SELECT * FROM education_snapshots WHERE id = ? AND class_id = ?",
-        (snapshot_id, class_id),
-    ).fetchone()
-    if not snapshot:
+    snapshot = _education_repository.get_snapshot(snapshot_id)
+    if not snapshot or snapshot["class_id"] != class_id:
         return jsonify({"error": "snapshot not found"}), 404
     try:
         deterministic = build_learning_path(
@@ -2981,43 +2807,31 @@ def education_class_assignments(class_id: str):
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    assignment_id = uuid.uuid4().hex
     path = deterministic
     try:
         ai_result = _education_ai_task(
             user_id=int(user["id"]),
-            task_id=assignment_id,
+            task_id=uuid.uuid4().hex,
             task_kind="path",
             payload=_education_path_payload(snapshot, deterministic),
-            scope=f"assignments/{assignment_id}",
+            scope=f"classes/{class_id}",
         )
         path = merge_ai_path(deterministic, ai_result)
     except Exception:
         path = {**deterministic, "aiEnhanced": False, "aiFallbackReason": "deterministic_fallback"}
     title = str(body.get("title") or f"学习：{target_node_id}").strip()[:160]
-    now = datetime.utcnow().isoformat()
-    db.execute(
-        """INSERT INTO education_assignments
-             (id, class_id, snapshot_id, title, target_node_id, due_at, status,
-              base_path_json, summary, created_by, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?)""",
-        (
-            assignment_id, class_id, snapshot_id, title, target_node_id,
-            body.get("dueAt") or None,
-            json.dumps(path, ensure_ascii=False),
-            path.get("summary") or "",
-            user["id"], now, now,
-        ),
-    )
-    _education_reconcile_assessment_nodes(db, assignment_id, path, initial=True)
-    db.commit()
-    _education_generate_initial_assessments(
-        assignment_id=assignment_id,
-        user_id=int(user["id"]),
-        snapshot=snapshot,
-        path=path,
-    )
-    row = db.execute("SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()
+    try:
+        row = _education_repository.create_assignment(
+            public_class_id=class_id,
+            snapshot_id=snapshot_id,
+            actor_id=int(user["id"]),
+            title=title,
+            target_node_id=target_node_id,
+            due_at=body.get("dueAt") or None,
+            path=path,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     return jsonify({
         "assignment": _education_public_assignment(row, snapshot=snapshot, role="teacher"),
         "warnings": _education_order_warnings(path),
@@ -3025,10 +2839,7 @@ def education_class_assignments(class_id: str):
 
 
 def _education_assignment_context(assignment_id: str, user):
-    db = _get_db()
-    assignment = db.execute(
-        "SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)
-    ).fetchone()
+    assignment = _education_repository.get_assignment(assignment_id)
     if not assignment:
         return None, None, None, (jsonify({"error": "assignment not found"}), 404)
     membership, error = _education_require_membership(assignment["class_id"], user)
@@ -3038,9 +2849,7 @@ def _education_assignment_context(assignment_id: str, user):
         return None, None, None, (jsonify({"error": "assignment not found"}), 404)
     if membership["role"] == "student" and assignment["status"] != "published":
         return None, None, None, (jsonify({"error": "assignment not found"}), 404)
-    snapshot = db.execute(
-        "SELECT * FROM education_snapshots WHERE id = ?", (assignment["snapshot_id"],)
-    ).fetchone()
+    snapshot = _education_repository.get_snapshot(assignment["snapshot_id"])
     return assignment, snapshot, membership, None
 
 
@@ -3108,16 +2917,12 @@ def education_assignment(assignment_id: str):
                 except ValueError:
                     return jsonify({"error": "dueAt must be an ISO date string or null"}), 400
 
-        now = datetime.utcnow().isoformat()
-        db = _get_db()
-        db.execute(
-            """UPDATE education_assignments
-               SET title = ?, due_at = ?, updated_at = ?
-               WHERE id = ? AND status = 'published'""",
-            (title, due_at, now, assignment_id),
+        updated = _education_repository.update_assignment(
+            assignment_id,
+            title=title,
+            due_at=due_at,
+            require_status="published",
         )
-        db.commit()
-        updated = db.execute("SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()
         return jsonify({
             "assignment": _education_public_assignment(updated, snapshot=snapshot, role="teacher"),
         })
@@ -3125,15 +2930,7 @@ def education_assignment(assignment_id: str):
     if request.method == "DELETE":
         if membership["role"] != "teacher" or assignment["status"] != "published":
             return jsonify({"error": "only a teacher can delete a published assignment"}), 403
-        now = datetime.utcnow().isoformat()
-        db = _get_db()
-        db.execute(
-            """UPDATE education_assignments
-               SET status = 'archived', updated_at = ?
-               WHERE id = ? AND status = 'published'""",
-            (now, assignment_id),
-        )
-        db.commit()
+        _education_repository.archive_assignment(assignment_id)
         return jsonify({"ok": True})
 
     if membership["role"] != "teacher" or assignment["status"] != "draft":
@@ -3176,24 +2973,13 @@ def education_assignment(assignment_id: str):
     path = {**current_path, "steps": normalized_steps}
     if isinstance(body.get("summary"), str):
         path["summary"] = body["summary"].strip()
-    now = datetime.utcnow().isoformat()
-    db = _get_db()
-    db.execute(
-        """UPDATE education_assignments
-           SET title = ?, due_at = ?, base_path_json = ?, summary = ?, updated_at = ?
-           WHERE id = ?""",
-        (
-            str(body.get("title") or assignment["title"]).strip()[:160],
-            body.get("dueAt") if "dueAt" in body else assignment["due_at"],
-            json.dumps(path, ensure_ascii=False),
-            path.get("summary") or "",
-            now,
-            assignment_id,
-        ),
+    updated = _education_repository.update_assignment(
+        assignment_id,
+        title=str(body.get("title") or assignment["title"]),
+        due_at=body.get("dueAt") if "dueAt" in body else assignment["due_at"],
+        path=path,
+        require_status="draft",
     )
-    _education_reconcile_assessment_nodes(db, assignment_id, path)
-    db.commit()
-    updated = db.execute("SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()
     return jsonify({
         "assignment": _education_public_assignment(updated, snapshot=snapshot, role="teacher"),
         "warnings": _education_order_warnings(path),
@@ -4931,9 +4717,7 @@ def education_student_context_delete(class_id: str):
 
 
 def _education_snapshot_context(snapshot_id: str, user):
-    snapshot = _get_db().execute(
-        "SELECT * FROM education_snapshots WHERE id = ?", (snapshot_id,)
-    ).fetchone()
+    snapshot = _education_repository.get_snapshot(snapshot_id)
     if not snapshot:
         return None, (jsonify({"error": "snapshot not found"}), 404)
     _membership, error = _education_require_membership(snapshot["class_id"], user)
@@ -4957,57 +4741,12 @@ def education_snapshot(snapshot_id: str):
         if membership["role"] != "teacher":
             return jsonify({"error": "forbidden"}), 403
 
-        db = _get_db()
-        source_graph_id = str(snapshot["source_graph_id"] or "").strip()
-        if source_graph_id:
-            snapshot_rows = db.execute(
-                """SELECT id FROM education_snapshots
-                    WHERE class_id = ? AND source_graph_id = ?""",
-                (snapshot["class_id"], source_graph_id),
-            ).fetchall()
-        else:
-            snapshot_rows = [snapshot]
-        snapshot_ids = [str(row["id"]) for row in snapshot_rows]
-        snapshot_placeholders = ",".join("?" for _ in snapshot_ids)
-        assignment_rows = db.execute(
-            f"SELECT id FROM education_assignments WHERE snapshot_id IN ({snapshot_placeholders})",
-            snapshot_ids,
-        ).fetchall()
-        assignment_ids = [str(row["id"]) for row in assignment_rows]
-        diagnostic_ids = []
-        if assignment_ids:
-            assignment_placeholders = ",".join("?" for _ in assignment_ids)
-            diagnostic_ids = [
-                str(row["id"])
-                for row in db.execute(
-                    f"SELECT id FROM education_diagnostics WHERE assignment_id IN ({assignment_placeholders})",
-                    assignment_ids,
-                ).fetchall()
-            ]
-
-        task_keys = assignment_ids + diagnostic_ids
-        try:
-            db.execute("BEGIN")
-            if task_keys:
-                task_placeholders = ",".join("?" for _ in task_keys)
-                db.execute(
-                    f"DELETE FROM education_ai_tasks WHERE task_key IN ({task_placeholders})",
-                    task_keys,
-                )
-            if assignment_ids:
-                assignment_placeholders = ",".join("?" for _ in assignment_ids)
-                db.execute(
-                    f"DELETE FROM education_assignments WHERE id IN ({assignment_placeholders})",
-                    assignment_ids,
-                )
-            db.execute(
-                f"DELETE FROM education_snapshots WHERE id IN ({snapshot_placeholders})",
-                snapshot_ids,
-            )
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
+        deleted = _education_repository.delete_snapshot_group(snapshot_id)
+        if deleted is None:
+            return jsonify({"error": "snapshot not found"}), 404
+        snapshot_ids = deleted["snapshot_ids"]
+        assignment_ids = deleted["assignment_ids"]
+        diagnostic_ids = deleted["diagnostic_ids"]
 
         cleanup_warnings = []
         cleanup_targets = [

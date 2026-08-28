@@ -266,9 +266,8 @@ class EducationSnapshot(Base):
     teaching_class_id: Mapped[int] = mapped_column(
         ForeignKey("teaching_classes.id", ondelete="CASCADE"), nullable=False
     )
-    source_graph_id: Mapped[str | None] = mapped_column(
-        ForeignKey("history.id", ondelete="SET NULL"), nullable=True
-    )
+    # 前端用该字段标识跨版本课程图谱，不保证对应某条 history 主键。
+    source_graph_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     nodes_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     edges_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)

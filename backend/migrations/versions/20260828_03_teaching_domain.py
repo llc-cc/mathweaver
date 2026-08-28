@@ -132,7 +132,6 @@ def _create_assignment_tables() -> None:
         sa.Column("created_by", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(["teaching_class_id"], ["teaching_classes.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(["source_graph_id"], ["history.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["created_by"], ["users.id"], ondelete="RESTRICT"),
         **TABLE_OPTIONS,
     )
