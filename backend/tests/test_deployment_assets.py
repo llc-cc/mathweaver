@@ -13,6 +13,7 @@ NGINX = ROOT / "deploy/nginx/mathweaver-teaching-18080.conf"
 DEPLOY = ROOT / "scripts/deploy_teaching_release.sh"
 SMOKE = ROOT / "scripts/smoke_teaching_release.sh"
 BUILD = ROOT / "scripts/build_release.ps1"
+GIT_ATTRIBUTES = ROOT / ".gitattributes"
 
 
 def _text(path: Path) -> str:
@@ -66,6 +67,14 @@ def test_release_builder_excludes_runtime_and_secret_files() -> None:
     for excluded in (".git", ".env", "*.db", "*.log", "__pycache__", ".pytest_cache"):
         assert excluded in build
     assert "WhatIf" in build
+
+
+def test_linux_deployment_assets_are_forced_to_lf_in_release_archives() -> None:
+    attributes = _text(GIT_ATTRIBUTES)
+
+    assert "*.sh text eol=lf" in attributes
+    assert "*.service text eol=lf" in attributes
+    assert "deploy/nginx/*.conf text eol=lf" in attributes
 
 
 def test_no_secret_literal_exists_in_deploy_assets() -> None:
