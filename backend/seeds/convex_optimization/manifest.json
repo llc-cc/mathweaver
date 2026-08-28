@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "datasetKey": "convex-optimization-bv-1.1-2.3-round4-round1",
+  "title": "凸优化 1.1-2.3",
+  "files": [
+    {
+      "role": "markdown",
+      "filename": "bv_cvxbook_1.1-2.3.md",
+      "sha256": "4f0ee13b9410e5751431a10e1607880caaefcd59150d6fa7b0b89d1a27dcd908"
+    },
+    {
+      "role": "nodes",
+      "filename": "node_fixed_round4.json",
+      "sha256": "a0b6a63e86faf0b80af481d4920c4bd9832f4cfe96d669088495385351dc51b6"
+    },
+    {
+      "role": "edges",
+      "filename": "edge_fixed_round1.json",
+      "sha256": "3993d48cccf5b9b9cf97b5749e533f4178ffb6301c2abcdda3f91cfa687edf30"
+    }
+  ],
+  "expected": {
+    "nodeCount": 90,
+    "edgeCount": 226,
+    "legacyGlobalIdMismatchCount": 8,
+    "continuousSourceMappingCount": 27,
+    "definitionDependencyCount": 225
+  }
+}
