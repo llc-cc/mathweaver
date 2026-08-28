@@ -72,6 +72,7 @@ def test_sidecars_use_a_release_node_runtime_and_minimal_root_traverse_acl() -> 
 
     assert 'install -D -m 0755 "$node_binary" "$RELEASE_DIR/.runtime/node"' in deploy
     assert 'setfacl -m u:nginx:--x "$ROOT"' in deploy
+    assert 'setfacl -m u:nginx:--x "$RELEASE_DIR"' in deploy
     assert "/opt/mathweaver/current-teaching/.runtime/node" in frontend
     assert "node_modules/@react-router/serve/bin.js" in frontend
     assert "/usr/bin/npm" not in frontend

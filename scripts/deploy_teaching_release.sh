@@ -123,8 +123,9 @@ start_release() {
     ln -sfn "$old_target" "$previous_next"
     mv -Tf "$previous_next" "$PREVIOUS"
   fi
-  # ROOT 保持 750，仅给 nginx 穿越权限，不开放目录枚举或敏感文件读取。
+  # 根目录与当前发布都保持 750，仅给 nginx 穿越权限，不开放目录枚举或敏感文件读取。
   setfacl -m u:nginx:--x "$ROOT"
+  setfacl -m u:nginx:--x "$RELEASE_DIR"
   activate_link "$RELEASE_DIR"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKEND_UNIT" "/etc/systemd/system/$BACKEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$FRONTEND_UNIT" "/etc/systemd/system/$FRONTEND_UNIT"
