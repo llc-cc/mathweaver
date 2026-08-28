@@ -1,0 +1,52 @@
+name: OCR component release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: MathWeaver release version (for example 0.1.1)
+        required: true
+        default: 0.1.1
+      component_version:
+        description: OCR component version (for example 3.4.4-cpu-win-x64-r1)
+        required: true
+        default: 3.4.4-cpu-win-x64-r1
+      upload_assets:
+        description: Upload the freshly built OCR parts to a draft GitHub Release
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  build-ocr:
+    runs-on: [self-hosted, windows, x64, mathweaver-ocr]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and validate OCR component
+        shell: powershell
+        run: |
+          $required = @($env:MATHWEAVER_OCR_BUILD_ROOT, $env:MATHWEAVER_OCR_PYTHON, $env:MATHWEAVER_OCR_PYTHON_EMBED, $env:MATHWEAVER_OCR_PYTHON_EMBED_SHA256, $env:MATHWEAVER_OCR_WHEELHOUSE, $env:MATHWEAVER_OCR_LOCK, $env:MATHWEAVER_OCR_MODEL_ROOT, $env:MATHWEAVER_OCR_MODEL_REVISION, $env:MATHWEAVER_OCR_CALIBRATION, $env:MATHWEAVER_OCR_MINERU_LICENSE, $env:MATHWEAVER_OCR_NOTICE)
+          if ($required | Where-Object { [string]::IsNullOrWhiteSpace($_) }) { throw 'Configure all MATHWEAVER_OCR_* variables on the dedicated Windows runner first.' }
+          if ([string]::IsNullOrWhiteSpace($env:MATHWEAVER_OCR_MODEL_PATHS)) { throw 'Configure MATHWEAVER_OCR_MODEL_PATHS as a semicolon-separated allowlist.' }
+          $out = Join-Path $env:MATHWEAVER_OCR_BUILD_ROOT '${{ inputs.component_version }}'
+          $modelPaths = $env:MATHWEAVER_OCR_MODEL_PATHS -split ';' | Where-Object { $_ }
+          .\scripts\release_ocr.ps1 -ReleaseVersion '${{ inputs.version }}' -ComponentVersion '${{ inputs.component_version }}' -Python $env:MATHWEAVER_OCR_PYTHON -PythonEmbed $env:MATHWEAVER_OCR_PYTHON_EMBED -PythonEmbedSha256 $env:MATHWEAVER_OCR_PYTHON_EMBED_SHA256 -Wheelhouse $env:MATHWEAVER_OCR_WHEELHOUSE -Lock $env:MATHWEAVER_OCR_LOCK -ModelRoot $env:MATHWEAVER_OCR_MODEL_ROOT -ModelRevision $env:MATHWEAVER_OCR_MODEL_REVISION -CalibrationPdf $env:MATHWEAVER_OCR_CALIBRATION -MineruLicense $env:MATHWEAVER_OCR_MINERU_LICENSE -NoticeFile $env:MATHWEAVER_OCR_NOTICE -RequiredModelPath $modelPaths -OutputRoot $out
+      - name: Upload OCR parts to draft release
+        if: ${{ inputs.upload_assets }}
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v${{ inputs.version }}'
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) { gh release create $tag --draft --title "MathWeaver $tag" --notes "OCR component assets are being staged." }
+          $parts = Join-Path $env:MATHWEAVER_OCR_BUILD_ROOT '${{ inputs.component_version }}\parts\*'
+          gh release upload $tag $parts --clobber
+          $assetRoot = Join-Path $env:MATHWEAVER_OCR_BUILD_ROOT '${{ inputs.component_version }}'
+          gh release upload $tag (Join-Path $assetRoot 'mineru-sbom.json') (Join-Path $assetRoot 'models-manifest.json') $env:MATHWEAVER_OCR_LOCK $env:MATHWEAVER_OCR_MINERU_LICENSE $env:MATHWEAVER_OCR_NOTICE --clobber
+          & $env:MATHWEAVER_OCR_PYTHON .\scripts\verify_ocr_release_assets.py (Join-Path $assetRoot 'manifest.json') --allow-network --require-draft
+          if ($LASTEXITCODE -ne 0) { throw 'Remote OCR release asset gate failed.' }
+          Copy-Item (Join-Path $env:MATHWEAVER_OCR_BUILD_ROOT '${{ inputs.component_version }}\manifest.json') .\backend\assets\ocr\manifest.json -Force
+          Write-Host 'Assets verified and manifest copied. Run the normal desktop packaging gate before publishing the release.'

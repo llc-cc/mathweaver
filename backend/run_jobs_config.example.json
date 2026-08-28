@@ -1,0 +1,12 @@
+{
+  "inputs": [
+    "/Users/combined_algebra.md"
+  ],
+  "output_root": "/Users/outputs",
+  "enable_analysis": true,
+  "edge_output_mode": "both",
+  "relation_prompt_profile": "graph",
+  "api_url": null,
+  "model_name": null,
+  "api_key": null
+}

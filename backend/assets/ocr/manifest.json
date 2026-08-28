@@ -1,0 +1,263 @@
+{
+  "schema_version": 2,
+  "component": "mineru-pipeline-cpu",
+  "version": "3.4.4-cpu-win-x64-r1",
+  "release_version": "0.1.1",
+  "platform": "windows-x64",
+  "python": "3.12.9",
+  "mineru": "mineru[pipeline]==3.4.4",
+  "model_revision": "ed6b654c018d742e65a17671e379c5e6ecc87ec9",
+  "model_source": "local",
+  "inference": "cpu",
+  "runtime_subdir": "runtime",
+  "models_subdir": "models/pipeline",
+  "config_subpath": "mineru.json",
+  "entrypoint": "{runtime_dir}/python.exe",
+  "entrypoint_args": [
+    "-m",
+    "mineru.cli.fast_api"
+  ],
+  "calibration_pdf": "calibration/calibration.pdf",
+  "calibration_sha256": "a05064e4088b563b129816b1f9a7d8e644a774a7daafb6895f0d9b732f875f4d",
+  "dependency_lock_sha256": "985cb5a9a05db350c3e375b0d3bdc6254c6b82cc4bfd9c43ec452b6fa318a4aa",
+  "sbom_path": "mineru-sbom.json",
+  "sbom_sha256": "00ab401567c70447aa2502cda515a8b8a3c22fdd859540073a27170144be8400",
+  "models_manifest_path": "models-manifest.json",
+  "models_manifest_sha256": "1625a063dc939aec469673d1216afd0a34809e6e3a9cb9a4b139513211102f61",
+  "auxiliary_assets": [
+    {
+      "name": "mineru-3.4.4-win-x64.lock.txt",
+      "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-3.4.4-win-x64.lock.txt",
+      "size": 118103,
+      "sha256": "985cb5a9a05db350c3e375b0d3bdc6254c6b82cc4bfd9c43ec452b6fa318a4aa"
+    },
+    {
+      "name": "mineru-sbom.json",
+      "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-sbom.json",
+      "size": 6060,
+      "sha256": "00ab401567c70447aa2502cda515a8b8a3c22fdd859540073a27170144be8400"
+    },
+    {
+      "name": "models-manifest.json",
+      "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/models-manifest.json",
+      "size": 4008,
+      "sha256": "1625a063dc939aec469673d1216afd0a34809e6e3a9cb9a4b139513211102f61"
+    },
+    {
+      "name": "LICENSE-MinerU.txt",
+      "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/LICENSE-MinerU.txt",
+      "size": 3301,
+      "sha256": "2d9aeb5d15159329a20dd804f251c64860ba954fbd26ec02f802220e6d71cf5c"
+    },
+    {
+      "name": "NOTICE.txt",
+      "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/NOTICE.txt",
+      "size": 542,
+      "sha256": "6191acd398458f032e7364783b17b4b6dfe669c74d6788534bacf95875b1697a"
+    }
+  ],
+  "download_bytes": 1884041811,
+  "installed_bytes": 2966988636,
+  "required_disk_bytes": 5336133492,
+  "license": "MinerU Open Source License (Apache 2.0 with additional conditions)",
+  "license_files": [
+    "LICENSE-MinerU.txt",
+    "NOTICE.txt"
+  ],
+  "archives": [
+    {
+      "role": "runtime",
+      "name": "mineru-runtime-win-x64-py312.zip",
+      "sha256": "b8db9df6d9fe580b25be242df3bd99dd9bd9dd429623f6a526cc3f2f698378f1",
+      "size": 386893356,
+      "unpacked_size": 1193907345,
+      "extract_to": "runtime",
+      "parts": [
+        {
+          "name": "mineru-runtime-win-x64-py312.zip.part001",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-runtime-win-x64-py312.zip.part001",
+          "size": 67108864,
+          "sha256": "3d9f4b072cb7f3a2c2be5e4be7060c9afe038ecdd1077ceaee0a75309b0f7b12"
+        },
+        {
+          "name": "mineru-runtime-win-x64-py312.zip.part002",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-runtime-win-x64-py312.zip.part002",
+          "size": 67108864,
+          "sha256": "3bd5631f7ac2871e8c3e8daf18444ae6a7348924971ea108db799c0f7c7b544e"
+        },
+        {
+          "name": "mineru-runtime-win-x64-py312.zip.part003",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-runtime-win-x64-py312.zip.part003",
+          "size": 67108864,
+          "sha256": "15586fb02ba859b95822f287ea0f0632ddeddeb4a43c1705e9471b77f054f21a"
+        },
+        {
+          "name": "mineru-runtime-win-x64-py312.zip.part004",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-runtime-win-x64-py312.zip.part004",
+          "size": 67108864,
+          "sha256": "5a9de2c6c446b9052e02fe233aa7c71d1bc237f031df67eac0a1aba8a6c01b02"
+        },
+        {
+          "name": "mineru-runtime-win-x64-py312.zip.part005",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-runtime-win-x64-py312.zip.part005",
+          "size": 67108864,
+          "sha256": "32e8f87cd8e9f8d4ff51ba94874a4b957fe79980c3c40936bc62921eb348c9a1"
+        },
+        {
+          "name": "mineru-runtime-win-x64-py312.zip.part006",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-runtime-win-x64-py312.zip.part006",
+          "size": 51349036,
+          "sha256": "da918983dcb61158747e41f576219386b542e3355a9c207b7914c8aa55b6cd9c"
+        }
+      ]
+    },
+    {
+      "role": "models",
+      "name": "mineru-models-pipeline.zip",
+      "sha256": "e40d3f7cc39f9aa1276a78e85d453d62ed4bb89be986059330a20101d8f208b1",
+      "size": 1497148455,
+      "unpacked_size": 1773081291,
+      "extract_to": "models/pipeline",
+      "parts": [
+        {
+          "name": "mineru-models-pipeline.zip.part001",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part001",
+          "size": 67108864,
+          "sha256": "c4b4886c12b1345604093cf63157dd6982436cf19533491a9056ff65eee9738b"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part002",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part002",
+          "size": 67108864,
+          "sha256": "84cd37a2406b37d29c1d8946c508b4e2a6a4dbd2706052fcd6897ce287258535"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part003",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part003",
+          "size": 67108864,
+          "sha256": "33668328705f8b24693647f1e89d8db4953f12475ff07a9ab13901e3ffde6163"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part004",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part004",
+          "size": 67108864,
+          "sha256": "d5afca217fe6abecc4b1b73cd11755ce21314abc48893a9cfdfd205400736f38"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part005",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part005",
+          "size": 67108864,
+          "sha256": "80e837716298ba96a2d3c10e1ce947e80435ee03ae35f949fa4cce0f7fc0c760"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part006",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part006",
+          "size": 67108864,
+          "sha256": "7241ba166c1cca47b025277343064861587b66f40a068529b8c74a68d9424e28"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part007",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part007",
+          "size": 67108864,
+          "sha256": "ee76d61f45836d55b79873a3b4df85b7811cb617541d01527e30cd43a57da36d"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part008",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part008",
+          "size": 67108864,
+          "sha256": "7b4bcd1b619ad2fa865512b01ceb31ac3304ec2438d3a7a5b387aee136d07a95"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part009",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part009",
+          "size": 67108864,
+          "sha256": "033b3f4f9991e6a139339b29beb725bd71f3b7ec5c730a84477c7505149b445c"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part010",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part010",
+          "size": 67108864,
+          "sha256": "64d464dfe2ccb8b024a6bd66a8ab5fbaa10e70ad92d2f1939fe7ff5d6d5a06f9"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part011",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part011",
+          "size": 67108864,
+          "sha256": "35a68e3691e189126a877aa0a28d4252330a7c9579bc52a5e0c843e3e44e7a4a"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part012",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part012",
+          "size": 67108864,
+          "sha256": "fec9ef0e640c756c545c5727060cf2a4f077ebfb5fdfe59884a461c851a87402"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part013",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part013",
+          "size": 67108864,
+          "sha256": "380d5727909cbd5c79a0b5f793c96d0b9e61547126cd7100bde6f2d9d1f44f7c"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part014",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part014",
+          "size": 67108864,
+          "sha256": "df22d08b5a9abc718b7c81c153bd88ec376aab48e859be7270e24f9d54036229"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part015",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part015",
+          "size": 67108864,
+          "sha256": "98938a01def3fbca4fa75adc3847b55bc8724f2fcdc33fbfe80ed180a863e296"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part016",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part016",
+          "size": 67108864,
+          "sha256": "36b6f5de1002c12c8e4d992c60f8eb154aa3a81a6ac3b880bc70e8709da3daec"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part017",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part017",
+          "size": 67108864,
+          "sha256": "662ec9ec4e8fa00b877c52dd328ea13e61d2a90aa94c55e340582fb041f9741d"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part018",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part018",
+          "size": 67108864,
+          "sha256": "993ec64f75d71d5630ab4f324b487b7ab6d7411a4f62ebbc38f944c9f3b4e4a0"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part019",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part019",
+          "size": 67108864,
+          "sha256": "6217a9742bfe7128dbb752789d668999e7e32081bf5656c00c5c66d05d0bd66d"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part020",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part020",
+          "size": 67108864,
+          "sha256": "77c2fbcfa99339c46332a5b96c77db8415c1f608c120fc78f5e55757cabd8663"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part021",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part021",
+          "size": 67108864,
+          "sha256": "3d4fa7ccb4902cf216a50a954512f5b9e7196215802a719da834dab40340c700"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part022",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part022",
+          "size": 67108864,
+          "sha256": "b570e45b6776d4c0c030bbdf2119bb17c07c592a13547e723416478c5ee41a3d"
+        },
+        {
+          "name": "mineru-models-pipeline.zip.part023",
+          "url": "https://github.com/SJTU-AI4MATH/MathWeaver/releases/download/v0.1.1/mineru-models-pipeline.zip.part023",
+          "size": 20753447,
+          "sha256": "596eb500e0ecc0c4f3dfa7ff52305fc5b1642b6f7fcc17330ffcaf9c99dd7034"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+.DS_Store
+.env
+.vscode
+/node_modules/
+
+# React Router
+/.react-router/
+/build/
+
+# 二进制工具（不应入库）
+ngrok.exe
+
+# 顶层运行时产物
+/checkpoint/
+
+# ===== backend =====
+# 环境 & 虚拟环境
+backend/.env
+backend/.venv/
+
+# 运行时中间产物
+backend/checkpoint/
+backend/**/_stage_cache/
+
+# Python 缓存
+backend/**/__pycache__/
+backend/**/*.pyc
+/scripts/__pycache__/
+
+# 数据目录（源语料 + 上传 + 测试输出 + 样本）
+backend/books/
+backend/uploads/
+backend/test_output/
+backend/samples/
+/backend/benchmarks/ocr_matrix/
+
+# 废弃文件
+backend/JoinAgent/LLM_API/llm_old.py
+backend/JoinAgent/checkpoint/
+
+# 本地运行配置（含绝对路径）
+backend/run_jobs_config.json
+backend/.env.example
+
+# 数据库（含用户凭据）
+backend/auth.db
+
+# 服务器日志
+*.stderr.log
+*.stdout.log
+
+# Playwright CLI 本地缓存
+backend/.playwright-cli/
+
+# Claude Code 本地配置（机器相关，只排除根目录）
+/.claude/
+
+# Local Studio test fixtures (may contain copyrighted source text)
+public/fixtures/
+.playwright-cli/
+output/playwright/
+/.venv/
+backend/scripts/_tmp_pipeline_context/
+
+# Desktop packaging outputs
+/dist/
+/release/
+/release-public-v0.1.1/
+/release-public-v0.1.1.zip
+/output/pdf/mineru-3.4.4-matrix-determinant-ocr-evaluation-*.pdf
+*.log
+/backend-exe*.log
+/ai4math-*.log
+/electron-dev.log
+
+# 教学空间运行期快照、作业缓存与本地数据库不得进入正式源码基线
+/tmp/
+/backend/education/snapshots/
+/backend/education/assignments/
+
+# Local process PID markers
+/_tmp_*_pid.txt
+/backend-server.pid

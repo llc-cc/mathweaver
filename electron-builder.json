@@ -1,0 +1,47 @@
+{
+  "appId": "cn.mathgraph.desktop",
+  "productName": "MathWeaver",
+  "directories": {
+    "output": "release"
+  },
+  "electronDist": "node_modules/electron/dist",
+  "files": [
+    "electron/**/*",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "dist/backend",
+      "to": "backend"
+    },
+    {
+      "from": "public/mathweaver-icon.png",
+      "to": "mathweaver-icon.png"
+    },
+    {
+      "from": "backend/assets/ocr/manifest.json",
+      "to": "ocr/manifest.json"
+    },
+    {
+      "from": "backend/assets/ocr/NOTICE.txt",
+      "to": "ocr/NOTICE.txt"
+    },
+    {
+      "from": "backend/assets/ocr/LICENSE-MinerU.txt",
+      "to": "ocr/LICENSE-MinerU.txt"
+    }
+  ],
+  "win": {
+    "icon": "public/mathweaver-icon.ico",
+    "target": [
+      "dir"
+    ],
+    "artifactName": "MathWeaver-${version}-${arch}.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true
+  }
+}

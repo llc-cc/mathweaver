@@ -1,0 +1,108 @@
+.entry {
+    width: 100%; 
+    padding-top: 5px; 
+    margin-top: 8px; 
+    margin-bottom: 8px; 
+}
+
+/* Definition */
+.entry.dfn {
+    background: #D6FEDF; 
+    border-left: 5px solid #009C27; 
+}
+
+.entry.dfn:hover {
+    background: #FFFFFF; 
+    box-shadow: inset 0 0 0 2px #009C27;
+    transition: 0.2s;
+}
+
+/* Property */
+.entry.ppt {
+    background: #FFEDFF; 
+    border-left: 5px solid #AC00AF; 
+}
+
+.entry.ppt:hover {
+    background: #FFFFFF; 
+    box-shadow: inset 0 0 0 2px #AC00AF;
+    transition: 0.2s;
+}
+
+/* Theorem */
+.entry.thm {
+    background: #DAF0FF; 
+    border-left: 5px solid #005B9C; 
+}
+.entry.thm:hover {
+    background: #FFFFFF; 
+    box-shadow: inset 0 0 0 2px #005B9C;
+    transition: 0.2s;
+}
+
+/* Example */
+.entry.xmp {
+    background: #EFDFFF; 
+    border-left: 5px solid #7700E5;
+}
+.entry.xmp:hover {
+    background: #FFFFFF; 
+    box-shadow: inset 0 0 0 2px #7700E5;
+    transition: 0.2s;
+}
+
+/* Counterexample */
+.entry.cxmp {
+    background: #FFD6DC; 
+    border-left: 5px solid #D30023;
+}
+.entry.cxmp:hover {
+    background: #FFFFFF; 
+    box-shadow: inset 0 0 0 2px #D30023;
+    transition: 0.2s;
+}
+
+/* Operator */
+.entry.op {
+    background: #d0fff1; 
+    border-left: 5px solid #00b8a0;
+}
+
+.entry.op:hover {
+    background: #FFFFFF; 
+    box-shadow: inset 0 0 0 2px #00b8a0;
+    transition: 0.2s;
+}
+
+/* Inner elements */
+.entry-title {
+    color: #000000;
+    font-family: "Computer Modern";
+    padding: 10px; 
+    caret-color: transparent; 
+}
+
+.entry-title.navigate {
+    cursor: pointer; 
+}
+
+.entry-separator {
+    border-top: 1px solid #C0C0C0; 
+    margin-left: 10px; 
+    margin-right: 10px; 
+    margin-top: 5px; 
+}
+
+.entry-content {
+    display: flex; 
+    height: auto;
+    flex-direction: row;
+    padding-bottom: 6px;
+    margin-left: 10px;
+    margin-right: 10px;
+    overflow-x: scroll; 
+}
+
+.entry-content::-webkit-scrollbar {
+    display: none;  
+}
