@@ -60,6 +60,12 @@ def test_deploy_uses_python_311_instead_of_the_legacy_python3_alias() -> None:
     assert "python3 -m venv" not in deploy
 
 
+def test_web_server_install_skips_the_desktop_electron_binary() -> None:
+    deploy = _text(DEPLOY)
+
+    assert 'ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix "$RELEASE_DIR" ci' in deploy
+
+
 def test_release_uses_version_directory_and_atomic_symlink() -> None:
     deploy = _text(DEPLOY)
 

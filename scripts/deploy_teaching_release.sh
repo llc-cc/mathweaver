@@ -77,7 +77,8 @@ migrate() {
   resolve_release "$1"
   "$PYTHON_BIN" -m venv "$RELEASE_DIR/.venv"
   "$RELEASE_DIR/.venv/bin/pip" install --disable-pip-version-check -r "$RELEASE_DIR/backend/requirements.txt"
-  npm --prefix "$RELEASE_DIR" ci
+  # 服务器只运行 Web 旁路服务，跳过不会被使用且依赖外网下载的 Electron 桌面二进制。
+  ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix "$RELEASE_DIR" ci
   npm --prefix "$RELEASE_DIR" run build
   set -a
   # shellcheck disable=SC1090
