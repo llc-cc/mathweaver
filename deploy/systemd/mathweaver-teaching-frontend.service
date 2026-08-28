@@ -9,7 +9,7 @@ Group=nginx
 WorkingDirectory=/opt/mathweaver/current-teaching
 Environment=HOST=127.0.0.1
 Environment=PORT=5174
-ExecStart=/usr/bin/npm run start
+ExecStart=/opt/mathweaver/current-teaching/.runtime/node /opt/mathweaver/current-teaching/node_modules/@react-router/serve/bin.js ./build/server/index.js
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

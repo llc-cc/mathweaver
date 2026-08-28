@@ -48,6 +48,20 @@ check_sidecar_ports_free() {
   done
 }
 
+wait_for_url() {
+  local url=$1 attempt=0
+  # systemd 已拉起进程不代表应用完成导入和监听，使用有上限的等待避免误判启动失败。
+  while [ "$attempt" -lt 30 ]; do
+    if curl --fail --silent "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  echo "service did not become ready: $url" >&2
+  return 1
+}
+
 activate_link() {
   local target=$1
   local next_link="$ROOT/.current-teaching.next"
@@ -63,10 +77,12 @@ preflight() {
     *) echo "teaching environment file permissions must be 600 or 640" >&2; exit 68 ;;
   esac
   command -v "$PYTHON_BIN" >/dev/null
+  command -v node >/dev/null
   command -v npm >/dev/null
   command -v nginx >/dev/null
   command -v curl >/dev/null
   command -v ss >/dev/null
+  command -v setfacl >/dev/null
   getent passwd nginx >/dev/null || { echo "required nginx service account is missing" >&2; exit 73; }
   check_sidecar_ports_free
   df -Pk "$ROOT" | awk 'NR==2 { if ($4 < 2097152) exit 1 }'
@@ -75,8 +91,12 @@ preflight() {
 
 migrate() {
   resolve_release "$1"
+  local node_binary
+  node_binary=$(command -v node)
   "$PYTHON_BIN" -m venv "$RELEASE_DIR/.venv"
   "$RELEASE_DIR/.venv/bin/pip" install --disable-pip-version-check -r "$RELEASE_DIR/backend/requirements.txt"
+  # Node 来自 root 的 NVM；复制单个运行时到版本目录，避免服务进程穿越 /root。
+  install -D -m 0755 "$node_binary" "$RELEASE_DIR/.runtime/node"
   # 服务器只运行 Web 旁路服务，跳过不会被使用且依赖外网下载的 Electron 桌面二进制。
   ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix "$RELEASE_DIR" ci
   npm --prefix "$RELEASE_DIR" run build
@@ -92,7 +112,7 @@ migrate() {
 
 start_release() {
   resolve_release "$1"
-  [ -x "$RELEASE_DIR/.venv/bin/gunicorn" ] && [ -f "$RELEASE_DIR/build/server/index.js" ] || {
+  [ -x "$RELEASE_DIR/.venv/bin/gunicorn" ] && [ -x "$RELEASE_DIR/.runtime/node" ] && [ -f "$RELEASE_DIR/node_modules/@react-router/serve/bin.js" ] && [ -f "$RELEASE_DIR/build/server/index.js" ] || {
     echo "release has not completed migrate/build" >&2
     exit 70
   }
@@ -103,6 +123,8 @@ start_release() {
     ln -sfn "$old_target" "$previous_next"
     mv -Tf "$previous_next" "$PREVIOUS"
   fi
+  # ROOT 保持 750，仅给 nginx 穿越权限，不开放目录枚举或敏感文件读取。
+  setfacl -m u:nginx:--x "$ROOT"
   activate_link "$RELEASE_DIR"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKEND_UNIT" "/etc/systemd/system/$BACKEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$FRONTEND_UNIT" "/etc/systemd/system/$FRONTEND_UNIT"
@@ -111,8 +133,8 @@ start_release() {
   systemctl enable --now "$BACKEND_UNIT" "$FRONTEND_UNIT"
   nginx -t
   systemctl reload nginx
-  curl --fail --silent --show-error http://127.0.0.1:5002/api/v2/ready >/dev/null
-  curl --fail --silent --show-error http://127.0.0.1:5174/ >/dev/null
+  wait_for_url "http://127.0.0.1:5002/api/v2/ready"
+  wait_for_url "http://127.0.0.1:5174/"
   echo "sidecar release started: $RELEASE_DIR"
 }
 
@@ -126,7 +148,8 @@ rollback() {
   esac
   activate_link "$target"
   systemctl restart "$BACKEND_UNIT" "$FRONTEND_UNIT"
-  curl --fail --silent --show-error http://127.0.0.1:5002/api/v2/ready >/dev/null
+  wait_for_url "http://127.0.0.1:5002/api/v2/ready"
+  wait_for_url "http://127.0.0.1:5174/"
   echo "rolled back teaching sidecar to: $target"
 }
 

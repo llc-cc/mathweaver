@@ -66,6 +66,27 @@ def test_web_server_install_skips_the_desktop_electron_binary() -> None:
     assert 'ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix "$RELEASE_DIR" ci' in deploy
 
 
+def test_sidecars_use_a_release_node_runtime_and_minimal_root_traverse_acl() -> None:
+    deploy = _text(DEPLOY)
+    frontend = _text(FRONTEND_UNIT)
+
+    assert 'install -D -m 0755 "$node_binary" "$RELEASE_DIR/.runtime/node"' in deploy
+    assert 'setfacl -m u:nginx:--x "$ROOT"' in deploy
+    assert "/opt/mathweaver/current-teaching/.runtime/node" in frontend
+    assert "node_modules/@react-router/serve/bin.js" in frontend
+    assert "/usr/bin/npm" not in frontend
+
+
+def test_service_start_uses_a_bounded_readiness_wait() -> None:
+    deploy = _text(DEPLOY)
+
+    assert "wait_for_url()" in deploy
+    assert 'while [ "$attempt" -lt 30 ]' in deploy
+    assert "sleep 1" in deploy
+    assert 'wait_for_url "http://127.0.0.1:5002/api/v2/ready"' in deploy
+    assert 'wait_for_url "http://127.0.0.1:5174/"' in deploy
+
+
 def test_release_uses_version_directory_and_atomic_symlink() -> None:
     deploy = _text(DEPLOY)
 
