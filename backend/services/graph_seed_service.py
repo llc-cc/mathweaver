@@ -4,18 +4,39 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
+
+from sqlalchemy import select
 
 from pipeline.common.node import (
     compute_global_id_from_source,
     get_node_source_original_text,
     normalize_source_text_for_id,
 )
+from storage.database import session_scope
+from storage.models import (
+    AuditLog,
+    ClassMembership,
+    Course,
+    EducationNodeIdentity,
+    EducationNodeOccurrence,
+    EducationSnapshot,
+    History,
+    TeachingClass,
+    User,
+)
 
 
 MANIFEST_NAME = "manifest.json"
+_IMPORT_NAMESPACE = uuid.UUID("9970df66-1f1d-4867-a677-360b60219962")
+
+
+class GraphSeedValidationError(RuntimeError):
+    """数据包未通过预检，导入事务尚未开始。"""
 
 
 def _sha256(path: Path) -> str:
@@ -249,4 +270,230 @@ def validate_graph_dataset(
         "hashes": hashes,
         "errors": errors,
         "warnings": warnings,
+    }
+
+
+def _stable_id(*parts: object) -> str:
+    return uuid.uuid5(_IMPORT_NAMESPACE, ":".join(str(part) for part in parts)).hex
+
+
+def _identity_id(public_class_id: str, global_id: str) -> str:
+    return _stable_id("identity", public_class_id, global_id)
+
+
+def _project_dataset(nodes: list[dict], edges: list[dict]) -> tuple[list[dict], list[dict]]:
+    """生成 Web 可用的数字节点键，同时保留负责人交付字段。"""
+    projected_nodes: list[dict] = []
+    id_by_global: dict[str, int] = {}
+    for node_id, raw in enumerate(nodes):
+        node = deepcopy(raw)
+        title = node.get("title") if isinstance(node.get("title"), dict) else {}
+        node["id"] = node_id
+        node["title_zh"] = str(title.get("chinese") or title.get("english") or "")
+        node["title_en"] = str(title.get("english") or title.get("chinese") or "")
+        node["source_statement"] = get_node_source_original_text(node)
+        projected_nodes.append(node)
+        id_by_global[str(node["global_id"])] = node_id
+
+    projected_edges: list[dict] = []
+    for raw in edges:
+        edge = deepcopy(raw)
+        edge["from"] = id_by_global[str(edge["出发节点"])]
+        edge["to"] = id_by_global[str(edge["到达节点"])]
+        edge["label"] = str(edge.get("关系") or "")
+        edge["description"] = str(edge.get("理由") or "")
+        projected_edges.append(edge)
+    return projected_nodes, projected_edges
+
+
+def import_graph_dataset(
+    dataset_path: str | Path,
+    teacher_email: str,
+    class_title: str,
+) -> dict[str, Any]:
+    """在一个短事务内幂等创建课程、图谱历史、快照与节点映射。"""
+    normalized_email = teacher_email.strip().lower()
+    normalized_title = class_title.strip()
+    if not normalized_email or not normalized_title:
+        raise ValueError("teacher email and class title are required")
+
+    report = validate_graph_dataset(dataset_path)
+    if not report["valid"]:
+        raise GraphSeedValidationError("graph dataset validation failed")
+    loaded = load_graph_dataset(dataset_path)
+    manifest = loaded["manifest"]
+    dataset_key = str(manifest["datasetKey"])
+    nodes, edges = _project_dataset(loaded["nodes"], loaded["edges"])
+
+    with session_scope() as session:
+        teacher = session.scalar(select(User).where(User.email == normalized_email))
+        if teacher is None or teacher.role not in {"teacher", "admin"} or not teacher.is_active:
+            raise LookupError("active teacher account not found")
+
+        course_code = f"SEED-{_stable_id('course', dataset_key)[:16].upper()}"
+        course = session.scalar(select(Course).where(Course.code == course_code))
+        if course is None:
+            course = Course(
+                code=course_code,
+                name=str(manifest.get("title") or normalized_title)[:255],
+                description=f"Official dataset: {dataset_key}",
+            )
+            session.add(course)
+            session.flush()
+
+        public_class_id = _stable_id(
+            "class", dataset_key, teacher.id, normalized_title
+        )
+        teaching_class = session.scalar(
+            select(TeachingClass).where(TeachingClass.public_id == public_class_id)
+        )
+        if teaching_class is None:
+            teaching_class = TeachingClass(
+                public_id=public_class_id,
+                course_id=course.id,
+                teacher_id=teacher.id,
+                name=normalized_title[:255],
+                invite_code=_stable_id("invite", public_class_id)[:8].upper(),
+            )
+            session.add(teaching_class)
+            session.flush()
+        elif teaching_class.teacher_id != teacher.id:
+            raise RuntimeError("deterministic class ownership conflict")
+
+        membership = session.scalar(
+            select(ClassMembership).where(
+                ClassMembership.teaching_class_id == teaching_class.id,
+                ClassMembership.student_id == teacher.id,
+            )
+        )
+        if membership is None:
+            session.add(
+                ClassMembership(
+                    teaching_class_id=teaching_class.id,
+                    student_id=teacher.id,
+                    role="teacher",
+                )
+            )
+        elif membership.role != "teacher":
+            raise RuntimeError("teacher membership role conflict")
+
+        history_id = _stable_id("history", dataset_key, teacher.id)
+        history = session.get(History, history_id)
+        if history is None:
+            history = History(
+                id=history_id,
+                user_id=teacher.id,
+                filename=next(
+                    item["filename"]
+                    for item in manifest["files"]
+                    if item["role"] == "markdown"
+                ),
+                node_count=len(nodes),
+                edge_count=len(edges),
+                nodes_json=deepcopy(nodes),
+                edges_json=deepcopy(edges),
+                source_markdown=loaded["markdown"],
+                latex_macros="{}",
+                source_pdf_json=None,
+                status="done",
+                stage="complete",
+                stage_label="正式图谱已导入",
+                stage_index=1,
+                total_stages=1,
+                stages_done_json=["complete"],
+                source_format="markdown",
+                source_origin="official_seed",
+                experimental_logic_ir=False,
+            )
+            session.add(history)
+
+        snapshot_id = _stable_id(
+            "snapshot", dataset_key, teacher.id, public_class_id
+        )
+        snapshot = session.get(EducationSnapshot, snapshot_id)
+        if snapshot is None:
+            snapshot = EducationSnapshot(
+                id=snapshot_id,
+                teaching_class_id=teaching_class.id,
+                source_graph_id=history_id,
+                filename=history.filename,
+                nodes_json=deepcopy(nodes),
+                edges_json=deepcopy(edges),
+                source_markdown=loaded["markdown"],
+                latex_macros_json={},
+                source_pdf_json=None,
+                created_by=teacher.id,
+            )
+            session.add(snapshot)
+            session.flush()
+
+        for node in nodes:
+            global_id = str(node["global_id"])
+            canonical_id = _identity_id(public_class_id, global_id)
+            identity = session.get(EducationNodeIdentity, canonical_id)
+            if identity is None:
+                identity = EducationNodeIdentity(
+                    id=canonical_id,
+                    teaching_class_id=teaching_class.id,
+                    global_id=global_id,
+                    title=str(node.get("title_zh") or node.get("title_en") or "")[:512],
+                )
+                session.add(identity)
+            elif (
+                identity.teaching_class_id != teaching_class.id
+                or identity.global_id != global_id
+            ):
+                raise ValueError("deterministic node identity conflict")
+
+            occurrence = session.get(
+                EducationNodeOccurrence, (snapshot_id, int(node["id"]))
+            )
+            if occurrence is None:
+                session.add(
+                    EducationNodeOccurrence(
+                        snapshot_id=snapshot_id,
+                        node_id=int(node["id"]),
+                        canonical_node_id=canonical_id,
+                        global_id=global_id,
+                    )
+                )
+            elif occurrence.canonical_node_id != canonical_id:
+                raise ValueError("snapshot occurrence identity conflict")
+
+        audit = session.scalar(
+            select(AuditLog).where(
+                AuditLog.actor_id == teacher.id,
+                AuditLog.action == "graph_seed.imported",
+                AuditLog.subject_type == "education_snapshot",
+                AuditLog.subject_id == snapshot_id,
+            )
+        )
+        if audit is None:
+            session.add(
+                AuditLog(
+                    actor_id=teacher.id,
+                    action="graph_seed.imported",
+                    subject_type="education_snapshot",
+                    subject_id=snapshot_id,
+                    details={
+                        "datasetKey": dataset_key,
+                        "historyId": history_id,
+                        "classId": public_class_id,
+                        "nodeCount": len(nodes),
+                        "edgeCount": len(edges),
+                        "hashes": report["hashes"],
+                    },
+                )
+            )
+
+    return {
+        "ok": True,
+        "datasetKey": dataset_key,
+        "historyId": history_id,
+        "sourceGraphId": history_id,
+        "snapshotId": snapshot_id,
+        "classId": public_class_id,
+        "nodeCount": len(nodes),
+        "edgeCount": len(edges),
+        "warningCount": len(report["warnings"]),
     }
