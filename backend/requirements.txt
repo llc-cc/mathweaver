@@ -20,3 +20,11 @@ dashscope>=1.0.0       # Qwen / DashScope embedding models
 # ── Utilities ────────────────────────────────────────────────────────
 aiohttp>=3.9.0         # async HTTP used by some integrations
 pylatexenc>=2.10       # TeX source parsing for structured statement extraction
+
+# ── Production database / deployment ───────────────────────────────
+SQLAlchemy>=2.0.36,<3.0
+alembic>=1.14.0,<2.0
+PyMySQL>=1.1.1,<2.0
+cryptography>=44.0.0,<51.0
+gunicorn>=23.0.0,<24.0
+pytest>=8.3.0,<9.0
