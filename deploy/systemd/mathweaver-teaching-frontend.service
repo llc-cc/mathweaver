@@ -1,0 +1,20 @@
+[Unit]
+Description=MathWeaver teaching frontend sidecar
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/mathweaver/current-teaching
+Environment=HOST=127.0.0.1
+Environment=PORT=5174
+ExecStart=/usr/bin/npm run start
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

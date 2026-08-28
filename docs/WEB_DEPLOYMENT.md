@@ -35,3 +35,32 @@ python -m scripts.import_graph_seed \
 首次成功结果应包含 90 个节点、226 条边以及确定的 history、class、snapshot ID。立即重复执行一次，第二次必须返回相同 ID，且数据库对象计数不增加。
 
 数据包预检会报告 8 个旧版 `global_id` 差异、27/90 的连续原文映射覆盖率以及 225/226 条“定义依赖”。这些是负责人交付数据的已知只读警告，不是自动修复项。
+
+## 旁路发布与回滚
+
+教学正式版使用独立旁路，不修改已有服务：后端仅监听 `127.0.0.1:5002`，前端仅监听 `127.0.0.1:5174`，Nginx 对外候选端口为 `18080`。
+
+发布包必须解压到 `/opt/mathweaver/releases/<git-sha>`。按顺序执行：
+
+```bash
+sudo bash scripts/deploy_teaching_release.sh preflight /opt/mathweaver/releases/<git-sha>
+sudo bash scripts/deploy_teaching_release.sh migrate /opt/mathweaver/releases/<git-sha>
+sudo bash scripts/deploy_teaching_release.sh start /opt/mathweaver/releases/<git-sha>
+```
+
+`start` 会把原 `current-teaching` 保存为 `previous-teaching`，再使用临时软链接和原子重命名切换版本。应用或验收失败时执行：
+
+```bash
+sudo bash /opt/mathweaver/current-teaching/scripts/deploy_teaching_release.sh rollback
+```
+
+回滚只切换教学旁路软链接并重启两个 `mathweaver-teaching-*` 服务，不逆向执行数据库 downgrade。涉及不兼容数据变更时应先停旁路，再从已验证的 MySQL 备份恢复。
+
+冒烟检查从环境读取专用教师账号，不在日志中输出口令或 token：
+
+```bash
+sudo --preserve-env=MATHWEAVER_SMOKE_EMAIL,MATHWEAVER_SMOKE_PASSWORD \
+  bash scripts/smoke_teaching_release.sh
+```
+
+外部 `18080` 不通但服务器本机检查通过时，记录为云安全组或防火墙阻塞；部署脚本不会自行修改 SSH、系统防火墙或云安全组。
