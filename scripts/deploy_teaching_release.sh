@@ -130,7 +130,9 @@ start_release() {
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$FRONTEND_UNIT" "/etc/systemd/system/$FRONTEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/nginx/mathweaver-teaching-18080.conf" "$NGINX_CONFIG"
   systemctl daemon-reload
-  systemctl enable --now "$BACKEND_UNIT" "$FRONTEND_UNIT"
+  systemctl enable "$BACKEND_UNIT" "$FRONTEND_UNIT"
+  # enable --now 不会重启已运行进程；切换软链后必须显式重启，确保执行的是新发布目录。
+  systemctl restart "$BACKEND_UNIT" "$FRONTEND_UNIT"
   nginx -t
   systemctl reload nginx
   wait_for_url "http://127.0.0.1:5002/api/v2/ready"

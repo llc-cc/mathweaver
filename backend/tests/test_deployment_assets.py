@@ -87,6 +87,21 @@ def test_service_start_uses_a_bounded_readiness_wait() -> None:
     assert 'wait_for_url "http://127.0.0.1:5174/"' in deploy
 
 
+def test_start_restarts_active_sidecars_after_switching_the_release_link() -> None:
+    """服务已运行时也必须加载新版本，不能只做 enable --now。"""
+    deploy = _text(DEPLOY)
+    start_body = re.search(
+        r"^start_release\(\) \{(?P<body>.*?)^\}$",
+        deploy,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+    assert start_body is not None
+    assert 'systemctl enable "$BACKEND_UNIT" "$FRONTEND_UNIT"' in start_body["body"]
+    assert 'systemctl restart "$BACKEND_UNIT" "$FRONTEND_UNIT"' in start_body["body"]
+    assert not re.search(r"systemctl\s+enable\s+--now", start_body["body"])
+
+
 def test_release_uses_version_directory_and_atomic_symlink() -> None:
     deploy = _text(DEPLOY)
 
