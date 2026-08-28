@@ -35,7 +35,6 @@ from urllib.parse import urlparse
 
 from flask import Flask, g, jsonify, request, send_file
 from flask_cors import CORS
-from werkzeug.security import check_password_hash, generate_password_hash
 
 _BACKEND = Path(__file__).parent
 sys.path.insert(0, str(_BACKEND))
@@ -88,9 +87,24 @@ from ocr_runtime import (
     OcrError,
     get_ocr_manager,
 )
+from services.auth_service import (
+    AuthService,
+    DuplicateEmailError,
+    InvalidCredentialsError,
+    PasswordPolicyError,
+)
+from storage.auth_repository import AuthRepository
+from storage.database import get_engine
+from storage.learning_repository import JobSnapshot, LearningRepository
 
 app = Flask(__name__)
 CORS(app)
+
+_auth_repository = AuthRepository()
+_auth_service = AuthService(_auth_repository)
+_learning_repository = LearningRepository()
+_teacher_sync_lock = threading.Lock()
+_teacher_sync_engine_id: int | None = None
 
 # ── SQLite auth / history ────────────────────────────────────────────────────
 
@@ -760,18 +774,27 @@ def _sync_teacher_accounts(conn) -> None:
 _init_db()
 
 
+def _ensure_teacher_accounts() -> None:
+    """每个已配置引擎只同步一次白名单，测试重建引擎后也会重新执行。"""
+    global _teacher_sync_engine_id
+
+    engine_id = id(get_engine())
+    if _teacher_sync_engine_id == engine_id:
+        return
+    with _teacher_sync_lock:
+        if _teacher_sync_engine_id == engine_id:
+            return
+        _auth_repository.sync_teacher_accounts(_configured_teacher_accounts())
+        _teacher_sync_engine_id = engine_id
+
+
 def _current_user():
-    """Return user row if request carries a valid Bearer token, else None."""
+    """返回 Bearer 会话对应的不可变用户快照。"""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
-    token = auth[7:]
-    db = _get_db()
-    row = db.execute(
-        "SELECT u.*, s.education_role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?",
-        (token,),
-    ).fetchone()
-    return row
+    _ensure_teacher_accounts()
+    return _auth_service.authenticate(auth[7:])
 
 
 def _public_source_pdf_meta(meta: dict | None) -> dict | None:
@@ -796,16 +819,11 @@ def _pending_source_pdf_meta(job_id: str) -> dict:
 
 def _update_history_source_pdf(job_id: str, meta: dict) -> None:
     try:
-        with sqlite3.connect(str(_DB_PATH)) as conn:
-            conn.execute(
-                "UPDATE history SET source_pdf_json = ? WHERE id = ?",
-                (
-                    json.dumps(_stored_source_pdf_meta(meta), ensure_ascii=False),
-                    job_id,
-                ),
-            )
-            conn.commit()
+        job = _jobs.get(job_id)
+        owner_id = int(job["_user_id"]) if job and job.get("_user_id") is not None else None
+        _learning_repository.update_source_pdf(job_id, meta, owner_id)
     except Exception:
+        # PDF 编译在后台线程结束，失败不应覆盖任务本身的最终状态。
         pass
 
 
@@ -815,17 +833,20 @@ def _source_pdf_dir(job_id: str) -> Path:
 
 def _read_source_pdf_meta(row_or_job) -> dict | None:
     if isinstance(row_or_job, dict):
-        return row_or_job.get("source_pdf")
-    raw = row_or_job["source_pdf_json"] if row_or_job and "source_pdf_json" in row_or_job.keys() else None
-    if not raw:
-        return None
-    try:
-        meta = json.loads(raw)
-    except Exception:
-        return None
+        raw = row_or_job.get("source_pdf")
+        meta = copy.deepcopy(raw) if isinstance(raw, dict) else None
+        row_id = row_or_job.get("id") or row_or_job.get("job_id")
+    else:
+        raw = row_or_job["source_pdf_json"] if row_or_job and "source_pdf_json" in row_or_job.keys() else None
+        if not raw:
+            return None
+        try:
+            meta = json.loads(raw)
+        except Exception:
+            return None
+        row_id = row_or_job["id"] if "id" in row_or_job.keys() else None
     if not isinstance(meta, dict):
         return None
-    row_id = row_or_job["id"] if "id" in row_or_job.keys() else None
     if row_id:
         source_dir = _source_pdf_dir(str(row_id))
         for name_key, path_key in (
@@ -842,6 +863,8 @@ def _read_source_pdf_meta(row_or_job) -> dict | None:
 def _json_list(value):
     if not value:
         return []
+    if isinstance(value, list):
+        return value
     try:
         parsed = json.loads(value)
         return parsed if isinstance(parsed, list) else []
@@ -863,38 +886,7 @@ def _complete_llm_config(config):
 def _active_user_llm_config(user):
     if not user:
         return None
-    db = _get_db()
-    row = db.execute(
-        "SELECT llm_api_url, llm_model, llm_api_key, llm_configs_json FROM user_settings WHERE user_id = ?",
-        (user["id"],),
-    ).fetchone()
-    if not row:
-        return None
-    if row["llm_configs_json"]:
-        try:
-            data = json.loads(row["llm_configs_json"])
-            configs = data.get("configs") or []
-            active_index = int(data.get("active_index") or 0)
-            if configs and 0 <= active_index < len(configs):
-                active = configs[active_index]
-            elif configs:
-                active = configs[0]
-            else:
-                active = {}
-            config = _complete_llm_config({
-                "api_url": active.get("api_url"),
-                "model_name": active.get("model_name"),
-                "api_key": active.get("api_key"),
-            })
-            if config:
-                return config
-        except Exception:
-            pass
-    return _complete_llm_config({
-        "api_url": row["llm_api_url"],
-        "model_name": row["llm_model"],
-        "api_key": row["llm_api_key"],
-    })
+    return _learning_repository.get_active_llm_config(int(user["id"]))
 
 
 # ── Auth endpoints ────────────────────────────────────────────────────────────
@@ -913,29 +905,18 @@ def auth_register():
         return jsonify({"error": "invalid education role"}), 400
     if not email or not password:
         return jsonify({"error": "email and password required"}), 400
-    if len(password) < 6:
-        return jsonify({"error": "password must be at least 6 characters"}), 400
-    db = _get_db()
+    _ensure_teacher_accounts()
     try:
-        db.execute(
-            "INSERT INTO users (email, password_hash, can_teach, created_at) VALUES (?, ?, 0, ?)",
-            (email, generate_password_hash(password), datetime.utcnow().isoformat()),
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
+        result = _auth_service.register_student(email, password)
+    except PasswordPolicyError:
+        return jsonify({"error": "password must be at least 6 characters"}), 400
+    except DuplicateEmailError:
         return jsonify({"error": "email already registered"}), 409
-    user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-    token = secrets.token_hex(32)
-    db.execute(
-        "INSERT INTO sessions (token, user_id, education_role, created_at) VALUES (?, ?, ?, ?)",
-        (token, user["id"], education_role, datetime.utcnow().isoformat()),
-    )
-    db.commit()
     return jsonify({
-        "token": token,
-        "email": user["email"],
-        "educationRole": education_role,
-        "canTeach": bool(user["can_teach"]),
+        "token": result.token,
+        "email": result.user.email,
+        "educationRole": result.education_role,
+        "canTeach": result.user.can_teach,
     }), 201
 
 
@@ -947,27 +928,20 @@ def auth_login():
     education_role = body.get("educationRole")
     if education_role is None:
         education_role = "student"
-    if education_role not in (None, "teacher", "student"):
+    if education_role not in ("teacher", "student"):
         return jsonify({"error": "invalid education role"}), 400
-    db = _get_db()
-    user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-    if not user or not check_password_hash(user["password_hash"], password):
+    _ensure_teacher_accounts()
+    try:
+        result = _auth_service.login(email, password, education_role)
+    except InvalidCredentialsError:
         if education_role == "teacher":
             return jsonify({"error": "教师账号或密码错误", "code": "teacher_login_failed"}), 401
         return jsonify({"error": "invalid email or password"}), 401
-    if education_role == "teacher" and not bool(user["can_teach"]):
-        return jsonify({"error": "教师账号或密码错误", "code": "teacher_login_failed"}), 401
-    token = secrets.token_hex(32)
-    db.execute(
-        "INSERT INTO sessions (token, user_id, education_role, created_at) VALUES (?, ?, ?, ?)",
-        (token, user["id"], education_role, datetime.utcnow().isoformat()),
-    )
-    db.commit()
     return jsonify({
-        "token": token,
-        "email": user["email"],
-        "educationRole": education_role,
-        "canTeach": bool(user["can_teach"]),
+        "token": result.token,
+        "email": result.user.email,
+        "educationRole": result.education_role,
+        "canTeach": result.user.can_teach,
     })
 
 
@@ -975,9 +949,7 @@ def auth_login():
 def auth_logout():
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        db = _get_db()
-        db.execute("DELETE FROM sessions WHERE token = ?", (auth[7:],))
-        db.commit()
+        _auth_service.logout(auth[7:])
     return jsonify({"ok": True})
 
 
@@ -987,10 +959,10 @@ def auth_me():
     if not user:
         return jsonify({"error": "not authenticated"}), 401
     return jsonify({
-        "email": user["email"],
-        "id": user["id"],
-        "educationRole": user["education_role"],
-        "canTeach": bool(user["can_teach"]),
+        "email": user.email,
+        "id": user.id,
+        "educationRole": user.education_role,
+        "canTeach": user.can_teach,
     })
 
 
@@ -1001,26 +973,7 @@ def settings_get():
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    db = _get_db()
-    row = db.execute(
-        "SELECT llm_api_url, llm_model, llm_api_key, llm_configs_json FROM user_settings WHERE user_id = ?",
-        (user["id"],),
-    ).fetchone()
-    if not row:
-        return jsonify({"configs": [], "active_index": 0})
-    # If new multi-config format exists, use it
-    if row["llm_configs_json"]:
-        try:
-            data = json.loads(row["llm_configs_json"])
-            return jsonify(data)
-        except Exception:
-            pass
-    # Migrate legacy single config
-    if row["llm_api_url"]:
-        legacy = [{"name": "默认配置", "api_url": row["llm_api_url"],
-                   "model_name": row["llm_model"], "api_key": row["llm_api_key"]}]
-        return jsonify({"configs": legacy, "active_index": 0})
-    return jsonify({"configs": [], "active_index": 0})
+    return jsonify(_learning_repository.get_settings(int(user["id"])))
 
 
 @app.route("/api/v2/settings", methods=["PUT"])
@@ -1030,24 +983,15 @@ def settings_put():
         return jsonify({"error": "not authenticated"}), 401
     body = request.get_json(silent=True) or {}
     configs = body.get("configs", [])
-    active_index = int(body.get("active_index", 0))
-    data_json = json.dumps({"configs": configs, "active_index": active_index}, ensure_ascii=False)
-    # Also keep legacy columns from active config for backward compat
-    active = configs[active_index] if configs and 0 <= active_index < len(configs) else {}
-    db = _get_db()
-    db.execute(
-        """INSERT INTO user_settings (user_id, llm_api_url, llm_model, llm_api_key, llm_configs_json, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(user_id) DO UPDATE SET
-               llm_api_url      = excluded.llm_api_url,
-               llm_model        = excluded.llm_model,
-               llm_api_key      = excluded.llm_api_key,
-               llm_configs_json = excluded.llm_configs_json,
-               updated_at       = excluded.updated_at""",
-        (user["id"], active.get("api_url",""), active.get("model_name",""),
-         active.get("api_key",""), data_json, datetime.utcnow().isoformat()),
-    )
-    db.commit()
+    if not isinstance(configs, list):
+        return jsonify({"error": "configs must be a list"}), 400
+    try:
+        active_index = int(body.get("active_index", 0))
+        _learning_repository.upsert_settings(
+            int(user["id"]), configs, active_index
+        )
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid settings payload"}), 400
     return jsonify({"ok": True})
 
 
@@ -1426,10 +1370,10 @@ def _persistent_job_dir(job_id: str) -> Path:
 
 
 def _history_resume_available(row) -> bool:
-    status = row["status"] if "status" in row.keys() else "done"
+    status = row.get("status") or "done"
     if status not in {"paused", "error"}:
         return False
-    source_markdown = row["source_markdown"] if "source_markdown" in row.keys() else None
+    source_markdown = row.get("source_markdown")
     if not source_markdown:
         return False
     manifest_path = _persistent_job_dir(row["id"]) / "_stage_cache" / "manifest.json"
@@ -1443,30 +1387,22 @@ def _history_resume_available(row) -> bool:
 
 
 def _history_item_payload(row):
-    status = row["status"] if "status" in row.keys() else "done"
+    status = row.get("status") or "done"
     return {
         "id": row["id"],
         "filename": row["filename"],
         "node_count": row["node_count"],
         "edge_count": row["edge_count"],
         "status": status or "done",
-        "stage": row["stage"] if "stage" in row.keys() else None,
-        "stage_label": row["stage_label"] if "stage_label" in row.keys() else None,
-        "stage_index": int(row["stage_index"] or 0) if "stage_index" in row.keys() else 0,
-        "total_stages": int(row["total_stages"] or 0) if "total_stages" in row.keys() else 0,
-        "experimental_logic_ir": bool(
-            row["experimental_logic_ir"]
-            if "experimental_logic_ir" in row.keys()
-            else False
-        ),
-        "stages_done": _json_list(
-            row["stages_done_json"] if "stages_done_json" in row.keys() else "[]"
-        ),
+        "stage": row.get("stage"),
+        "stage_label": row.get("stage_label"),
+        "stage_index": int(row.get("stage_index") or 0),
+        "total_stages": int(row.get("total_stages") or 0),
+        "experimental_logic_ir": bool(row.get("experimental_logic_ir")),
+        "stages_done": list(row.get("stages_done") or []),
         "resume_available": _history_resume_available(row),
         "updated_at": (
-            row["updated_at"]
-            if "updated_at" in row.keys() and row["updated_at"]
-            else row["created_at"]
+            row.get("updated_at") or row.get("created_at")
         ),
         "created_at": row["created_at"],
     }
@@ -1481,71 +1417,44 @@ def _upsert_job_history(job: dict, status: str, user_id: int | None = None) -> b
     result = result if isinstance(result, dict) else {}
     nodes = result.get("nodes") if isinstance(result.get("nodes"), list) else []
     edges = result.get("edges") if isinstance(result.get("edges"), list) else []
-    now = datetime.utcnow().isoformat()
-    source_pdf = job.get("source_pdf")
-    values = {
-        "filename": job.get("filename") or "input.md",
-        "node_count": len(nodes),
-        "edge_count": len(edges),
-        "nodes_json": json.dumps(nodes, ensure_ascii=False),
-        "edges_json": json.dumps(edges, ensure_ascii=False),
-        "source_markdown": job.get("source_markdown"),
-        "latex_macros": json.dumps(
-            job.get("latex_macros") or result.get("latex_macros") or {},
-            ensure_ascii=False,
-        ),
-        "source_pdf_json": (
-            json.dumps(_stored_source_pdf_meta(source_pdf), ensure_ascii=False)
-            if source_pdf
-            else None
-        ),
-        "status": status,
-        "stage": job.get("stage"),
-        "stage_label": job.get("stage_label"),
-        "stage_index": int(job.get("stage_index") or 0),
-        "total_stages": int(job.get("total_stages") or len(stage_defs)),
-        "stages_done_json": json.dumps(job.get("stages_done") or [], ensure_ascii=False),
-        "source_format": job.get("source_format") or "markdown",
-        "source_origin": job.get("source_origin") or "markdown",
-        "experimental_logic_ir": int(bool(job.get("_experimental_logic_ir"))),
-        "updated_at": now,
-    }
-    conn = None
+    created_at = job.get("created_at")
+    if isinstance(created_at, str):
+        try:
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError:
+            created_at = None
+    if not isinstance(created_at, datetime):
+        created_at = datetime.utcnow()
     try:
-        conn = sqlite3.connect(str(_DB_PATH))
-        existing = conn.execute(
-            "SELECT user_id FROM history WHERE id = ?",
-            (job["job_id"],),
-        ).fetchone()
-        if existing and int(existing[0]) != int(owner_id):
+        saved = _learning_repository.upsert_job_progress(
+            int(owner_id),
+            JobSnapshot(
+                job_id=job["job_id"],
+                filename=job.get("filename") or "input.md",
+                status=status,
+                nodes=nodes,
+                edges=edges,
+                source_markdown=job.get("source_markdown"),
+                latex_macros=job.get("latex_macros") or result.get("latex_macros") or {},
+                source_pdf=job.get("source_pdf"),
+                stage=job.get("stage"),
+                stage_label=job.get("stage_label"),
+                stage_index=int(job.get("stage_index") or 0),
+                total_stages=int(job.get("total_stages") or len(stage_defs)),
+                stages_done=list(job.get("stages_done") or []),
+                source_format=job.get("source_format") or "markdown",
+                source_origin=job.get("source_origin") or "markdown",
+                experimental_logic_ir=bool(job.get("_experimental_logic_ir")),
+                created_at=created_at,
+            ),
+        )
+        if not saved:
             return False
-        if existing:
-            assignments = ", ".join(f"{key} = ?" for key in values)
-            conn.execute(
-                f"UPDATE history SET {assignments} WHERE id = ? AND user_id = ?",
-                (*values.values(), job["job_id"], owner_id),
-            )
-        else:
-            columns = ["id", "user_id", *values.keys(), "created_at"]
-            placeholders = ", ".join("?" for _ in columns)
-            conn.execute(
-                f"INSERT INTO history ({', '.join(columns)}) VALUES ({placeholders})",
-                (
-                    job["job_id"],
-                    owner_id,
-                    *values.values(),
-                    job.get("created_at") or now,
-                ),
-            )
-        conn.commit()
         job["_user_id"] = int(owner_id)
         job["_history_persisted"] = True
         return True
     except Exception:
         return False
-    finally:
-        if conn is not None:
-            conn.close()
 
 
 def _job_access_allowed(job: dict) -> bool:
@@ -1561,17 +1470,7 @@ def history_list():
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    db = _get_db()
-    rows = db.execute(
-        """SELECT id, filename, node_count, edge_count, status, stage, stage_label,
-                  stage_index, total_stages, stages_done_json, source_markdown,
-                  experimental_logic_ir, updated_at, created_at
-           FROM history
-           WHERE user_id = ?
-           ORDER BY created_at DESC
-           LIMIT 50""",
-        (user["id"],),
-    ).fetchall()
+    rows = _learning_repository.list_history(int(user["id"]), limit=50)
     return jsonify([_history_item_payload(row) for row in rows])
 
 
@@ -1595,16 +1494,13 @@ def history_get(hist_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    db = _get_db()
-    row = db.execute(
-        "SELECT * FROM history WHERE id = ? AND user_id = ?", (hist_id, user["id"])
-    ).fetchone()
+    row = _learning_repository.get_owned_history(int(user["id"]), hist_id)
     if not row:
         return jsonify({"error": "not found"}), 404
-    status = row["status"] if "status" in row.keys() else "done"
+    status = row.get("status") or "done"
     if status != "done":
         return jsonify({"error": "history item is not complete", "status": status}), 409
-    nodes = json.loads(row["nodes_json"])
+    nodes = copy.deepcopy(row["nodes"])
     # Backfill node_index_in_doc for old records that lack it (use node id as proxy)
     for n in nodes:
         if "node_index_in_doc" not in n or n["node_index_in_doc"] is None:
@@ -1622,8 +1518,8 @@ def history_get(hist_id):
         "edge_count": row["edge_count"],
         "created_at": row["created_at"],
         "nodes": nodes,
-        "edges": json.loads(row["edges_json"]),
-        "latex_macros": json.loads(row["latex_macros"] or "{}"),
+        "edges": row["edges"],
+        "latex_macros": row["latex_macros"],
         "source_pdf": _public_source_pdf_meta(_read_source_pdf_meta(row)),
     })
 
@@ -1655,13 +1551,10 @@ def history_resume(hist_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    row = _get_db().execute(
-        "SELECT * FROM history WHERE id = ? AND user_id = ?",
-        (hist_id, user["id"]),
-    ).fetchone()
+    row = _learning_repository.get_owned_history(int(user["id"]), hist_id)
     if not row:
         return jsonify({"error": "not found"}), 404
-    status = row["status"] if "status" in row.keys() else "done"
+    status = row.get("status") or "done"
     if status not in {"paused", "error"}:
         return jsonify({
             "error": "Only a paused or failed history task can be resumed",
@@ -1674,8 +1567,8 @@ def history_resume(hist_id):
         return jsonify({"error": "Complete LLM and embedding configuration is required"}), 400
 
     artifact_dir = _persistent_job_dir(hist_id)
-    source_format = row["source_format"] or "markdown"
-    source_origin = row["source_origin"] if "source_origin" in row.keys() else "markdown"
+    source_format = row.get("source_format") or "markdown"
+    source_origin = row.get("source_origin") or "markdown"
     source_path = artifact_dir / _safe_upload_filename(row["filename"], source_format)
     if not source_path.is_file():
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1689,20 +1582,10 @@ def history_resume(hist_id):
         if job and job.get("status") == "running":
             return jsonify({"error": "Pipeline worker is already running"}), 409
         if job is None:
-            try:
-                latex_macros = json.loads(row["latex_macros"] or "{}")
-            except json.JSONDecodeError:
-                latex_macros = {}
-            try:
-                partial_nodes = json.loads(row["nodes_json"] or "[]")
-                partial_edges = json.loads(row["edges_json"] or "[]")
-            except json.JSONDecodeError:
-                partial_nodes, partial_edges = [], []
-            experimental_logic_ir = bool(
-                row["experimental_logic_ir"]
-                if "experimental_logic_ir" in row.keys()
-                else False
-            )
+            latex_macros = copy.deepcopy(row.get("latex_macros") or {})
+            partial_nodes = copy.deepcopy(row.get("nodes") or [])
+            partial_edges = copy.deepcopy(row.get("edges") or [])
+            experimental_logic_ir = bool(row.get("experimental_logic_ir"))
             stage_defs = _pipeline_stage_defs(experimental_logic_ir)
             job = {
                 "job_id": hist_id,
@@ -1712,7 +1595,7 @@ def history_resume(hist_id):
                 "stage_label": row["stage_label"],
                 "stage_index": int(row["stage_index"] or 0),
                 "total_stages": int(row["total_stages"] or len(stage_defs)),
-                "stages_done": _json_list(row["stages_done_json"] or "[]"),
+                "stages_done": list(row.get("stages_done") or []),
                 "result": None,
                 "partial": {"nodes": partial_nodes, "edges": partial_edges},
                 "error": None,
@@ -1756,10 +1639,7 @@ def history_markdown(hist_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    db = _get_db()
-    row = db.execute(
-        "SELECT filename, source_markdown FROM history WHERE id = ? AND user_id = ?", (hist_id, user["id"])
-    ).fetchone()
+    row = _learning_repository.get_owned_history(int(user["id"]), hist_id)
     if not row:
         return jsonify({"error": "not found"}), 404
     if row["source_markdown"]:
@@ -1784,11 +1664,7 @@ def history_delete(hist_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    db = _get_db()
-    row = db.execute(
-        "SELECT status FROM history WHERE id = ? AND user_id = ?",
-        (hist_id, user["id"]),
-    ).fetchone()
+    row = _learning_repository.get_owned_history(int(user["id"]), hist_id)
     if not row:
         return jsonify({"error": "not found"}), 404
     with _jobs_lock:
@@ -1811,31 +1687,14 @@ def history_delete(hist_id):
 
 # ── Proof workspace endpoints ────────────────────────────────────────────────
 
-def _workspace_row_to_dict(row):
-    return {
-        "nodeId": row["node_id"],
-        "userProof": row["user_proof"] or "",
-        "versions": _json_list(row["versions_json"]),
-        "aiMessages": _json_list(row["ai_messages_json"]),
-        "imports": _json_list(row["imports_json"]),
-        "updatedAt": row["updated_at"],
-    }
-
 
 @app.route("/api/v2/proof-workspaces/<graph_id>", methods=["GET"])
 def proof_workspace_list(graph_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    db = _get_db()
-    rows = db.execute(
-        """SELECT node_id, user_proof, versions_json, ai_messages_json, imports_json, updated_at
-           FROM proof_workspaces
-           WHERE user_id = ? AND graph_id = ?
-           ORDER BY node_id ASC""",
-        (user["id"], graph_id),
-    ).fetchall()
-    return jsonify({"workspaces": [_workspace_row_to_dict(row) for row in rows]})
+    rows = _learning_repository.list_proof_workspaces(int(user["id"]), graph_id)
+    return jsonify({"workspaces": rows})
 
 
 @app.route("/api/v2/proof-workspaces/<graph_id>/<int:node_id>", methods=["PUT"])
@@ -1844,41 +1703,18 @@ def proof_workspace_save(graph_id, node_id):
     if not user:
         return jsonify({"error": "not authenticated"}), 401
     body = request.get_json(silent=True) or {}
-    user_proof = body.get("userProof") or ""
-    versions = body.get("versions") if isinstance(body.get("versions"), list) else []
-    ai_messages = body.get("aiMessages") if isinstance(body.get("aiMessages"), list) else []
-    imports = body.get("imports") if isinstance(body.get("imports"), list) else []
-    now = datetime.utcnow().isoformat()
-    db = _get_db()
-    db.execute(
-        """INSERT INTO proof_workspaces
-              (user_id, graph_id, node_id, user_proof, versions_json, ai_messages_json, imports_json, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(user_id, graph_id, node_id) DO UPDATE SET
-              user_proof       = excluded.user_proof,
-              versions_json    = excluded.versions_json,
-              ai_messages_json = excluded.ai_messages_json,
-              imports_json     = excluded.imports_json,
-              updated_at       = excluded.updated_at""",
-        (
-            user["id"], graph_id, node_id, user_proof,
-            json.dumps(versions, ensure_ascii=False),
-            json.dumps(ai_messages, ensure_ascii=False),
-            json.dumps(imports, ensure_ascii=False),
-            now,
-        ),
+    payload = {
+        "userProof": body.get("userProof") or "",
+        "versions": body.get("versions") if isinstance(body.get("versions"), list) else [],
+        "aiMessages": body.get("aiMessages") if isinstance(body.get("aiMessages"), list) else [],
+        "imports": body.get("imports") if isinstance(body.get("imports"), list) else [],
+    }
+    workspace = _learning_repository.upsert_proof_workspace(
+        int(user["id"]), graph_id, node_id, payload
     )
-    db.commit()
     return jsonify({
         "ok": True,
-        "workspace": {
-            "nodeId": node_id,
-            "userProof": user_proof,
-            "versions": versions,
-            "aiMessages": ai_messages,
-            "imports": imports,
-            "updatedAt": now,
-        },
+        "workspace": workspace,
     })
 
 
@@ -1913,8 +1749,7 @@ def _education_llm_config(user_id: int | None = None) -> dict | None:
     })
     config = dedicated or generic
     if config is None and user_id is not None:
-        user = _get_db().execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-        config = _active_user_llm_config(user)
+        config = _learning_repository.get_active_llm_config(int(user_id))
     if config is None:
         return None
     return {
@@ -6805,15 +6640,7 @@ def _cancel_job_record(job_id: str, owner_id: int | None, *, artifact_dir=None):
         )
     _remove_job_artifacts(job_id, selected_artifact_dir)
     if owner_id is not None:
-        conn = sqlite3.connect(str(_DB_PATH))
-        try:
-            conn.execute(
-                "DELETE FROM history WHERE id = ? AND user_id = ?",
-                (job_id, owner_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        _learning_repository.delete_owned_history(int(owner_id), job_id)
     with _jobs_lock:
         runtime = _job_runtimes.pop(job_id, None)
         if runtime and runtime.get("queue"):
@@ -7145,19 +6972,22 @@ def job_result(job_id):
 
 
 def _source_pdf_context(job_id: str) -> tuple[dict | None, list[dict]]:
+    user = _current_user()
     job = _jobs.get(job_id)
     if job:
+        owner_id = job.get("_user_id")
+        if owner_id is not None and (
+            user is None or int(user["id"]) != int(owner_id)
+        ):
+            return None, []
         result = job.get("result") or {}
         return job.get("source_pdf"), result.get("nodes") or []
-    row = _get_db().execute(
-        "SELECT id, nodes_json, source_pdf_json FROM history WHERE id = ?", (job_id,)
-    ).fetchone()
+    if user is None:
+        return None, []
+    row = _learning_repository.get_owned_history(int(user["id"]), job_id)
     if not row:
         return None, []
-    try:
-        nodes = json.loads(row["nodes_json"] or "[]")
-    except Exception:
-        nodes = []
+    nodes = copy.deepcopy(row.get("nodes") or [])
     return _read_source_pdf_meta(row), nodes
 
 
