@@ -81,3 +81,6 @@ backend/scripts/_tmp_pipeline_context/
 # Local process PID markers
 /_tmp_*_pid.txt
 /backend-server.pid
+
+# Codex 实施计划使用的隔离工作树
+/.worktrees/
