@@ -64,3 +64,7 @@ sudo --preserve-env=MATHWEAVER_SMOKE_EMAIL,MATHWEAVER_SMOKE_PASSWORD \
 ```
 
 外部 `18080` 不通但服务器本机检查通过时，记录为云安全组或防火墙阻塞；部署脚本不会自行修改 SSH、系统防火墙或云安全组。
+
+## 实际上线记录
+
+2026-08-28 的正式数据库迁移、图谱导入、侧车发布、端到端验收和回滚演练结果见 [教学正式版发布记录](releases/2026-08-28-teaching-production.md)。发布记录不得写入数据库口令、教师初始口令、Bearer token 或第三方 API 密钥。
