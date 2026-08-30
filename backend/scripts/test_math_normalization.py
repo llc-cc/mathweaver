@@ -1,4 +1,4 @@
-﻿from pipeline.common.node import normalize_text_with_variables
+﻿from pipeline.common.node import normalize_node_fields, normalize_text_with_variables
 
 
 def test_normalize_root_expressions():
@@ -115,6 +115,36 @@ def test_regular_variables_still_normalize():
     ]
     result = normalize_text_with_variables(variables, "n + a^2")
     assert result == "INTEGER_3 + Power(INTEGER_2,2)"
+
+
+def test_variable_replacement_treats_normalize_type_as_literal():
+    token = r"SUBSPACE OF $\MATHBF{R}^N$_1"
+
+    result = normalize_text_with_variables(
+        [{"name": "V", "normalize_type": token}],
+        "V is fixed",
+    )
+
+    assert result == rf"{token} is fixed"
+
+
+def test_normalize_node_fields_handles_latex_variable_types():
+    node = {
+        "content": "Subspace example.",
+        "variables": [
+            {"name": "V", "type": r"subspace of $\mathbf{R}^n$"},
+            {"name": "y", "type": r"vector in $\mathbf{R}^n$"},
+        ],
+        "conditions": [{"id": "c1", "text": "V is a subspace"}],
+        "conclusions": [{"id": "q1", "text": "the dual cone of V is fixed"}],
+    }
+
+    normalized = normalize_node_fields(node)
+
+    token = r"SUBSPACE OF $\MATHBF{R}^N$_1"
+    assert normalized["variables"][0]["normalize_type"] == token
+    assert normalized["conditions"][0]["text_normalized"] == f"{token} is a subspace"
+    assert normalized["conclusions"][0]["text_normalized"] == f"the dual cone of {token} is fixed"
 
 
 def main():

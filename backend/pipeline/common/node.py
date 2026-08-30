@@ -1434,7 +1434,7 @@ def normalize_text_with_variables(variables, text):
         escaped = re.escape(name)
         if re.match(r"^[A-Za-z0-9_]+$", name):
             pattern = re.compile(rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])")
-            normalized = pattern.sub(token, normalized)
+            normalized = pattern.sub(lambda _match, value=token: value, normalized)
         else:
             normalized = normalized.replace(name, token)
 

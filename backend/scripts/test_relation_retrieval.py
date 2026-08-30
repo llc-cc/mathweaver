@@ -20,6 +20,7 @@ from pipeline.stages.build_relations.relation_retrieval import (
     retrieve_relation_candidates,
     select_final_candidates,
     tokenize_math_text,
+    normalize_rerank_result,
     validate_rerank_result,
 )
 
@@ -450,6 +451,25 @@ def test_rerank_result_repairs_one_unambiguous_candidate_id_typo():
     assert not validate_rerank_result(task, ambiguous_result)
 
 
+def test_rerank_result_repairs_one_omitted_hex_character():
+    expected_id = "fa7a39555cda7aa61f855b3f"
+    omitted_id = "fa7a3955cda7aa61f855b3f"
+    other_id = "89abcdef0123456789abcdef"
+    task = {"candidate_ids": [expected_id, other_id]}
+    result = {
+        "ranked": [
+            {"candidate_id": omitted_id, "score": 3},
+            {"candidate_id": other_id, "score": 1},
+        ]
+    }
+
+    normalized = validate_rerank_result(task, result)
+    repaired = normalize_rerank_result(task, result)
+
+    assert normalized is True
+    assert repaired["ranked"][0]["candidate_id"] == expected_id
+
+
 def test_full_relation_stage_writes_candidates_report_and_edges():
     nodes = [_logic_node(0, conclusion="P"), _logic_node(1, condition="P", conclusion="Q")]
     original_get_embedding = relation_stage.get_embedding
@@ -530,6 +550,33 @@ def test_strict_embedding_failure_does_not_update_canonical_edges():
         relation_stage.get_embedding = original_get_embedding
 
 
+def test_invalid_rerank_partial_is_pruned_before_recovery():
+    tasks = {
+        "valid-task": {"candidate_ids": ["candidate-a"]},
+        "invalid-task": {"candidate_ids": ["candidate-b"]},
+    }
+    partial = {
+        "valid-task": {
+            "ranked": [{"candidate_id": "candidate-a", "score": 3}],
+        },
+        "invalid-task": {
+            "ranked": [{"candidate_id": "wrong-candidate", "score": 3}],
+        },
+    }
+    with tempfile.TemporaryDirectory() as temp_dir:
+        partial_path = Path(temp_dir) / "partial_result_dict.json"
+        partial_path.write_text(json.dumps(partial), encoding="utf-8")
+
+        removed = relation_stage._prune_invalid_rerank_partial(
+            {"run_dir": temp_dir},
+            tasks,
+        )
+        retained = json.loads(partial_path.read_text(encoding="utf-8"))
+
+    assert removed == 1
+    assert list(retained) == ["valid-task"]
+
+
 def test_unique_forward_explicit_reference_remains_a_direct_edge():
     nodes = [
         {
@@ -565,7 +612,9 @@ if __name__ == "__main__":
     test_logic_rerank_task_contains_source_evidence_and_contract_version()
     test_listwise_rerank_uses_recoverable_task_and_cache()
     test_rerank_result_repairs_one_unambiguous_candidate_id_typo()
+    test_rerank_result_repairs_one_omitted_hex_character()
     test_full_relation_stage_writes_candidates_report_and_edges()
     test_strict_embedding_failure_does_not_update_canonical_edges()
+    test_invalid_rerank_partial_is_pruned_before_recovery()
     test_unique_forward_explicit_reference_remains_a_direct_edge()
     print("relation retrieval tests passed")

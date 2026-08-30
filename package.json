@@ -16,7 +16,7 @@
     "start": "react-router-serve ./build/server/index.js",
     "typecheck": "react-router typegen && tsc",
     "test:ocr-state": "vitest run app/ocr.test.ts",
-    "test:education": "vitest run app/routes/education.test.ts",
+    "test:education": "vitest run app/education-direct.test.ts app/routes/education.test.ts",
     "test:formula-input": "vitest run app/routes/formula-input.test.ts",
     "test:math": "vitest run --config vitest.config.ts app/routes/math.test.tsx",
     "audit:latex": "node scripts/audit-latex-job.mjs",

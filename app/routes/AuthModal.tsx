@@ -16,9 +16,10 @@ export function AuthModal({ onAuth, onSkip }: AuthModalProps) {
   const [closing, setClosing] = useState(false);
 
   const closeSoftly = () => {
-    if (closing) return;
+    if (closing || !onSkip) return;
+    const skip = onSkip;
     setClosing(true);
-    window.setTimeout(onSkip, 140);
+    window.setTimeout(skip, 140);
   };
 
   const submit = async () => {
@@ -128,12 +129,14 @@ export function AuthModal({ onAuth, onSkip }: AuthModalProps) {
           ) : <span style={{ fontSize: 11 }}>教师账号由管理员配置</span>}
         </div>
 
-        <button
-          style={{ display: "block", width: "100%", boxSizing: "border-box", margin: "10px 0 0", padding: 0, background: "none", border: "none", color: "var(--muted)", fontSize: 11, textAlign: "center", cursor: "pointer" }}
-          onClick={closeSoftly}
-        >
-          暂不登录，继续使用（本次会话结果不会保存）
-        </button>
+        {onSkip && (
+          <button
+            style={{ display: "block", width: "100%", boxSizing: "border-box", margin: "10px 0 0", padding: 0, background: "none", border: "none", color: "var(--muted)", fontSize: 11, textAlign: "center", cursor: "pointer" }}
+            onClick={closeSoftly}
+          >
+            暂不登录
+          </button>
+        )}
       </div>
     </div>
   );

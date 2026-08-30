@@ -187,12 +187,19 @@
   }
 }
 
-.mg-workspace-switch {
+.mg-workspace-switch-group {
   position: fixed;
   top: 26px;
   left: 14px;
   transform: translateY(-50%);
   z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mg-workspace-switch {
+  position: static;
   background: rgba(255,255,255,.94);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -203,6 +210,23 @@
   padding: 5px;
   font-family: var(--font-ui);
 }
+
+.mg-workspace-role-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+.mg-workspace-role-badge.teacher { color: #234e78; background: #e7f0f9; }
+.mg-workspace-role-badge.student { color: #4f6c58; background: #eaf3eb; }
+.mg-workspace-role-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
 .mg-workspace-switch button {
   margin: 0;
@@ -246,8 +270,8 @@
   color: var(--ink);
 }
 .mg-workspace-switch button.active {
-  background: var(--ink);
-  color: #fff;
+  background: #e7f0f9;
+  color: #234e78;
   box-shadow: var(--shadow-sm);
 }
 
@@ -273,8 +297,10 @@
 }
 
 @media (max-width: 1280px) {
-  .mg-workspace-switch {
+  .mg-workspace-switch-group {
     left: 8px;
+  }
+  .mg-workspace-switch {
     gap: 3px;
     padding: 3px;
   }
@@ -392,8 +418,8 @@
 
 /* primary CTA: ink/dark like landing + studio primary buttons */
 .mg-upload-screen .mg-btn-primary {
-  background: var(--ink);
-  color: #fff;
+  background: #e7f0f9;
+  color: #234e78;
 }
 .mg-upload-screen .mg-btn-primary:not(:disabled):hover {
   opacity: 1;
@@ -781,8 +807,8 @@
 .mg-settings-guide-link:hover { text-decoration: underline; }
 
 .mg-btn-primary {
-  background: var(--ink);
-  color: #fff;
+  background: #e7f0f9;
+  color: #234e78;
   width: 100%;
   padding: 10px;
   font-size: 14px;
@@ -791,8 +817,8 @@
   border-radius: var(--radius);
 }
 .mg-btn-primary:not(:disabled):hover {
-  background: var(--ink);
-  color: #fff;
+  background: #e7f0f9;
+  color: #234e78;
   opacity: 1;
   box-shadow: var(--shadow);
   transform: translateY(-1px);

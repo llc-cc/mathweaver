@@ -11,7 +11,7 @@ import httpx
 import numpy as np
 from openai import OpenAI
 
-from ...common.io import read_json, save_stage_json
+from ...common.io import atomic_write_json, read_json, save_stage_json
 from ...common.llm_task import run_multiprocess_task
 from ...common.node import (
     assemble_statement_text,
@@ -1002,6 +1002,35 @@ def _save_rerank_cache(context, results):
     )
 
 
+def _prune_invalid_rerank_partial(unresolved, tasks):
+    """Drop present-but-invalid results so task recovery reruns them."""
+
+    if not isinstance(unresolved, dict):
+        return 0
+    run_dir = unresolved.get("run_dir")
+    if not run_dir:
+        return 0
+    partial_path = Path(run_dir) / "partial_result_dict.json"
+    if not partial_path.is_file():
+        return 0
+    try:
+        partial = read_json(str(partial_path))
+    except Exception:
+        return 0
+    if not isinstance(partial, dict):
+        return 0
+
+    valid_partial = {}
+    for task_key, result in partial.items():
+        task = tasks.get(str(task_key))
+        if task is not None and validate_rerank_result(task, result):
+            valid_partial[str(task_key)] = result
+    removed_count = len(partial) - len(valid_partial)
+    if removed_count:
+        atomic_write_json(str(partial_path), valid_partial)
+    return removed_count
+
+
 def _execute_candidate_rerank(context, candidates, node_list, config, *, resume=False):
     tasks = build_rerank_tasks(
         candidates,
@@ -1035,6 +1064,7 @@ def _execute_candidate_rerank(context, candidates, node_list, config, *, resume=
             expected = set(unresolved["report"].get("expected_task_keys") or [])
             can_resume = bool(expected) and expected == set(missing_tasks)
         if can_resume:
+            _prune_invalid_rerank_partial(unresolved, tasks)
             partial, failure_report, run_dir = rerun_unresolved_task_report(
                 context,
                 stage_name=RELATION_RERANK_TASK_STAGE,
@@ -1597,6 +1627,7 @@ def run(context, state, relation_mode="structured", relation_prompt_profile="gra
             state,
             relation_mode,
             relation_prompt_profile,
+            rerank_resume=bool(getattr(context, "resume_task_checkpoints", False)),
         )
     except (EmbeddingRetrievalError, RelationRerankError) as exc:
         state["build_relations_stage_run"] = dict(exc.report or {})

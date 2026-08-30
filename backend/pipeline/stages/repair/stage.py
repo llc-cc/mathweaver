@@ -873,7 +873,7 @@ def apply_repair_patch(node_dict, repair_result_dict, repair_input_keys=None):
 
         try:
             candidate = _apply_validated_patch(node, field_patch, result["repair_log"])
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, re.error) as exc:
             repair_log = copy.deepcopy(result["repair_log"])
             repair_log["risk_notes"] = list(repair_log.get("risk_notes") or []) + [{
                 "guard_rejections": [str(exc)],

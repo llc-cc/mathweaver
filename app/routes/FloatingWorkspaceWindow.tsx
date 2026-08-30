@@ -226,7 +226,7 @@ export function FloatingWorkspaceWindow({
 
   const portalRoot = typeof document === "undefined"
     ? null
-    : (anchorElement?.closest(".gs-root") as HTMLElement | null) || document.body;
+    : (anchorElement?.closest(".gs-root, .edu-root") as HTMLElement | null) || document.body;
   if (!portalRoot) return null;
 
   const floatingStyle = {

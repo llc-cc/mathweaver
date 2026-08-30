@@ -5,7 +5,7 @@ import { Network } from "vis-network";
 import { DataSet } from "vis-data";
 import {
   Search, Settings2, Sun, Moon, Maximize2, Plus, Minus, Crosshair,
-  PanelRightClose, PanelLeftClose, PanelLeft, X, Upload, Download, Minimize2,
+  PanelLeftClose, PanelLeft, X, Upload, Download, Minimize2,
   BookOpen, ArrowRight, Loader2, History, LayoutGrid, FileText, FileJson, CircleHelp,
   GraduationCap, Route as RouteIcon, CheckCircle2, AlertTriangle,
   LockKeyhole, Brain, ChevronDown, ChevronLeft, ChevronRight, ArrowUp, ArrowDown, Trash2, Save, RotateCcw, Send, ClipboardCheck,
@@ -1161,7 +1161,7 @@ export default function GraphStudio({
     <div ref={rootRef} className="gs-root" data-theme={theme}>
       {/* ── Top bar ── */}
       <div className="gs-topbar">
-        <button className="gs-iconbtn" title={railOpen ? "收起侧栏" : "展开侧栏"} onClick={() => setRailOpen(v => !v)}>
+        <button className="gs-iconbtn gs-rail-toggle" title={railOpen ? "收起侧栏" : "展开侧栏"} onClick={() => setRailOpen(v => !v)}>
           {railOpen ? <PanelLeftClose size={17} /> : <PanelLeft size={17} />}
         </button>
         <div className="gs-brand">

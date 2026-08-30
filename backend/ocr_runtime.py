@@ -1486,16 +1486,29 @@ class OcrManager:
         self._maybe_cleanup_expired_uploads()
         with self._lock:
             jobs = list(self._jobs.values())
-        recovered: list[dict[str, Any]] = []
+        latest_by_upload: dict[str, dict[str, Any]] = {}
         for job in jobs:
             if job.get("status") != "interrupted":
                 continue
+            upload_id = str(job.get("upload_id") or "")
             try:
-                upload = self._upload(str(job.get("upload_id") or ""))
+                upload = self._upload(upload_id)
             except OcrError:
                 continue
-            recovered.append({**job, "upload_expires_at": upload.get("expires_at")})
-        return recovered
+            current = latest_by_upload.get(upload_id)
+            job_key = (
+                str(job.get("updated_at") or job.get("created_at") or ""),
+                str(job.get("created_at") or ""),
+                str(job.get("ocr_job_id") or ""),
+            )
+            current_key = (
+                str(current.get("updated_at") or current.get("created_at") or ""),
+                str(current.get("created_at") or ""),
+                str(current.get("ocr_job_id") or ""),
+            ) if current else ()
+            if current is None or job_key > current_key:
+                latest_by_upload[upload_id] = {**job, "upload_expires_at": upload.get("expires_at")}
+        return list(latest_by_upload.values())
 
     def retry_job(self, job_id: str) -> dict[str, Any]:
         job = self.get_job(job_id)

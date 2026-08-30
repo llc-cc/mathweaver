@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -208,6 +209,75 @@ def test_apply_repair_patch_skips_global_id_mismatch():
 
     assert updated[0]["statement_form"] == "implication"
     assert report["skipped"][0]["reason"] == "node_identity_mismatch"
+
+
+def test_apply_repair_patch_handles_latex_variable_types():
+    source = (
+        r"Subspace. The dual cone of a subspace $V \subseteq \mathbf { R } ^ { n }$ "
+        r"is its orthogonal complement $V ^ { \perp }$."
+    )
+    node = _seal_source_node(
+        {
+            "node_type": "example",
+            "statement_form": "equality",
+            "variables": [
+                {"name": "V", "type": r"subspace of $\mathbf{R}^n$"},
+                {"name": "y", "type": r"vector in $\mathbf{R}^n$"},
+            ],
+            "context": [],
+            "conditions": [{"id": "c1", "text": r"$V$ is a subspace of $\mathbf{R}^n$"}],
+            "conclusions": [{"id": "q1", "text": "the dual cone of V is its orthogonal complement"}],
+        },
+        source,
+    )
+    evidence = r"$V ^ { \perp }$"
+
+    updated, report = apply_repair_patch(
+        {56: node},
+        {
+            "56": {
+                "node_key": "56",
+                "node_global_id": node["global_id"],
+                "field_patch": {"context": [evidence]},
+                "repair_log": _repair_log(_repair_record("context", "append", evidence)),
+            }
+        },
+        repair_input_keys=["56"],
+    )
+
+    assert updated[56]["repair_status"] == "applied"
+    assert [
+        {"name": variable["name"], "type": variable["type"]}
+        for variable in updated[56]["variables"]
+    ] == node["variables"]
+    assert updated[56]["variables"][0]["normalize_type"] == r"SUBSPACE OF $\MATHBF{R}^N$_1"
+    assert updated[56]["context"]["text"] == [evidence]
+    assert updated[56]["context"]["text_normalized"]
+    assert report["applied"][0]["key"] == 56
+
+
+def test_apply_repair_patch_rejects_regex_errors_per_node():
+    node = _sample_node()
+    result = {
+        "0": {
+            "node_key": "0",
+            "node_global_id": node["global_id"],
+            "field_patch": {
+                "conditions": [
+                    {"id": "c1", "text": "A holds"},
+                    {"id": "c2", "text": "A is finite"},
+                ]
+            },
+            "repair_log": _repair_log(_repair_record("conditions", "append", "A is finite")),
+        }
+    }
+
+    with patch.object(repair_stage, "normalize_node_fields", side_effect=re.error("bad escape")):
+        updated, report = apply_repair_patch({0: node}, result)
+
+    assert updated[0]["repair_status"] == "rejected_guard"
+    assert report["skipped"][0]["reason"] == "guard_rejected"
+    assert report["skipped"][0]["errors"] == ["bad escape"]
 
 
 def test_repair_validation_rejects_non_json_values():
@@ -619,6 +689,8 @@ if __name__ == "__main__":
     test_apply_repair_patch_updates_allowed_fields_only()
     test_apply_repair_patch_does_not_overwrite_with_empty_values()
     test_apply_repair_patch_skips_global_id_mismatch()
+    test_apply_repair_patch_handles_latex_variable_types()
+    test_apply_repair_patch_rejects_regex_errors_per_node()
     test_repair_validation_rejects_non_json_values()
     test_repair_validation_accepts_sparse_evidence_grounded_patch()
     test_repair_validation_rejects_patch_without_structured_evidence_log()

@@ -50,13 +50,24 @@ Exact source span:
 
 TARGETED_CORRECTION_TEMPLATE = r"""
 Your previous recovery was invalid. Return only content_quote and proof_quote.
-Both non-empty quotes must be exact contiguous substrings of the source span.
+Do not explain the error, repeat these instructions, or copy text from the schema.
+
+Target node type: {target_type}
+Target source label: {target_label}
+
+Copy one non-empty content_quote exactly from the source span below. Include a
+proof_quote only when the source span contains a proof; otherwise return an empty
+string. Both non-empty quotes must be exact contiguous source substrings and must
+preserve the source language and LaTeX exactly.
 
 Required schema:
 {data_template}
 
 Invalid previous answer:
 {answer}
+
+Exact source span:
+{pos1}
 """
 
 

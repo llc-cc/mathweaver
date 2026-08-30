@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyOcrRuntime,
+  dedupeOcrRecoveryJobs,
   ocrRuntimeDiagnostic,
   ocrRuntimeErrorSummary,
   type OcrRuntimeStatus,
@@ -36,5 +37,27 @@ describe("OCR runtime state classification", () => {
     expect(ocrRuntimeDiagnostic(value)).not.toContain("C:\\Users");
     expect(ocrRuntimeErrorSummary(status({ error_code: "ocr_download_proxy_timeout" }))).toContain("代理 TLS 握手超时");
     expect(ocrRuntimeErrorSummary(status({ error_code: "ocr_download_failed", diagnostic: "_ssl.c:993 handshake operation timed out" }))).toContain("代理 TLS 握手超时");
+  });
+});
+describe("OCR recovery jobs", () => {
+  it("keeps only the newest interrupted job for each upload", () => {
+    const base = {
+      upload_id: "upload-1",
+      filename: "recovery.pdf",
+      size_bytes: 1,
+      page_count: 1,
+      status: "interrupted" as const,
+      phase: "interrupted" as const,
+      elapsed_seconds: 0,
+      eta_seconds: null,
+      retryable: true,
+    };
+    const jobs = [
+      { ...base, ocr_job_id: "job-old", updated_at: "2026-08-28T09:00:00Z" },
+      { ...base, ocr_job_id: "job-new", updated_at: "2026-08-28T10:00:00Z" },
+      { ...base, upload_id: "upload-2", ocr_job_id: "job-other" },
+    ];
+
+    expect(dedupeOcrRecoveryJobs(jobs)).toEqual([jobs[1], jobs[2]]);
   });
 });

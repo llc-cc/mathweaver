@@ -330,6 +330,7 @@ def execute_fixed_pipeline(
     edge_output_mode="structured",
     relation_prompt_profile="graph",
     experimental_logic_ir=False,
+    stop_stage=None,
     on_stage_start: StageCallback | None = None,
     on_stage_ready: StageCallback | None = None,
     on_stage_complete: StageCallback | None = None,
@@ -386,8 +387,16 @@ def execute_fixed_pipeline(
             raise ValueError(f"Unknown fixed pipeline start stage: {start_stage}")
         start_index = stage_keys.index(start_stage)
     total = len(plan)
+    stop_index = total - 1
+    if stop_stage is not None:
+        stage_keys = [stage.key for stage in plan]
+        if stop_stage not in stage_keys:
+            raise ValueError(f"Unknown fixed pipeline stop stage: {stop_stage}")
+        stop_index = stage_keys.index(stop_stage)
+        if stop_index < start_index:
+            raise ValueError("stop_stage cannot be earlier than start_stage")
     try:
-        for index in range(start_index, total):
+        for index in range(start_index, stop_index + 1):
             stage = plan[index]
             context.current_stage_key = stage.key
             _assert_state_keys(

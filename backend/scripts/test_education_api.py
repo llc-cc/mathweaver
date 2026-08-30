@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 import api_v2
 import student_context
+from education_service import validate_direct_scoring_standard_result
 
 
 NODES = [
@@ -65,12 +67,14 @@ class EducationApiTests(unittest.TestCase):
             api_v2._SOURCE_PDF_ROOT,
             api_v2._EDUCATION_ROOT,
             api_v2._EDUCATION_SNAPSHOT_ROOT,
+            api_v2._EDUCATION_ASSIGNMENT_SOURCE_ROOT,
         )
         api_v2._DATA_ROOT = root
         api_v2._DB_PATH = root / "auth.db"
         api_v2._SOURCE_PDF_ROOT = root / "uploads" / "source_pdfs"
         api_v2._EDUCATION_ROOT = root / "education"
         api_v2._EDUCATION_SNAPSHOT_ROOT = root / "education" / "snapshots"
+        api_v2._EDUCATION_ASSIGNMENT_SOURCE_ROOT = root / "education" / "assignment_sources"
         api_v2.app.config.update(TESTING=True)
         self.client = api_v2.app.test_client()
         self.env = patch.dict(
@@ -102,6 +106,7 @@ class EducationApiTests(unittest.TestCase):
             api_v2._SOURCE_PDF_ROOT,
             api_v2._EDUCATION_ROOT,
             api_v2._EDUCATION_SNAPSHOT_ROOT,
+            api_v2._EDUCATION_ASSIGNMENT_SOURCE_ROOT,
         ) = self.previous
         self.temp_dir.cleanup()
 
@@ -227,6 +232,44 @@ class EducationApiTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertNotIn("user-key", stored_error)
         self.assertIn("[redacted]", stored_error)
+
+    def test_direct_question_standard_generation_is_single_teacher_task(self):
+        generated = {
+            "referenceAnswer": "先列出已知条件，再给出结论。",
+            "focus": "检查学生是否说明了条件与结论之间的关系。",
+            "expectedPoints": ["正确识别条件", "给出关键推导", "明确最终结论"],
+        }
+        with patch.object(api_v2, "_education_ai_task", return_value=generated) as task:
+            response = self.client.post(
+                "/api/v2/edu/direct-questions/generate-standard",
+                json={"question": "设向量组线性无关，说明其性质。"},
+                headers=self._headers(self.teacher),
+            )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json(), generated)
+        task.assert_called_once()
+        kwargs = task.call_args.kwargs
+        self.assertEqual(kwargs["task_kind"], "direct_scoring_standard")
+        self.assertEqual(kwargs["payload"], {"question": "设向量组线性无关，说明其性质。"})
+
+        self.assertTrue(validate_direct_scoring_standard_result(generated))
+        self.assertFalse(validate_direct_scoring_standard_result({**generated, "focus": ""}))
+        self.assertFalse(validate_direct_scoring_standard_result({**generated, "expectedPoints": []}))
+
+        student_response = self.client.post(
+            "/api/v2/edu/direct-questions/generate-standard",
+            json={"question": "学生不应调用教师生成接口。"},
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(student_response.status_code, 403, student_response.get_json())
+
+        invalid_response = self.client.post(
+            "/api/v2/edu/direct-questions/generate-standard",
+            json={"question": "   "},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(invalid_response.status_code, 400, invalid_response.get_json())
+
 
     def test_saved_teacher_config_generates_assessments_without_system_environment(self):
         self._save_llm_config(self.teacher)
@@ -2708,6 +2751,558 @@ class EducationApiTests(unittest.TestCase):
             headers=self._headers(self.teacher),
         )
         self.assertEqual(released.status_code, 200, released.get_json())
+
+    def test_graph_assignment_still_requires_scoring_points(self):
+        _class_data, _snapshot, assignment = self._create_draft_assignment_with_assessments()
+        question = assignment["assessments"][0]["questions"][0]
+        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+            connection.execute(
+                "UPDATE education_assessment_questions SET expected_points_json = ? WHERE id = ?",
+                (json.dumps([], ensure_ascii=False), question["id"]),
+            )
+            connection.commit()
+
+        blocked = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(blocked.status_code, 409, blocked.get_json())
+        self.assertEqual(blocked.get_json()["code"], "assessment_scoring_required")
+
+
+    def test_direct_assignment_empty_draft_and_multipart_import(self):
+        created = self.client.post(
+            "/api/v2/edu/classes",
+            json={"title": "Empty direct assignment course"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        class_data = created.get_json()["class"]
+        joined = self.client.post(
+            f"/api/v2/edu/classes/{class_data['inviteCode']}/join",
+            json={"inviteCode": class_data["inviteCode"], "studentName": "Empty draft student", "studentNumber": "E001"},
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(joined.status_code, 200, joined.get_json())
+
+        empty = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/assignments/direct",
+            data={"title": "待导入作业", "questions": "[]"},
+            content_type="multipart/form-data",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(empty.status_code, 201, empty.get_json())
+        assignment = empty.get_json()["assignment"]
+        self.assertEqual(assignment["directStructureVersion"], 1)
+        self.assertEqual(assignment["targetNodeId"], 0)
+        self.assertEqual(assignment["path"]["steps"], [])
+        self.assertEqual(assignment["path"]["edges"], [])
+        self.assertEqual(assignment["assessments"], [])
+        self.assertEqual(assignment["snapshot"]["nodes"], [])
+        self.assertEqual(assignment["snapshot"]["edges"], [])
+        self.assertNotIn("source", assignment)
+
+        publish = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(publish.status_code, 409, publish.get_json())
+        self.assertEqual(publish.get_json().get("code"), "assessment_scoring_required")
+
+        imported = self.client.patch(
+            f"/api/v2/edu/assignments/{assignment['id']}/direct-questions",
+            data={
+                "questions": json.dumps([{"order": 1, "question": "导入的第一题"}], ensure_ascii=False),
+                "sourceOrigin": "ocr",
+                "sourceText": "第 1 题\n导入的第一题",
+                "source_file": (io.BytesIO(b"%PDF-empty-import"), "imported.pdf"),
+            },
+            content_type="multipart/form-data",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(imported.status_code, 200, imported.get_json())
+        updated = imported.get_json()["assignment"]
+        self.assertEqual(len(updated["snapshot"]["nodes"]), 1)
+        self.assertEqual(len(updated["snapshot"]["edges"]), 0)
+        self.assertEqual([step["nodeId"] for step in updated["path"]["steps"]], [1])
+        self.assertEqual(updated["snapshot"]["sourceMarkdown"], "第 1 题\n导入的第一题")
+        self.assertEqual(updated["source"]["origin"], "ocr")
+        self.assertTrue(updated["source"]["hasOriginalFile"])
+        source = self.client.get(
+            f"/api/v2/edu/assignments/{assignment['id']}/source",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(source.status_code, 200)
+        self.assertEqual(source.data, b"%PDF-empty-import")
+
+    def test_direct_assignment_draft_delete_removes_assignment_snapshot_and_source(self):
+        created = self.client.post(
+            "/api/v2/edu/classes",
+            json={"title": "Disposable direct assignment course"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        class_data = created.get_json()["class"]
+        joined = self.client.post(
+            f"/api/v2/edu/classes/{class_data['inviteCode']}/join",
+            json={"inviteCode": class_data["inviteCode"], "studentName": "Draft student", "studentNumber": "DRAFT-1"},
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(joined.status_code, 200, joined.get_json())
+
+        created_assignment = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/assignments/direct",
+            data={
+                "title": "待删除草稿",
+                "questions": json.dumps([{"order": 1, "question": "待删除题目", "referenceAnswer": "答案", "maxScore": 100}], ensure_ascii=False),
+                "sourceOrigin": "ocr",
+                "sourceText": "待删除题目",
+                "source_file": (io.BytesIO(b"%PDF-delete-draft"), "draft.pdf"),
+            },
+            content_type="multipart/form-data",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(created_assignment.status_code, 201, created_assignment.get_json())
+        assignment = created_assignment.get_json()["assignment"]
+        assignment_id = assignment["id"]
+        snapshot_id = assignment["snapshotId"]
+        source_dir = api_v2._EDUCATION_ASSIGNMENT_SOURCE_ROOT / assignment_id
+        work_dir = api_v2._EDUCATION_ROOT / "assignments" / assignment_id
+        snapshot_dir = api_v2._EDUCATION_SNAPSHOT_ROOT / snapshot_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "checkpoint.json").write_text("{}", encoding="utf-8")
+        (snapshot_dir / "artifact.json").write_text("{}", encoding="utf-8")
+        self.assertTrue(source_dir.is_dir())
+
+        student_delete = self.client.delete(
+            f"/api/v2/edu/assignments/{assignment_id}",
+            headers=self._headers(self.student),
+        )
+        self.assertIn(student_delete.status_code, (403, 404), student_delete.get_json())
+
+        deleted = self.client.delete(
+            f"/api/v2/edu/assignments/{assignment_id}",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.get_json())
+        self.assertEqual(deleted.get_json(), {"ok": True})
+
+        missing = self.client.get(
+            f"/api/v2/edu/assignments/{assignment_id}",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(missing.status_code, 404, missing.get_json())
+        assignments = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/assignments",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(assignments.status_code, 200, assignments.get_json())
+        self.assertNotIn(assignment_id, [item["id"] for item in assignments.get_json()["assignments"]])
+
+        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_snapshots WHERE id = ?", (snapshot_id,)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_assignment_sources WHERE assignment_id = ?", (assignment_id,)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_assessment_nodes WHERE assignment_id = ?", (assignment_id,)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_assessment_questions WHERE assignment_id = ?", (assignment_id,)).fetchone()[0], 0)
+        self.assertFalse(source_dir.exists())
+        self.assertFalse(work_dir.exists())
+        self.assertFalse(snapshot_dir.exists())
+
+        _graph_class, _graph_snapshot, graph_assignment = self._create_draft_assignment_with_assessments()
+        graph_delete = self.client.delete(
+            f"/api/v2/edu/assignments/{graph_assignment['id']}",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(graph_delete.status_code, 403, graph_delete.get_json())
+        graph_still_exists = self.client.get(
+            f"/api/v2/edu/assignments/{graph_assignment['id']}",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(graph_still_exists.status_code, 200, graph_still_exists.get_json())
+
+    def test_direct_assignment_input_edit_publish_student_flow_and_source_permissions(self):
+        created = self.client.post(
+            "/api/v2/edu/classes",
+            json={"title": "Direct assignment course"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        class_data = created.get_json()["class"]
+        joined = self.client.post(
+            f"/api/v2/edu/classes/{class_data['inviteCode']}/join",
+            json={"inviteCode": class_data["inviteCode"], "studentName": "Direct student", "studentNumber": "D001"},
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(joined.status_code, 200, joined.get_json())
+
+        questions = [
+            {"order": 2, "question": "第二题", "kind": "proof", "focus": "边界", "maxScore": 60},
+            {"order": 1, "question": "第一题", "kind": "calculation", "focus": "定义", "maxScore": 40},
+        ]
+        created_assignment = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/assignments/direct",
+            data={
+                "title": "直接题目作业",
+                "sourceOrigin": "ocr",
+                "sourceText": "第 1 题\n第一题\n第 2 题\n第二题",
+                "questions": json.dumps(questions, ensure_ascii=False),
+                "source_file": (io.BytesIO(b"%PDF-direct-source"), "questions.pdf"),
+            },
+            content_type="multipart/form-data",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(created_assignment.status_code, 201, created_assignment.get_json())
+        assignment = created_assignment.get_json()["assignment"]
+        self.assertEqual(assignment["assignmentType"], "direct")
+        self.assertEqual(assignment["directStructureVersion"], 1)
+        self.assertEqual(assignment["snapshot"]["snapshotType"], "direct")
+        self.assertEqual(assignment["source"]["origin"], "ocr")
+        self.assertTrue(assignment["source"]["hasOriginalFile"])
+        self.assertEqual(len(assignment["snapshot"]["nodes"]), 2)
+        self.assertEqual(len(assignment["snapshot"]["edges"]), 1)
+        self.assertEqual(len(assignment["path"]["steps"]), 2)
+        self.assertEqual([item["questionCount"] for item in assignment["assessments"]], [1, 1])
+        stable_node_ids = [step["nodeId"] for step in assignment["path"]["steps"]]
+        graph_snapshots = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(graph_snapshots.status_code, 200, graph_snapshots.get_json())
+        self.assertNotIn(assignment["snapshotId"], [item["id"] for item in graph_snapshots.get_json()["snapshots"]])
+
+        source = self.client.get(
+            f"/api/v2/edu/assignments/{assignment['id']}/source",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(source.status_code, 200)
+        self.assertEqual(source.data, b"%PDF-direct-source")
+        self.assertEqual(
+            self.client.get(
+                f"/api/v2/edu/assignments/{assignment['id']}/source",
+                headers=self._headers(self.student),
+            ).status_code,
+            403,
+        )
+
+        missing_reference = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(missing_reference.status_code, 409, missing_reference.get_json())
+        self.assertEqual(missing_reference.get_json()["code"], "assessment_scoring_required")
+
+        duplicate_order = self.client.patch(
+            f"/api/v2/edu/assignments/{assignment['id']}/direct-questions",
+            json={"questions": [{"order": 1, "question": "甲"}, {"order": 1, "question": "乙"}]},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(duplicate_order.status_code, 400)
+
+        updated = self.client.patch(
+            f"/api/v2/edu/assignments/{assignment['id']}/direct-questions",
+            json={"questions": [
+                {"nodeId": stable_node_ids[1], "order": 2, "question": "更新后的第二题", "kind": "proof", "focus": "证明", "referenceAnswer": "答案 2", "expectedPoints": ["点 2"], "maxScore": 60},
+                {"nodeId": stable_node_ids[0], "order": 1, "question": "更新后的第一题", "kind": "calculation", "focus": "计算", "referenceAnswer": "答案 1", "expectedPoints": ["点 1"], "maxScore": 40},
+            ]},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(updated.status_code, 200, updated.get_json())
+        updated_assignment = updated.get_json()["assignment"]
+        updated_questions = [assessment["questions"][0] for assessment in updated_assignment["assessments"]]
+        self.assertEqual([item["question"] for item in updated_questions], ["更新后的第一题", "更新后的第二题"])
+        self.assertEqual([step["nodeId"] for step in updated_assignment["path"]["steps"]], [stable_node_ids[0], stable_node_ids[1]])
+        self.assertEqual(sum(item["maxScore"] for item in updated_questions), 100)
+        self.assertEqual(updated_questions[0]["focus"], "计算")
+
+        inserted = self.client.patch(
+            f"/api/v2/edu/assignments/{assignment['id']}/direct-questions",
+            json={"questions": [
+                {"nodeId": stable_node_ids[1], "order": 1, "question": "顺序后的第二题", "referenceAnswer": "答案 A", "expectedPoints": [], "maxScore": 1},
+                {"nodeId": stable_node_ids[0], "order": 2, "question": "顺序后的第一题", "referenceAnswer": "答案 B", "expectedPoints": [], "maxScore": 1},
+                {"order": 3, "question": "新增第三题", "referenceAnswer": "答案 C", "expectedPoints": [], "maxScore": 1},
+            ]},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(inserted.status_code, 200, inserted.get_json())
+        inserted_assignment = inserted.get_json()["assignment"]
+        inserted_ids = [step["nodeId"] for step in inserted_assignment["path"]["steps"]]
+        self.assertEqual(inserted_ids[:2], [stable_node_ids[1], stable_node_ids[0]])
+        self.assertNotIn(inserted_ids[2], stable_node_ids)
+        self.assertEqual(len(inserted_assignment["snapshot"]["nodes"]), 3)
+        self.assertEqual(len(inserted_assignment["snapshot"]["edges"]), 2)
+        self.assertEqual(sum(question["questions"][0]["maxScore"] for question in inserted_assignment["assessments"]), 100)
+        self.assertTrue(all(question["questions"][0]["expectedPoints"] == [] for question in inserted_assignment["assessments"]))
+
+        first_question = inserted_assignment["assessments"][0]["questions"][0]
+        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+            connection.execute(
+                "UPDATE education_assessment_questions SET max_score = 10 WHERE id = ?",
+                (first_question["id"],),
+            )
+            connection.commit()
+        wrong_total = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(wrong_total.status_code, 409, wrong_total.get_json())
+        self.assertEqual(wrong_total.get_json()["code"], "assessment_scoring_required")
+        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+            connection.execute(
+                "UPDATE education_assessment_questions SET max_score = ? WHERE id = ?",
+                (first_question["maxScore"], first_question["id"]),
+            )
+            connection.commit()
+
+        published = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+
+        student_assignment = self.client.get(
+            f"/api/v2/edu/assignments/{assignment['id']}",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(student_assignment.status_code, 200, student_assignment.get_json())
+        student_payload = student_assignment.get_json()["assignment"]
+        self.assertEqual(student_payload["assignmentType"], "direct")
+        self.assertNotIn("source", student_payload)
+        self.assertEqual(student_payload["snapshot"].get("sourceMarkdown"), "")
+        self.assertNotIn("%PDF-direct-source", json.dumps(student_payload, ensure_ascii=False))
+
+        for node_id in inserted_ids:
+            started = self.client.post(
+                f"/api/v2/edu/assignments/{assignment['id']}/assessments/{node_id}/attempts",
+                headers=self._headers(self.student),
+            )
+            self.assertEqual(started.status_code, 201, started.get_json())
+            attempt = started.get_json()["attempt"]
+            self.assertEqual(len(attempt["questions"]), 1)
+            completed = self.client.post(
+                f"/api/v2/edu/assessment-attempts/{attempt['id']}/complete",
+                json={"answers": {question["id"]: "学生答案" for question in attempt["questions"]}},
+                headers=self._headers(self.student),
+            )
+            self.assertEqual(completed.status_code, 200, completed.get_json())
+        submitted = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/submissions",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(submitted.status_code, 201, submitted.get_json())
+        submission = submitted.get_json()["submission"]
+
+        captured_tasks = {}
+        def fake_grading_tasks(**kwargs):
+            captured_tasks.update(kwargs["tasks"])
+            return {
+                question_id: {
+                    "suggestedScore": round(task["maxScore"] * 0.8, 1),
+                    "maxScore": task["maxScore"],
+                    "rationale": "未配置评分点时仍依据参考答案评分",
+                    "correctPoints": [],
+                    "issues": [],
+                    "studentFeedback": "请继续完善解题过程。",
+                    "confidence": 0.8,
+                    "needsTeacherReview": False,
+                }
+                for question_id, task in kwargs["tasks"].items()
+            }
+
+        with patch.object(api_v2, "_education_ai_tasks", side_effect=fake_grading_tasks) as grading_tasks:
+            evaluated = self.client.post(
+                f"/api/v2/edu/submissions/{submission['id']}/evaluate",
+                headers=self._headers(self.teacher),
+            )
+        self.assertEqual(evaluated.status_code, 200, evaluated.get_json())
+        grading_tasks.assert_called_once()
+        self.assertTrue(captured_tasks)
+        self.assertTrue(all(task["expectedPoints"] == [] for task in captured_tasks.values()))
+
+        evaluated_submission = evaluated.get_json()["submission"]
+        publish_before_save = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/grades/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(publish_before_save.status_code, 409, publish_before_save.get_json())
+        self.assertEqual(publish_before_save.get_json()["code"], "grading_incomplete")
+
+        saved = self.client.patch(
+            f"/api/v2/edu/submissions/{submission['id']}/grade",
+            json={
+                "grades": [{"questionId": grade["questionId"], "teacherScore": grade["maxScore"], "teacherFeedback": "已保存草稿"} for grade in evaluated_submission["grades"]],
+                "teacherSummary": "草稿评语",
+            },
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(saved.status_code, 200, saved.get_json())
+        saved_submission = saved.get_json()["submission"]
+        self.assertEqual(saved_submission["status"], "review_draft")
+        self.assertEqual(saved_submission["teacherTotal"], 100)
+
+        revised = self.client.patch(
+            f"/api/v2/edu/submissions/{submission['id']}/grade",
+            json={
+                "grades": [{"questionId": grade["questionId"], "teacherScore": 0 if index == 0 else grade["maxScore"], "teacherFeedback": "已修改草稿"} for index, grade in enumerate(saved_submission["grades"])],
+                "teacherSummary": "修改后的草稿评语",
+            },
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(revised.status_code, 200, revised.get_json())
+        self.assertEqual(revised.get_json()["submission"]["status"], "review_draft")
+
+        grading_overview = self.client.get(
+            f"/api/v2/edu/assignments/{assignment['id']}/grading-overview",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(grading_overview.status_code, 200, grading_overview.get_json())
+        self.assertTrue(grading_overview.get_json()["canPublish"])
+        released = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/grades/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(released.status_code, 200, released.get_json())
+
+    def test_class_statistics_matrix_and_xlsx_export(self):
+        class_data, _snapshot, assignment = self._create_draft_assignment_with_assessments()
+        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+            connection.execute("UPDATE education_assignments SET assignment_type = 'direct' WHERE id = ?", (assignment["id"],))
+            connection.commit()
+        published = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        self._complete_all_assignment_assessments(assignment)
+        submitted = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/submissions",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(submitted.status_code, 201, submitted.get_json())
+        submission_id = submitted.get_json()["submission"]["id"]
+
+        single = self.client.get(
+            f"/api/v2/edu/assignments/{assignment['id']}/statistics",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(single.status_code, 200, single.get_json())
+        self.assertEqual(single.get_json()["assignmentId"], assignment["id"])
+        self.assertNotIn("classTitle", single.get_json())
+
+        student_forbidden = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/statistics",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(student_forbidden.status_code, 403, student_forbidden.get_json())
+
+        pending = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/statistics",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(pending.status_code, 200, pending.get_json())
+        pending_payload = pending.get_json()
+        self.assertEqual(len(pending_payload["assignments"]), 1)
+        self.assertEqual(pending_payload["assignments"][0]["questionCount"], 12)
+        self.assertEqual(pending_payload["students"][0]["assignments"][assignment["id"]]["status"], "submitted")
+        self.assertIsNone(pending_payload["students"][0]["averageScore"])
+        student_id = pending_payload["students"][0]["userId"]
+
+        pending_student_export = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/students/{student_id}/statistics/export",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(pending_student_export.status_code, 200, pending_student_export.get_json())
+        with zipfile.ZipFile(io.BytesIO(pending_student_export.data)) as workbook:
+            student_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            self.assertIn("Assessment student", student_sheet)
+            self.assertIn("A001", student_sheet)
+            self.assertIn("待批改", student_sheet)
+
+        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+            connection.execute("UPDATE education_assignment_submissions SET status = 'review_draft' WHERE id = ?", (submission_id,))
+            connection.commit()
+        review_draft = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/statistics",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(review_draft.status_code, 200, review_draft.get_json())
+        self.assertEqual(review_draft.get_json()["students"][0]["assignments"][assignment["id"]]["status"], "review_draft")
+
+        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+            connection.execute(
+                "UPDATE education_assignment_submissions SET status = 'finalized', teacher_total = 85 WHERE id = ?",
+                (submission_id,),
+            )
+            connection.commit()
+        finalized = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/statistics",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(finalized.status_code, 200, finalized.get_json())
+        payload = finalized.get_json()
+        self.assertEqual(payload["overview"]["finalizedStudents"], 1)
+        self.assertEqual(payload["students"][0]["averageScore"], 85.0)
+        self.assertEqual(payload["students"][0]["rank"], 1)
+        self.assertEqual(payload["students"][0]["assignments"][assignment["id"]]["score"], 85.0)
+
+        student_export = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/students/{student_id}/statistics/export",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(student_export.status_code, 200, student_export.get_json())
+        self.assertIn("A001", student_export.headers.get("Content-Disposition", ""))
+        with zipfile.ZipFile(io.BytesIO(student_export.data)) as workbook:
+            self.assertIn("xl/worksheets/sheet1.xml", workbook.namelist())
+            workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
+            self.assertIn("学生成绩", workbook_xml)
+            student_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            self.assertIn("Assessment task", student_sheet)
+            self.assertIn("85.0", student_sheet)
+
+        student_forbidden_export = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/students/{student_id}/statistics/export",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(student_forbidden_export.status_code, 403, student_forbidden_export.get_json())
+
+        missing_student_export = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/students/999999/statistics/export",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(missing_student_export.status_code, 404, missing_student_export.get_json())
+
+        exported = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/statistics/export",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(exported.status_code, 200, exported.get_json())
+        content_disposition = exported.headers.get("Content-Disposition", "")
+        self.assertIn(".xlsx", content_disposition)
+        self.assertRegex(content_disposition, r"\d{4}-\d{2}-\d{2}")
+        with zipfile.ZipFile(io.BytesIO(exported.data)) as workbook:
+            self.assertIn("xl/worksheets/sheet1.xml", workbook.namelist())
+            self.assertIn("xl/worksheets/sheet2.xml", workbook.namelist())
+            workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
+            self.assertIn("班级成绩总表", workbook_xml)
+            self.assertIn("作业汇总", workbook_xml)
+            sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            self.assertIn("Assessment task", sheet)
+            self.assertIn("85.0", sheet)
+            assignment_sheet = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
+            self.assertIn("Assessment task", assignment_sheet)
+
+        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+            connection.execute(
+                "UPDATE education_memberships SET removed_at = CURRENT_TIMESTAMP WHERE class_id = ? AND user_id = ?",
+                (class_data["id"], student_id),
+            )
+            connection.commit()
+        removed_student_export = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/students/{student_id}/statistics/export",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(removed_student_export.status_code, 404, removed_student_export.get_json())
 
 
 if __name__ == "__main__":

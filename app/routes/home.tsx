@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { Link, useSearchParams } from "react-router";
-import { useJobs, type JobErrorCode, type RestoredJob } from "~/context/jobs";
+import { Link, useNavigate, useSearchParams } from "react-router";
+import { useJobs, type BackgroundJob, type JobErrorCode, type RestoredJob } from "~/context/jobs";
 import { FloatingBadge } from "~/components/FloatingBadge";
 import { ApiSetupGuide, type ApiGuideStep } from "~/components/ApiSetupGuide";
 import { apiUrl } from "~/api";
 import {
   cancelOcrJob,
   cancelOcrInstall,
+  dedupeOcrRecoveryJobs,
   classifyOcrRuntime,
   deleteOcrRecovery,
   getOcrRecovery,
@@ -43,6 +44,9 @@ import {
 } from "./education";
 import { loadStudioSettings, resolveTheme } from "./studio-graph";
 import { ProofWorkspace } from "./ProofWorkspace";
+import { DirectAssignmentWorkspace, type DirectAssignmentWorkspaceMode } from "./DirectAssignmentWorkspace";
+import { EducationAssignmentStatistics } from "./EducationAssignmentStatistics";
+import { EducationClassStatistics } from "./EducationClassStatistics";
 import { MatrixFlowText } from "./matrix-flow/MatrixFlowViewer";
 import type { MatrixFlow } from "./matrix-flow/types";
 import { nodeTypeLabel } from "./node-type-language";
@@ -59,7 +63,7 @@ import { AuthModal } from "./AuthModal";
 import { HistoryPanel } from "./HistoryPanel";
 import {
   Columns2, LayoutGrid, PanelRightOpen,
-  GitBranch, Layers, AlignJustify, BookText,
+  GitBranch, Layers, BookText,
   History, Upload, Maximize2, Eye, Settings, CircleHelp, Sparkles, ArrowRight,
   LogOut, Loader2, Focus, MessageSquare, FileText, Download, Home as HomeIcon,
   GraduationCap, X,
@@ -72,6 +76,10 @@ export type WorkspaceMode = "generate" | "import";
 export type EducationWorkspaceMode = "course" | "create";
 export type AuthMode = "login" | "register";
 export type EducationRole = "teacher" | "student";
+
+export function canUseAutonomousWorkspace(role?: EducationRole | null) {
+  return role !== "student";
+}
 type ViewMode = "graph" | "hierarchical" | "linear" | "docorder";
 type ResultLayout = "md-graph" | "full-graph" | "graph-node";
 
@@ -193,6 +201,13 @@ interface WorkspaceSnapshot {
   sourceMarkdown?: string;
   errorInfo: ErrorInfo | null;
   filename: string;
+}
+
+export function isRetriedJobError(
+  snapshot: Pick<WorkspaceSnapshot, "view" | "jobId">,
+  job: Pick<BackgroundJob, "id" | "phase">,
+) {
+  return snapshot.view === "error" && snapshot.jobId === job.id && job.phase === "running";
 }
 
 export interface HistoryItem {
@@ -517,34 +532,47 @@ const EDUCATION_WORKSPACE_MODES: Array<{
 ];
 
 function EducationWorkspaceSwitch({
-  mode, onChange, isGenerating = false,
+  mode, educationRole, onChange, isGenerating = false,
 }: {
   mode: EducationWorkspaceMode;
+  educationRole?: EducationRole | null;
   onChange: (mode: EducationWorkspaceMode) => void;
   isGenerating?: boolean;
 }) {
+  const visibleModes = canUseAutonomousWorkspace(educationRole)
+    ? EDUCATION_WORKSPACE_MODES
+    : EDUCATION_WORKSPACE_MODES.filter(({ mode: item }) => item === "course");
+
   return (
-    <div className="mg-workspace-switch" role="tablist" aria-label="教育版工作区">
-      <Link className="mg-home-link" to="/" title="返回首页介绍" aria-label="返回首页介绍">
-        <HomeIcon size={14} />
-      </Link>
-      {EDUCATION_WORKSPACE_MODES.map(({ mode: item, label, compactLabel, title, Icon }) => (
-        <button
-          key={item}
-          type="button"
-          role="tab"
-          aria-selected={mode === item}
-          title={title}
-          className={mode === item ? "active" : ""}
-          onClick={() => onChange(item)}
-        >
-          {item === "create" && isGenerating
-            ? <Loader2 className="mg-workspace-switch-spinner" size={14} />
-            : <Icon size={14} />}
-          <span className="mg-workspace-label-full">{label}</span>
-          <span className="mg-workspace-label-compact">{compactLabel}</span>
-        </button>
-      ))}
+    <div className="mg-workspace-switch-group">
+      <div className="mg-workspace-switch" role="tablist" aria-label="教育版工作区">
+        <Link className="mg-home-link" to="/" title="返回首页介绍" aria-label="返回首页介绍">
+          <HomeIcon size={14} />
+        </Link>
+        {visibleModes.map(({ mode: item, label, compactLabel, title, Icon }) => (
+          <button
+            key={item}
+            type="button"
+            role="tab"
+            aria-selected={mode === item}
+            title={title}
+            className={mode === item ? "active" : ""}
+            onClick={() => onChange(item)}
+          >
+            {item === "create" && isGenerating
+              ? <Loader2 className="mg-workspace-switch-spinner" size={14} />
+              : <Icon size={14} />}
+            <span className="mg-workspace-label-full">{label}</span>
+            <span className="mg-workspace-label-compact">{compactLabel}</span>
+          </button>
+        ))}
+      </div>
+      {educationRole && (
+        <span className={`mg-workspace-role-badge ${educationRole}`}>
+          <span className="mg-workspace-role-dot" />
+          {educationRole === "teacher" ? "教师端" : "学生端"}
+        </span>
+      )}
     </div>
   );
 }
@@ -553,7 +581,7 @@ function EducationWorkspaceSwitch({
 
 export interface AuthModalProps {
   onAuth: (token: string, email: string, educationRole?: EducationRole | null, canTeach?: boolean) => void;
-  onSkip: () => void;
+  onSkip?: () => void;
 }
 
 // ── History Panel ─────────────────────────────────────────────────────────────
@@ -599,6 +627,7 @@ function UploadScreen({
   const [recoveryJobs, setRecoveryJobs] = useState<OcrJobStatus[]>([]);
   const [ocrUploadProgress, setOcrUploadProgress] = useState<number | null>(null);
   const ocrAbortRef = useRef<AbortController | null>(null);
+  const recoveryFileRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadLocked = Boolean(activeFilename);
   const displayedFilename = activeFilename || file?.name || "";
@@ -616,20 +645,20 @@ function UploadScreen({
   useEffect(() => {
     let active = true;
     void getOcrRecovery().then((response) => {
-      if (active) setRecoveryJobs(response.jobs || []);
+      if (active) setRecoveryJobs(dedupeOcrRecoveryJobs(response.jobs || []));
     }).catch(() => undefined);
     return () => { active = false; };
   }, []);
 
-  const isSupportedFile = (candidate: File) => /\.(md|txt|tex|pdf)$/i.test(candidate.name);
-  const isPdfFile = (candidate: File) => /\.pdf$/i.test(candidate.name);
+  const isSupportedFile = (candidate: File) => /\.(md|txt|tex|pdf|png|jpg|jpeg|webp)$/i.test(candidate.name);
+  const isOcrFile = (candidate: File) => /\.(pdf|png|jpg|jpeg|webp)$/i.test(candidate.name);
   const getOcrMarkdownFilename = (sourceFilename: string) => {
     const stem = sourceFilename.replace(/\.[^.]+$/, "") || "ocr-result";
     return `${stem}_ocr.md`;
   };
   const preparePdf = useCallback(async (candidate: File) => {
     if (candidate.size > 100 * 1024 * 1024) {
-      setErr("PDF 文件不能超过 100MB");
+      setErr("OCR 文件不能超过 100MB");
       return null;
     }
     ocrAbortRef.current?.abort();
@@ -647,7 +676,7 @@ function UploadScreen({
       return uploaded;
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
-        setErr(error instanceof Error ? error.message : "PDF 预检上传失败");
+        setErr(error instanceof Error ? error.message : "OCR 预检上传失败");
       }
       setOcrUpload(null);
       setOcrRuntime(null);
@@ -665,12 +694,13 @@ function UploadScreen({
     if (submitPhase || uploadLocked) return;
     const f = e.dataTransfer.files?.[0];
     if (f && isSupportedFile(f)) {
+      recoveryFileRef.current = false;
       setErr("");
       setFile(f);
-      if (isPdfFile(f)) void preparePdf(f);
+      if (isOcrFile(f)) void preparePdf(f);
       else { setOcrUpload(null); setOcrRuntime(null); setOcrJob(null); setOcrPreview(null); }
     } else {
-      setErr("请上传 PDF (.pdf)、Markdown (.md)、TeX (.tex) 或纯文本 (.txt) 文件");
+      setErr("请上传 PDF/PNG/JPG/WEBP OCR 文件，或 Markdown (.md)、TeX (.tex)、纯文本 (.txt) 文件");
     }
   }, [preparePdf, submitPhase, uploadLocked]);
 
@@ -679,12 +709,13 @@ function UploadScreen({
     const f = e.target.files?.[0];
     if (!f) return;
     if (!isSupportedFile(f)) {
-      setErr("请上传 PDF (.pdf)、Markdown (.md)、TeX (.tex) 或纯文本 (.txt) 文件");
+      setErr("请上传 PDF/PNG/JPG/WEBP OCR 文件，或 Markdown (.md)、TeX (.tex)、纯文本 (.txt) 文件");
       return;
     }
+    recoveryFileRef.current = false;
     setErr("");
     setFile(f);
-    if (isPdfFile(f)) void preparePdf(f);
+    if (isOcrFile(f)) void preparePdf(f);
     else { setOcrUpload(null); setOcrRuntime(null); setOcrJob(null); setOcrPreview(null); }
   };
 
@@ -695,13 +726,13 @@ function UploadScreen({
     const hasText = textInput.trim().length > 0;
 
     if (!hasFile && !hasText) { setErr("请选择文件或输入文本"); return; }
-    if (!ocrPreview && !(file && isPdfFile(file)) && (!llm.api_url || !llm.model_name || !llm.api_key)) {
+    if (!ocrPreview && !(file && isOcrFile(file)) && (!llm.api_url || !llm.model_name || !llm.api_key)) {
       setErr("LLM 配置尚未完成，可使用新手向导逐步填写。");
       setConfigOpen(true);
       onShowApiGuide("chat");
       return;
     }
-    if (!ocrPreview && !(file && isPdfFile(file)) && !llm.embedding_model.trim()) {
+    if (!ocrPreview && !(file && isOcrFile(file)) && !llm.embedding_model.trim()) {
       setErr("Embedding 配置尚未完成，可使用新手向导逐步填写。");
       setConfigOpen(true);
       onShowApiGuide("embedding");
@@ -720,6 +751,7 @@ function UploadScreen({
         const generatedFile = new File([ocrPreview], generatedFilename, { type: "text/markdown" });
         filename = generatedFile.name;
         content = ocrPreview;
+        recoveryFileRef.current = false;
         setFile(generatedFile);
         setTextInput("");
         setOcrPreview(null);
@@ -727,14 +759,14 @@ function UploadScreen({
         setOcrRuntime(null);
         setOcrJob(null);
       }
-      if (file && !(isPdfFile(file) && ocrPreview?.trim())) {
+      if (file && !(isOcrFile(file) && ocrPreview?.trim())) {
         filename = file.name;
-        if (isPdfFile(file)) {
+        if (isOcrFile(file)) {
           let uploaded = ocrUpload;
           if (!uploaded || uploaded.filename !== file.name || uploaded.size_bytes !== file.size) {
             uploaded = await preparePdf(file);
             if (!uploaded) return;
-            setErr("PDF 预检完成。请再次点击“开始分析”以启动 OCR。");
+            setErr("OCR 预检完成。请再次点击“开始分析”以启动 OCR。");
             return;
           }
           let runtime = ocrRuntime || await getOcrRuntime();
@@ -756,7 +788,7 @@ function UploadScreen({
           await pollOcrJob(job.ocr_job_id, setOcrJob, ocrAbortRef.current?.signal);
           const data = await getOcrResult(job.ocr_job_id, ocrAbortRef.current?.signal);
           content = data.importedText;
-          if (!content.trim()) throw new Error("PDF OCR 未识别出可处理的文本");
+          if (!content.trim()) throw new Error("OCR 未识别出可处理的文本");
           setOcrPreview(content);
           setErr("");
           return;
@@ -766,8 +798,8 @@ function UploadScreen({
       }
 
       if (!isLlmComplete) {
-        setErr(file && isPdfFile(file)
-          ? "PDF OCR 已完成，Markdown 已保留；补充 LLM 与 Embedding 配置后再开始分析。"
+        setErr(file && isOcrFile(file)
+          ? "OCR 已完成，Markdown 已保留；补充 LLM 与 Embedding 配置后再开始分析。"
           : "LLM 与 Embedding 配置尚未完成，请先补充配置。" );
         setConfigOpen(true);
         onShowApiGuide("chat");
@@ -800,22 +832,42 @@ function UploadScreen({
     ocrAbortRef.current = null;
     setSubmitPhase(null);
     setOcrJob(null);
+    if (recoveryFileRef.current) setFile(null);
+    recoveryFileRef.current = false;
     setErr("OCR 已取消，原始上传仍可在 24 小时内重试。");
   };
 
   const handleRecoveryRetry = async (recovery: OcrJobStatus) => {
+    if (submitPhase || uploadLocked) return;
+    const controller = new AbortController();
+    ocrAbortRef.current = controller;
+    setErr("");
+    setOcrPreview(null);
+    setTextInput("");
+    setOcrUpload(null);
+    setOcrRuntime(null);
+    setOcrJob(null);
+    recoveryFileRef.current = true;
+    setFile(new File([], recovery.filename, { type: "application/octet-stream" }));
+    setSubmitPhase("ocr");
     try {
-      const job = await retryOcrJob(recovery.ocr_job_id);
+      const job = await retryOcrJob(recovery.ocr_job_id, controller.signal);
       setOcrJob(job);
-      await pollOcrJob(job.ocr_job_id, setOcrJob);
-      const result = await getOcrResult(job.ocr_job_id);
+      await pollOcrJob(job.ocr_job_id, setOcrJob, controller.signal);
+      const result = await getOcrResult(job.ocr_job_id, controller.signal);
       setOcrPreview(result.importedText);
       setTextInput(result.importedText);
-      setFile(null);
       setErr("已恢复 OCR 结果；请检查预览并补充配置后开始分析。");
-      setRecoveryJobs((items) => items.filter((item) => item.ocr_job_id !== recovery.ocr_job_id));
+      setRecoveryJobs((items) => items.filter((item) => item.upload_id !== recovery.upload_id));
     } catch (error) {
-      setErr(error instanceof Error ? error.message : "恢复 OCR 失败");
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        recoveryFileRef.current = false;
+        setFile(null);
+        setErr(error instanceof Error ? error.message : "恢复 OCR 失败");
+      }
+    } finally {
+      if (ocrAbortRef.current === controller) ocrAbortRef.current = null;
+      setSubmitPhase(null);
     }
   };
 
@@ -834,6 +886,7 @@ function UploadScreen({
   };
 
   const handleCancelOcrPreview = () => {
+    recoveryFileRef.current = false;
     setOcrPreview(null);
     setOcrJob(null);
     setOcrUpload(null);
@@ -890,15 +943,15 @@ function UploadScreen({
               </span>
             ) : (
               <>
-                <div className="mg-dropzone-primary">拖拽 PDF / Markdown / TeX 文件至此，或点击选择</div>
-                <div className="mg-dropzone-sub">.pdf · .md · .tex · .txt</div>
+                <div className="mg-dropzone-primary">拖拽 PDF / 图片 / Markdown / TeX 文件至此，或点击选择</div>
+                <div className="mg-dropzone-sub">.pdf · .png · .jpg · .webp · .md · .tex · .txt</div>
               </>
             )}
           </div>
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf,.md,.tex,.txt,application/pdf,text/markdown,text/plain,text/x-tex,application/x-tex"
+            accept=".pdf,.png,.jpg,.jpeg,.webp,.md,.tex,.txt,application/pdf,image/png,image/jpeg,image/webp,text/markdown,text/plain,text/x-tex,application/x-tex"
             onChange={handleFileChange}
             disabled={!!submitPhase || uploadLocked}
             style={{ display: "none" }}
@@ -1022,16 +1075,16 @@ function UploadScreen({
               {recoveryJobs.map((recovery) => (
                 <div key={recovery.ocr_job_id} style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 5 }}>
                   <span style={{ flex: 1 }}>{recovery.filename} · {recovery.page_count} 页</span>
-                  <button className="mg-btn mg-btn-ghost" onClick={() => void handleRecoveryRetry(recovery)}>重试</button>
-                  <button className="mg-btn mg-btn-ghost" onClick={() => void deleteOcrRecovery(recovery.ocr_job_id).then(() => setRecoveryJobs((items) => items.filter((item) => item.ocr_job_id !== recovery.ocr_job_id))).catch(() => undefined)}>清理</button>
+                  <button className="mg-btn mg-btn-ghost" disabled={Boolean(submitPhase) || uploadLocked} onClick={() => void handleRecoveryRetry(recovery)}>重试</button>
+                  <button className="mg-btn mg-btn-ghost" onClick={() => void deleteOcrRecovery(recovery.ocr_job_id).then(() => setRecoveryJobs((items) => items.filter((item) => item.upload_id !== recovery.upload_id))).catch(() => undefined)}>清理</button>
                 </div>
               ))}
             </div>
           )}
 
-          {!ocrPreview && file && isPdfFile(file) && (ocrUpload || ocrRuntime) && (
+          {!ocrPreview && file && isOcrFile(file) && (ocrUpload || ocrRuntime) && (
             <div style={{ marginTop: 10, padding: "9px 11px", border: "1px solid var(--line)", borderRadius: 8, fontSize: 12, color: "var(--muted)" }}>
-              <div>PDF 预检：{ocrUpload ? `${(ocrUpload.size_bytes / 1024 / 1024).toFixed(1)}MB · ${ocrUpload.page_count} 页` : "上传中…"}</div>
+              <div>OCR 预检：{ocrUpload ? `${(ocrUpload.size_bytes / 1024 / 1024).toFixed(1)}MB · ${ocrUpload.page_count} 页` : "上传中…"}</div>
               <div>OCR 组件：{ocrRuntime?.state || "检查中"}{ocrRuntime?.total_bytes ? ` · 下载约 ${(ocrRuntime.total_bytes / 1024 / 1024 / 1024).toFixed(1)}GB` : ""}{ocrRuntime?.required_disk_bytes ? ` · 需要约 ${(ocrRuntime.required_disk_bytes / 1024 / 1024 / 1024).toFixed(1)}GB` : ""}{ocrRuntime?.available_disk_bytes ? ` · 可用 ${(ocrRuntime.available_disk_bytes / 1024 / 1024 / 1024).toFixed(1)}GB` : ""}</div>
               {ocrRuntime && (
                 <OcrRuntimeErrorPanel
@@ -1085,7 +1138,7 @@ function UploadScreen({
               disabled={!!submitPhase || uploadLocked || (Boolean(ocrUpload) && ocrBlocked)}
               style={{ marginTop: 14, borderRadius: 10, padding: "12px", fontSize: 14, letterSpacing: ".01em" }}
             >
-              {uploadLocked ? "正在处理中…" : submitPhase === "uploading" ? "正在上传并预检 PDF…" : submitPhase === "installing" ? "正在安装 OCR 组件…" : submitPhase === "ocr" ? "正在识别 PDF…" : submitPhase === "generate" ? "正在提交分析…" : ocrRetryableError ? "重试下载并开始 OCR" : ocrUpload ? "确认并开始 PDF OCR" : "开始分析"}
+              {uploadLocked ? "正在处理中…" : submitPhase === "uploading" ? "正在上传并预检文件…" : submitPhase === "installing" ? "正在安装 OCR 组件…" : submitPhase === "ocr" ? "正在识别题目…" : submitPhase === "generate" ? "正在提交分析…" : ocrRetryableError ? "重试下载并开始 OCR" : ocrUpload ? "确认并开始 OCR" : "开始分析"}
             </button>
           )}
           {submitPhase && <button className="mg-btn mg-btn-ghost mg-ocr-cancel-button" style={{ width: "100%", margin: "7px 0 0" }} onClick={() => void handleCancel()}>取消</button>}
@@ -2795,6 +2848,7 @@ function SettingsModal({
 
 export default function Home() {
   const { jobs, latestJobId, startJob, resumeJob } = useJobs();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedGuideStep = searchParams.get("step");
   const guideStep: ApiGuideStep = (
@@ -2807,9 +2861,10 @@ export default function Home() {
   // URL so those links never fall back to the autonomous upload screen.
   const requestedAssignmentId = searchParams.get("assignment");
   const requestedCourseGraphId = searchParams.get("courseGraph");
-  const educationRequested = searchParams.get("edu") === "hub" || Boolean(requestedAssignmentId) || Boolean(requestedCourseGraphId);
-  const educationWorkspaceMode: EducationWorkspaceMode = educationRequested ? "course" : "create";
-  const showApiGuide = !educationRequested && searchParams.get("guide") === "api-setup";
+  const requestedDirectCreateClassId = searchParams.get("directCreate");
+  const requestedClassStatisticsId = searchParams.get("classStatistics");
+  const requestedAssignmentView = searchParams.get("assignmentView");
+  const educationRouteRequested = searchParams.get("edu") === "hub" || Boolean(requestedAssignmentId) || Boolean(requestedCourseGraphId) || Boolean(requestedDirectCreateClassId) || Boolean(requestedClassStatisticsId);
 
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("generate");
   const [view, setView] = useState<View>("upload");
@@ -2865,13 +2920,69 @@ export default function Home() {
   const [courseImportBusy, setCourseImportBusy] = useState(false);
   const [courseImportError, setCourseImportError] = useState("");
   const [educationEntryNotice, setEducationEntryNotice] = useState<string | null>(null);
-  const setEducationLocation = useCallback((assignmentId?: string | null) => {
+  const studentCourseOnly = configReady && auth?.educationRole === "student";
+  const educationRequested = educationRouteRequested || studentCourseOnly;
+  const educationWorkspaceMode: EducationWorkspaceMode = educationRequested ? "course" : "create";
+  const directWorkspaceLoading = Boolean(requestedAssignmentId) && educationLoading && !educationAssignment;
+  const showEducationWorkspaceSwitch = !requestedDirectCreateClassId
+    && !requestedClassStatisticsId
+    && !directWorkspaceLoading
+    && educationAssignment?.assignmentType !== "direct";
+  const showApiGuide = !educationRequested && searchParams.get("guide") === "api-setup";
+  const setEducationLocation = useCallback((assignmentId?: string | null, assignmentView?: "edit" | "statistics") => {
     setSearchParams((current) => {
       const next = new URLSearchParams(current);
       next.set("edu", "hub");
       if (assignmentId) next.set("assignment", assignmentId);
       else next.delete("assignment");
       next.delete("courseGraph");
+      next.delete("directCreate");
+      next.delete("classStatistics");
+      if (assignmentView) next.set("assignmentView", assignmentView);
+      else next.delete("assignmentView");
+      return next;
+    });
+  }, [setSearchParams]);
+  const setEducationClassStatisticsLocation = useCallback((classId?: string | null) => {
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current);
+      next.set("edu", "hub");
+      next.delete("assignment");
+      next.delete("courseGraph");
+      next.delete("classStatistics");
+      next.delete("directCreate");
+      next.delete("assignmentView");
+      if (classId) next.set("classStatistics", classId);
+      else next.delete("classStatistics");
+      return next;
+    });
+  }, [setSearchParams]);
+  const setDirectCreateLocation = useCallback((classId?: string | null) => {
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current);
+      next.set("edu", "hub");
+      next.delete("assignment");
+      next.delete("courseGraph");
+      if (classId) next.set("directCreate", classId);
+      else next.delete("directCreate");
+      next.delete("assignmentView");
+      return next;
+    });
+  }, [setSearchParams]);
+  const setDirectAssignmentGradingLocation = useCallback((assignmentId?: string | null) => {
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current);
+      next.set("edu", "hub");
+      next.delete("courseGraph");
+      next.delete("directCreate");
+      next.delete("classStatistics");
+      if (assignmentId) {
+        next.set("assignment", assignmentId);
+        next.set("assignmentView", "grading");
+      } else {
+        next.delete("assignment");
+        next.delete("assignmentView");
+      }
       return next;
     });
   }, [setSearchParams]);
@@ -2880,11 +2991,17 @@ export default function Home() {
       const next = new URLSearchParams(current);
       next.set("edu", "hub");
       next.delete("assignment");
+      next.delete("directCreate");
+      next.delete("assignmentView");
       if (snapshotId) next.set("courseGraph", snapshotId);
       else next.delete("courseGraph");
       return next;
     });
   }, [setSearchParams]);
+  useEffect(() => {
+    if (!studentCourseOnly || educationRouteRequested) return;
+    setEducationLocation(null);
+  }, [educationRouteRequested, setEducationLocation, studentCourseOnly]);
   const closeEducation = useCallback(() => {
     setEducationAssignment(null);
     setEducationCourseGraph(null);
@@ -2900,6 +3017,9 @@ export default function Home() {
       next.delete("edu");
       next.delete("assignment");
       next.delete("courseGraph");
+      next.delete("classStatistics");
+      next.delete("directCreate");
+      next.delete("assignmentView");
       return next;
     });
   }, [setSearchParams]);
@@ -2915,6 +3035,10 @@ export default function Home() {
     setEducationDraftDirty(false);
     setEducationLocation(null);
   }, [setEducationLocation]);
+  const leaveEducationWorkspace = useCallback((classId?: string | null) => {
+    if (educationDraftDirty && !window.confirm("当前作业有未保存修改，确定离开吗？")) return;
+    returnToEducationHub(classId);
+  }, [educationDraftDirty, returnToEducationHub]);
   const openEducation = useCallback((target?: GraphNode | null) => {
     if (target) setEducationTarget(target);
     setEducationTargetCourseGraphId(null);
@@ -2925,15 +3049,51 @@ export default function Home() {
     setEducationLocation(null);
     if (!auth || !auth.educationRole) setShowAuthModal(true);
   }, [auth, setEducationLocation]);
-  const openEducationAssignment = useCallback((assignmentId: string) => {
+  const openEducationAssignment = useCallback((assignmentId: string, assignmentView?: "edit") => {
     setEducationAssignment(null);
     setEducationCourseGraph(null);
     setEducationError("");
     setEducationProfileClassId(null);
     setEducationResumeTarget(null);
-    setEducationLocation(assignmentId);
+    setEducationLocation(assignmentId, assignmentView);
     if (!auth || !auth.educationRole) setShowAuthModal(true);
   }, [auth, setEducationLocation]);
+  const openDirectAssignmentCreate = useCallback((classId: string) => {
+    setEducationAssignment(null);
+    setEducationCourseGraph(null);
+    setEducationError("");
+    setEducationProfileClassId(null);
+    setEducationResumeTarget(null);
+    setDirectCreateLocation(classId);
+    if (!auth || auth.educationRole !== "teacher") setShowAuthModal(true);
+  }, [auth, setDirectCreateLocation]);
+  const openAssignmentStatistics = useCallback((assignmentId: string) => {
+    setEducationAssignment(null);
+    setEducationCourseGraph(null);
+    setEducationError("");
+    setEducationProfileClassId(null);
+    setEducationResumeTarget(null);
+    setEducationLocation(assignmentId, "statistics");
+    if (!auth || auth.educationRole !== "teacher") setShowAuthModal(true);
+  }, [auth, setEducationLocation]);
+  const openClassStatistics = useCallback((classId: string) => {
+    setEducationAssignment(null);
+    setEducationCourseGraph(null);
+    setEducationError("");
+    setEducationProfileClassId(null);
+    setEducationResumeTarget(null);
+    setEducationClassStatisticsLocation(classId);
+    if (!auth || auth.educationRole !== "teacher") setShowAuthModal(true);
+  }, [auth, setEducationClassStatisticsLocation]);
+  const openDirectAssignmentGrading = useCallback((assignmentId: string) => {
+    setEducationAssignment(null);
+    setEducationCourseGraph(null);
+    setEducationError("");
+    setEducationProfileClassId(null);
+    setEducationResumeTarget(null);
+    setDirectAssignmentGradingLocation(assignmentId);
+    if (!auth || auth.educationRole !== "teacher") setShowAuthModal(true);
+  }, [auth, setDirectAssignmentGradingLocation]);
   const openEducationCourseGraph = useCallback((snapshotId: string) => {
     setEducationAssignment(null);
     setEducationCourseGraph(null);
@@ -3124,6 +3284,14 @@ export default function Home() {
       return;
     }
     setShowAuthModal(false);
+    if (requestedDirectCreateClassId && auth.educationRole !== "teacher") {
+      setEducationLocation(null);
+      return;
+    }
+    if (requestedClassStatisticsId && auth.educationRole !== "teacher") {
+      setEducationClassStatisticsLocation(null);
+      return;
+    }
     if (!requestedAssignmentId && !requestedCourseGraphId) {
       setEducationAssignment(null);
       setEducationCourseGraph(null);
@@ -3156,7 +3324,7 @@ export default function Home() {
       })
       .finally(() => { if (!cancelled) setEducationLoading(false); });
     return () => { cancelled = true; };
-  }, [auth, configReady, educationRequested, requestedAssignmentId, requestedCourseGraphId, setEducationLocation]);
+  }, [auth, configReady, educationRequested, requestedAssignmentId, requestedClassStatisticsId, requestedCourseGraphId, setEducationClassStatisticsLocation, setEducationLocation]);
 
   // The classic result screen saves history itself. Studio bypasses that screen,
   // so persist every logged-in Studio result here for both workspace entries.
@@ -3209,6 +3377,10 @@ export default function Home() {
 
   const switchEducationMode = useCallback((nextMode: EducationWorkspaceMode) => {
     if (nextMode === educationWorkspaceMode) return;
+    if (!canUseAutonomousWorkspace(auth?.educationRole) && nextMode === "create") {
+      openEducation();
+      return;
+    }
     if (nextMode === "course") {
       openEducation();
       return;
@@ -3219,7 +3391,7 @@ export default function Home() {
     activeWorkspaceModeRef.current = "generate";
     setWorkspaceMode("generate");
     applySnapshot(workspaceStates.current.generate);
-  }, [applySnapshot, closeEducation, educationDraftDirty, educationWorkspaceMode, openEducation]);
+  }, [applySnapshot, auth?.educationRole, closeEducation, educationDraftDirty, educationWorkspaceMode, openEducation]);
 
   // Restore the most recent result for both modes.
   useEffect(() => {
@@ -3244,11 +3416,23 @@ export default function Home() {
     workspaceStates.current[workspaceMode] = captureSnapshot();
   }, [workspaceMode, captureSnapshot]);
 
-  // React to background job state changes (done / error)
+  // React to background job state changes (retry / done / error)
   useEffect(() => {
     if (!latestJobId) return;
     const job = jobs[latestJobId];
     if (!job) return;
+
+    if (isRetriedJobError(workspaceStates.current.generate, job)) {
+      workspaceStates.current.generate = {
+        ...workspaceStates.current.generate,
+        view: "upload",
+        errorInfo: null,
+      };
+      if (activeWorkspaceModeRef.current !== "generate") return;
+      setErrorInfo(null);
+      setView("upload");
+      return;
+    }
 
     if (job.phase === "done" && job.result) {
       const graph = dedupeGraph({ ...(job.result as GraphResult), source_mode: "generate" });
@@ -3293,6 +3477,10 @@ export default function Home() {
   }, [jobs, latestJobId]);
 
   const handleSubmit = async (content: string, fname: string, cfg: LLMConfig, sourceOrigin: "markdown" | "ocr" = "markdown") => {
+    if (!canUseAutonomousWorkspace(auth?.educationRole)) {
+      setEducationLocation(null);
+      return;
+    }
     const llm = cfg;
     setErrorInfo(null);
 
@@ -3453,13 +3641,18 @@ export default function Home() {
   const activeUploadFilename = activeUploadJob?.phase === "running" ? activeUploadJob.filename : null;
   const isGenerating = Object.values(jobs).some((job) => job.phase === "running");
 
+  if (!configReady) {
+    return <div className="edu-root"><div className="edu-loading"><Loader2 className="edu-spin" />正在确认工作空间身份…</div></div>;
+  }
+
   return (
     <>
-      <EducationWorkspaceSwitch
+      {showEducationWorkspaceSwitch && <EducationWorkspaceSwitch
         mode={educationWorkspaceMode}
+        educationRole={auth?.educationRole}
         onChange={switchEducationMode}
         isGenerating={isGenerating}
-      />
+      />}
       {showApiGuide && (
         <ApiSetupGuide
           config={llm}
@@ -3474,7 +3667,7 @@ export default function Home() {
       {showAuthModal && (
         <AuthModal
           onAuth={handleAuth}
-          onSkip={() => educationRequested ? switchEducationMode("create") : setShowAuthModal(false)}
+          onSkip={() => educationRequested ? navigate("/") : setShowAuthModal(false)}
         />
       )}
 
@@ -3671,7 +3864,7 @@ export default function Home() {
         />
       )}
 
-      {educationRequested && auth && auth.educationRole && !requestedAssignmentId && !requestedCourseGraphId && (
+      {educationRequested && auth && auth.educationRole && !requestedAssignmentId && !requestedCourseGraphId && !requestedClassStatisticsId && (
         <EducationHub
           token={auth.token}
           educationRole={auth.educationRole}
@@ -3680,6 +3873,10 @@ export default function Home() {
           initialClassId={educationProfileClassId || educationTargetClassId}
           resumeTarget={educationResumeTarget}
           onOpenAssignment={openEducationAssignment}
+          onOpenDirectCreate={openDirectAssignmentCreate}
+          onOpenDirectGrading={openDirectAssignmentGrading}
+          onOpenStatistics={openAssignmentStatistics}
+          onOpenClassStatistics={openClassStatistics}
           onOpenCourseGraph={openEducationCourseGraph}
           onOpenCreate={() => switchEducationMode("create")}
           onReauthenticate={() => { void handleLogout(); }}
@@ -3687,13 +3884,49 @@ export default function Home() {
           onNoticeConsumed={() => setEducationEntryNotice(null)}
         />
       )}
+      {educationRequested && auth && auth.educationRole === "teacher" && requestedClassStatisticsId && !educationLoading && (
+        <EducationClassStatistics token={auth.token} classId={requestedClassStatisticsId} classTitle="" theme={resolveTheme(loadStudioSettings().theme)} onBack={() => returnToEducationHub(requestedClassStatisticsId)} />
+      )}
+      {educationRequested && auth && auth.educationRole === "teacher" && requestedDirectCreateClassId && !educationLoading && (
+        <DirectAssignmentWorkspace
+          mode="create"
+          token={auth.token}
+          theme={resolveTheme(loadStudioSettings().theme)}
+          classId={requestedDirectCreateClassId}
+          onBack={() => leaveEducationWorkspace(requestedDirectCreateClassId)}
+          onCreated={assignment => openEducationAssignment(assignment.id)}
+          onDirtyChange={setEducationDraftDirty}
+        />
+      )}
       {educationRequested && auth && auth.educationRole && (requestedAssignmentId || requestedCourseGraphId) && educationLoading && (
-        <div className="edu-root"><div className="edu-loading"><Loader2 className="edu-spin" />正在加载{requestedAssignmentId ? "学习路径" : "课程图谱"}…</div></div>
+        <div className="edu-root"><div className="edu-loading"><Loader2 className="edu-spin" />正在加载{requestedAssignmentId ? "作业" : "课程图谱"}…</div></div>
       )}
       {educationRequested && auth && auth.educationRole && (requestedAssignmentId || requestedCourseGraphId) && educationError && !educationLoading && (
-        <div className="edu-root"><div className="edu-empty"><GraduationCap size={34} /><strong>无法打开{requestedAssignmentId ? "学习路径" : "课程图谱"}</strong><span>{educationError}</span><button className="edu-button primary" onClick={() => setEducationLocation(null)}>返回教育空间</button></div></div>
+        <div className="edu-root"><div className="edu-empty"><GraduationCap size={34} /><strong>无法打开{requestedAssignmentId ? "作业" : "课程图谱"}</strong><span>{educationError}</span><button className="edu-button primary" onClick={() => setEducationLocation(null)}>返回教育空间</button></div></div>
       )}
       {educationRequested && auth && auth.educationRole && educationAssignment && !educationLoading && (() => {
+        if (educationAssignment.assignmentType === "direct") {
+          if (requestedAssignmentView === "statistics" && educationAssignment.role === "teacher") {
+            return <EducationAssignmentStatistics token={auth.token} assignmentId={educationAssignment.id} assignmentTitle={educationAssignment.title} dueAt={educationAssignment.dueAt} theme={resolveTheme(loadStudioSettings().theme)} onBack={() => leaveEducationWorkspace(educationAssignment.classId)} />;
+          }
+
+          const mode: DirectAssignmentWorkspaceMode = requestedAssignmentView === "grading" && educationAssignment.role === "teacher"
+            ? "grading"
+            : educationAssignment.role === "student"
+              ? educationAssignment.submission ? "result" : "answer"
+              : educationAssignment.status === "draft" || requestedAssignmentView === "edit" ? "review" : "readOnly";
+          return <DirectAssignmentWorkspace
+            mode={mode}
+            token={auth.token}
+            theme={resolveTheme(loadStudioSettings().theme)}
+            assignment={educationAssignment}
+            llmConfig={llm}
+            onBack={() => leaveEducationWorkspace(educationAssignment.classId)}
+            onChanged={setEducationAssignment}
+            onRemoved={assignmentId => { if (educationAssignment?.id === assignmentId) returnToEducationHub(educationAssignment.classId); }}
+            onDirtyChange={setEducationDraftDirty}
+          />;
+        }
         const educationGraph = assignmentGraphResult(educationAssignment);
         if (!educationGraph || !educationAssignment.snapshot) return null;
         return (

@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import tempfile
 import sys
 
@@ -11,12 +11,23 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline.stages.ensure_coverage import stage as coverage_stage
+from JoinAgent import MultiProcessor
 
 
 SOURCE = (
     "# Theorem 1.1\nFirst statement.\n\n"
     "# Definition 1.2\nSecond statement.\n\n"
     "Remark. This ordinary prose is not a structural candidate.\n"
+)
+
+GLOBAL_OPTIMIZATION_SOURCE = (
+    "In global optimization, the true global solution of the optimization problem (1.1) is found; the\n"
+    "compromise is efficiency. The worst-case complexity of global optimization methods grows\n"
+    "exponentially with the problem sizes n and m.\n"
+)
+GLOBAL_OPTIMIZATION_QUOTE = (
+    "In global optimization, the true global solution of the optimization problem (1.1) is found; the\n"
+    "compromise is efficiency."
 )
 
 
@@ -67,6 +78,95 @@ def _context(tmp, source_format="markdown"):
         num_threads=1,
         checkpoint=10,
     )
+
+
+def _coverage_processor(tmp, llm):
+    return MultiProcessor(
+        llm=llm,
+        parse_method=lambda value: value,
+        data_template=coverage_stage.COVERAGE_DATA_TEMPLATE,
+        prompt_template=coverage_stage.TARGETED_PROMPT_TEMPLATE,
+        correction_template=coverage_stage.TARGETED_CORRECTION_TEMPLATE,
+        validator=coverage_stage.validation_coverage_quote,
+        checkpoint_dir=tmp,
+    )
+
+
+def _global_optimization_payload():
+    return {
+        "pos1": GLOBAL_OPTIMIZATION_SOURCE,
+        "target_type": "definition",
+        "target_label": "",
+        "_candidate_id": "block:3",
+        "_origin": "segment_block",
+        "_block_id": 3,
+        "_source_start": 2052,
+        "_source_end": 2052 + len(GLOBAL_OPTIMIZATION_SOURCE),
+    }
+
+
+def test_coverage_correction_prompt_repeats_exact_source_context():
+    invalid_answer = {
+        "content_quote": "Your previous recovery was invalid.",
+        "proof_quote": "",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        processor = _coverage_processor(tmp, Mock())
+        prompt = processor.generate_correction_prompt(
+            invalid_answer,
+            **_global_optimization_payload(),
+        )
+
+    assert GLOBAL_OPTIMIZATION_SOURCE in prompt
+    assert "Target node type: definition" in prompt
+    assert "Target source label:" in prompt
+    assert repr(invalid_answer) in prompt
+    assert coverage_stage.COVERAGE_DATA_TEMPLATE in prompt
+    assert "{pos1}" not in prompt
+    assert "{target_type}" not in prompt
+    assert "{target_label}" not in prompt
+
+
+def test_coverage_correction_flow_can_quote_the_repeated_source():
+    llm = Mock()
+    llm.ask.side_effect = [
+        {"content_quote": "", "proof_quote": ""},
+        {"content_quote": GLOBAL_OPTIMIZATION_QUOTE, "proof_quote": ""},
+    ]
+    payload = _global_optimization_payload()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result = _coverage_processor(tmp, llm).process_task("block:3", payload, False)
+
+    assert result == {
+        "content_quote": GLOBAL_OPTIMIZATION_QUOTE,
+        "proof_quote": "",
+    }
+    assert llm.ask.call_count == 2
+    assert GLOBAL_OPTIMIZATION_SOURCE in llm.ask.call_args_list[1].args[0]
+
+
+def test_global_optimization_quote_is_accepted_but_prompt_echo_is_rejected():
+    candidate = coverage_stage._candidate_from_input(
+        "block:3",
+        _global_optimization_payload(),
+    )
+    node, diagnostic = coverage_stage._validate_target_result(
+        candidate,
+        {"content_quote": GLOBAL_OPTIMIZATION_QUOTE, "proof_quote": ""},
+    )
+    rejected_node, rejected_diagnostic = coverage_stage._validate_target_result(
+        candidate,
+        {
+            "content_quote": "Your previous recovery was invalid.",
+            "proof_quote": "",
+        },
+    )
+
+    assert node["content"] == GLOBAL_OPTIMIZATION_QUOTE
+    assert diagnostic["status"] == "accepted"
+    assert rejected_node is None
+    assert rejected_diagnostic["reason"] == "content_quote_not_unique_contiguous_substring"
 
 
 def test_structural_missing_item_is_recovered_once():
@@ -371,6 +471,9 @@ def test_tex_missing_deterministic_block_reports_and_raises():
 
 
 if __name__ == "__main__":
+    test_coverage_correction_prompt_repeats_exact_source_context()
+    test_coverage_correction_flow_can_quote_the_repeated_source()
+    test_global_optimization_quote_is_accepted_but_prompt_echo_is_rejected()
     test_structural_missing_item_is_recovered_once()
     test_covered_blocks_use_source_identity_even_when_label_is_empty()
     test_markdown_heading_candidate_stops_at_next_arbitrary_heading()

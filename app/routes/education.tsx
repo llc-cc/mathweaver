@@ -2,13 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   AlertTriangle, ArrowLeft, BookOpen, Brain, Check, CheckCircle2, ChevronLeft, ChevronRight, ClipboardList,
-  Copy, FileJson, FileText, GitBranch, GraduationCap, Loader2, Pencil, Plus, Route, Save, School, Send, Settings, Trash2, Upload, Users, X,
+  Copy, FileJson, FileText, GitBranch, GraduationCap, Loader2, Pencil, Plus, Route, Save, School, Send, Settings, Trash2, Upload, Users, X, BarChart3,
 } from "lucide-react";
 import { apiUrl } from "~/api";
 import type { EducationRole, GraphNode, GraphResult } from "./home";
 import { MathText } from "./math";
 import { loadStudioSettings, resolveTheme } from "./studio-graph";
 import "./education.css";
+import type { DirectImportOrigin } from "~/components/DirectQuestionImport";
+import type { DirectQuestionDraft } from "../education-direct";
 
 
 export type LearningStepState = "not_started" | "in_progress" | "mastered" | "needs_review";
@@ -174,6 +176,7 @@ export interface EducationClassMember {
 export interface EducationSnapshotSummary {
   id: string;
   classId: string;
+  snapshotType?: "graph" | "direct";
   sourceGraphId?: string | null;
   filename: string;
   nodeCount: number;
@@ -197,6 +200,8 @@ export interface EducationSnapshot extends EducationSnapshotSummary {
 export interface EducationAssignment {
   id: string;
   classId: string;
+  assignmentType?: "graph" | "direct";
+  directStructureVersion?: number;
   snapshotId: string;
   title: string;
   targetNodeId: number;
@@ -212,6 +217,7 @@ export interface EducationAssignment {
   gradesPublishedAt?: string | null;
   submission?: EducationSubmissionSummary | null;
   snapshot?: EducationSnapshot;
+  source?: { filename: string; mimeType: string; origin: string; hasOriginalFile: boolean; url?: string | null };
 }
 
 export function unresolvedAssessmentNodeIds(assignment: EducationAssignment): number[] {
@@ -345,6 +351,38 @@ export interface GradingOverview {
   canPublish: boolean;
   pendingUserIds: number[];
   students: GradingStudent[];
+}
+
+export interface EducationAssignmentStatistics {
+  assignmentId: string;
+  assignmentTitle: string;
+  generatedAt: string;
+  overview: { totalStudents: number; submittedStudents: number; finalizedStudents: number; averageScore: number | null; medianScore: number | null; highestScore: number | null; lowestScore: number | null; passRate: number | null };
+  scoreDistribution: Array<{ label: "0-59" | "60-69" | "70-79" | "80-89" | "90-100"; count: number }>;
+  questionStatistics: Array<{ questionId: string; order: number; label: string; maxScore: number; averageScore: number | null; averageRate: number | null; lowScoreCount: number; lowScoreRate: number | null; partialScoreCount: number; partialScoreRate: number | null; correctCount: number; correctRate: number | null; averageLostScore: number | null }>;
+  errorDistribution: { correct: number; partial: number; low: number };
+  difficultQuestions: Array<{ questionId: string; order: number; label: string; averageRate: number; lowScoreRate: number; averageLostScore: number }>;
+  students: Array<{ userId: number; studentName?: string | null; studentNumber?: string | null; totalScore: number; rank: number }>;
+}
+
+export type ClassStatisticsCellStatus = SubmissionStatus | "not_submitted";
+export interface EducationClassStatistics {
+  classId: string;
+  classTitle: string;
+  generatedAt: string;
+  assignments: Array<{ id: string; title: string; questionCount: number; maxScore: number; publishedAt?: string | null; dueAt?: string | null; studentCount: number; submittedCount: number; finalizedCount: number; averageScore: number | null; averageRate?: number | null }>;
+  overview: { totalStudents: number; assignmentCount: number; submittedStudents: number; finalizedStudents: number; averageScore: number | null; highestScore: number | null; lowestScore: number | null; averageSubmissionRate: number | null };
+  students: Array<{
+    userId: number;
+    studentName?: string | null;
+    studentNumber?: string | null;
+    assignments: Record<string, { score: number | null; maxScore: number; status: ClassStatisticsCellStatus; submittedAt?: string | null }>;
+    submittedCount: number;
+    gradedCount: number;
+    submissionRate: number;
+    averageScore: number | null;
+    rank: number | null;
+  }>;
 }
 
 export interface StudentPathSummary {
@@ -588,6 +626,13 @@ export function educationErrorMessage(cause: unknown) {
     case "assessment_scoring_required": return "请补齐每题参考答案、评分点和分值，并确保作业总分恰好为 100 分。";
     case "assessment_scoring_frozen": return "该评分标准已冻结；已定稿或已发布成绩的作业不能再修改。";
     case "assessment_score_invalid": return "题目分值必须大于 0，且最多保留一位小数。";
+    case "unsupported source file": return "题目来源文件格式不支持。";
+    case "at least one direct question is required": return "至少导入一道题目。";
+    case "direct questions cannot be empty": return "题目内容不能为空。";
+    case "direct question order must be unique": return "题目顺序不能重复。";
+    case "direct question order must start at 1": return "题目顺序必须从 1 开始且连续。";
+    case "direct question nodeId must be unique": return "题目节点标识不能重复。";
+    case "direct assignments edit questions through direct-questions": return "直接作业题目请在题目编辑区保存。";
     case "assignment_incomplete": return "请先完成所有非免考节点的全部题目，再提交整份作业。";
     case "assignment_closed": return "该作业已关闭提交。";
     case "assignment_already_submitted": return "作业已经提交，答案已冻结，不能继续修改。";
@@ -598,6 +643,8 @@ export function educationErrorMessage(cause: unknown) {
     case "grades_released": return "成绩已经发布。";
     case "education_ai_unconfigured": return "课程 AI 尚未配置，请联系教师或管理员。";
     case "education_ai_limit_reached": return "今天的课程 AI 使用次数已达上限。";
+    case "direct_scoring_generation_invalid": return "AI 返回的参考答案、检查重点或评分点格式无效，请重试。";
+    case "direct_scoring_generation_failed": return "参考答案、检查重点和评分点生成失败，请稍后重试。";
     case "interaction_incomplete": return "上一次请求仍在保存，请稍后重试。";
     case "database_unavailable": return "教学服务暂不可用，请稍后重试。";
     default: return error.message || "操作失败，请稍后重试。";
@@ -614,6 +661,87 @@ export function assessmentGenerationErrorMessage(assessment?: Pick<NodeAssessmen
   const code = assessment.generationErrorCode || legacyCode;
   if (code) return educationErrorMessage({ code });
   return assessment.generationError || "题目生成失败，请重新生成或设为免考。";
+}
+
+
+async function educationMultipartRequest<T>(token: string, path: string, formData: FormData, init?: RequestInit): Promise<T> {
+  const response = await fetch(apiUrl(path), {
+    ...init,
+    method: init?.method || "POST",
+    headers: { Authorization: `Bearer ${token}`, ...init?.headers },
+    body: formData,
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(body.error || `请求失败（${response.status}）`) as Error & { code?: string };
+    error.code = body.code;
+    throw error;
+  }
+  return body as T;
+}
+
+export async function createDirectEducationAssignment(
+  token: string,
+  classId: string,
+  input: { title: string; dueAt: string | null; questions: DirectQuestionDraft[]; sourceText: string; sourceFile: File | null; sourceOrigin: DirectImportOrigin },
+) {
+  const formData = new FormData();
+  formData.append("title", input.title);
+  formData.append("dueAt", input.dueAt || "");
+  formData.append("questions", JSON.stringify(input.questions));
+  formData.append("sourceText", input.sourceText);
+  formData.append("sourceOrigin", input.sourceOrigin);
+  if (input.sourceFile) {
+    formData.append("source_file", input.sourceFile);
+    formData.append("sourceFilename", input.sourceFile.name);
+  }
+  const body = await educationMultipartRequest<{ assignment: EducationAssignment }>(
+    token,
+    `/api/v2/edu/classes/${encodeURIComponent(classId)}/assignments/direct`,
+    formData,
+  );
+  return body.assignment;
+}
+
+export async function updateDirectEducationQuestions(
+  token: string,
+  assignmentId: string,
+  questions: DirectQuestionDraft[],
+  source?: { sourceText: string; sourceFile: File | null; sourceOrigin: DirectImportOrigin },
+) {
+  const path = `/api/v2/edu/assignments/${encodeURIComponent(assignmentId)}/direct-questions`;
+  const body = source
+    ? await (() => {
+        const formData = new FormData();
+        formData.append("questions", JSON.stringify(questions));
+        formData.append("sourceText", source.sourceText);
+        formData.append("sourceOrigin", source.sourceOrigin);
+        if (source.sourceFile) {
+          formData.append("source_file", source.sourceFile);
+          formData.append("sourceFilename", source.sourceFile.name);
+        }
+        return educationMultipartRequest<{ assignment: EducationAssignment }>(token, path, formData, { method: "PATCH" });
+      })()
+    : await educationRequest<{ assignment: EducationAssignment }>(
+        token,
+        path,
+        { method: "PATCH", body: JSON.stringify({ questions }) },
+      );
+  return body.assignment;
+}
+
+export interface DirectQuestionStandardGeneration {
+  referenceAnswer: string;
+  focus: string;
+  expectedPoints: string[];
+}
+
+export async function generateDirectQuestionStandard(token: string, question: string) {
+  return educationRequest<DirectQuestionStandardGeneration>(
+    token,
+    "/api/v2/edu/direct-questions/generate-standard",
+    { method: "POST", body: JSON.stringify({ question }) },
+  );
 }
 
 export async function loadEducationAssignment(token: string, assignmentId: string) {
@@ -648,6 +776,19 @@ export async function saveEducationAssignment(token: string, assignment: Educati
   );
 }
 
+export async function saveDirectEducationAssignmentMetadata(
+  token: string,
+  assignmentId: string,
+  input: { title: string; dueAt: string | null },
+) {
+  const body = await educationRequest<{ assignment: EducationAssignment }>(
+    token,
+    `/api/v2/edu/assignments/${encodeURIComponent(assignmentId)}`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+  return body.assignment;
+}
+
 export async function updatePublishedEducationAssignment(
   token: string,
   assignmentId: string,
@@ -661,7 +802,7 @@ export async function updatePublishedEducationAssignment(
   return body.assignment;
 }
 
-export async function archiveEducationAssignment(token: string, assignmentId: string) {
+export async function removeEducationAssignment(token: string, assignmentId: string) {
   await educationRequest<{ ok: true }>(
     token,
     `/api/v2/edu/assignments/${encodeURIComponent(assignmentId)}`,
@@ -814,6 +955,45 @@ export async function loadEducationGradingOverview(token: string, assignmentId: 
   return educationRequest<GradingOverview>(token, `/api/v2/edu/assignments/${encodeURIComponent(assignmentId)}/grading-overview`);
 }
 
+export async function loadEducationAssignmentStatistics(token: string, assignmentId: string) {
+  return educationRequest<EducationAssignmentStatistics>(token, `/api/v2/edu/assignments/${encodeURIComponent(assignmentId)}/statistics`);
+}
+
+export async function loadEducationClassStatistics(token: string, classId: string) {
+  return educationRequest<EducationClassStatistics>(token, `/api/v2/edu/classes/${encodeURIComponent(classId)}/statistics`);
+}
+
+function educationDownloadFilename(contentDisposition: string | null, fallback: string) {
+  const encoded = contentDisposition?.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) return decodeURIComponent(encoded);
+  const plain = contentDisposition?.match(/filename="?([^";]+)"?/i)?.[1];
+  return plain ? decodeURIComponent(plain) : fallback;
+}
+
+export async function downloadEducationClassStatistics(token: string, classId: string) {
+  const response = await fetch(apiUrl(`/api/v2/edu/classes/${encodeURIComponent(classId)}/statistics/export`), { headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const error = new Error(body.error || `请求失败（${response.status}）`) as Error & { code?: string; status?: number };
+    error.code = body.code;
+    error.status = response.status;
+    throw error;
+  }
+  return { blob: await response.blob(), filename: educationDownloadFilename(response.headers.get("Content-Disposition"), `成绩统计-${classId}.xlsx`) };
+}
+
+export async function downloadEducationStudentStatistics(token: string, classId: string, userId: number) {
+  const response = await fetch(apiUrl(`/api/v2/edu/classes/${encodeURIComponent(classId)}/students/${encodeURIComponent(String(userId))}/statistics/export`), { headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const error = new Error(body.error || `请求失败（${response.status}）`) as Error & { code?: string; status?: number };
+    error.code = body.code;
+    error.status = response.status;
+    throw error;
+  }
+  return { blob: await response.blob(), filename: educationDownloadFilename(response.headers.get("Content-Disposition"), `学生成绩统计-${classId}-${userId}.xlsx`) };
+}
+
 export async function loadEducationSubmission(token: string, submissionId: string) {
   const body = await educationRequest<{ submission: EducationSubmission }>(token, `/api/v2/edu/submissions/${encodeURIComponent(submissionId)}`);
   return body.submission;
@@ -958,7 +1138,7 @@ function nodeTitle(node: GraphNode | undefined, nodeId: number) {
   return node?.title_zh || node?.title_en || node?.label || `节点 ${nodeId}`;
 }
 
-function formatDate(value?: string | null) {
+export function formatDate(value?: string | null) {
   if (!value) return "未设置";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { dateStyle: "medium", timeStyle: "short" });
@@ -1155,7 +1335,11 @@ interface EducationHubProps {
   initialCourseGraphId?: string | null;
   initialClassId?: string | null;
   resumeTarget?: { kind: "assignment" | "courseGraph"; id: string } | null;
-  onOpenAssignment: (assignmentId: string) => void;
+  onOpenAssignment: (assignmentId: string, assignmentView?: "edit") => void;
+  onOpenDirectCreate: (classId: string) => void;
+  onOpenDirectGrading: (assignmentId: string) => void;
+  onOpenStatistics: (assignmentId: string) => void;
+  onOpenClassStatistics: (classId: string) => void;
   onOpenCourseGraph: (snapshotId: string) => void;
   onOpenCreate: () => void;
   onReauthenticate: () => void;
@@ -1165,7 +1349,7 @@ interface EducationHubProps {
 
 export function EducationHub({
   token, educationRole, targetNode, initialCourseGraphId, initialClassId, resumeTarget,
-  onOpenAssignment, onOpenCourseGraph, onOpenCreate, onReauthenticate, initialNotice, onNoticeConsumed,
+  onOpenAssignment, onOpenDirectCreate, onOpenDirectGrading, onOpenStatistics, onOpenClassStatistics, onOpenCourseGraph, onOpenCreate, onReauthenticate, initialNotice, onNoticeConsumed,
 }: EducationHubProps) {
   const [classes, setClasses] = useState<EducationClass[]>([]);
   const [selectedClassId, setSelectedClassId] = useState<string | null>(null);
@@ -1203,6 +1387,7 @@ export function EducationHub({
   const [loading, setLoading] = useState(true);
   const [courseGraphsLoading, setCourseGraphsLoading] = useState(false);
   const [busy, setBusy] = useState("");
+  const [statisticsOpening, setStatisticsOpening] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
@@ -1871,7 +2056,7 @@ export function EducationHub({
     if (!editingAssignment) return;
     setBusy("assignment-delete"); setEditError("");
     try {
-      await archiveEducationAssignment(token, editingAssignment.id);
+      await removeEducationAssignment(token, editingAssignment.id);
       setAssignments(items => items.filter(item => item.id !== editingAssignment.id));
       setOverview(null);
       setOverviewAssignmentId(null);
@@ -1894,10 +2079,6 @@ export function EducationHub({
             <img className="edu-brand-mark" src="/mathweaver-icon.png" alt="" aria-hidden="true" />
             <span className="edu-brand-name">绎理</span>
           </div>
-          <span className={`edu-role-badge ${educationRole}`}>
-            <span className="edu-role-dot" />
-            {educationRole === "teacher" ? "教师端" : "学生端"}
-          </span>
         </div>
         <div className="edu-header-actions">
           {educationRole === "teacher" && (
@@ -1991,19 +2172,25 @@ export function EducationHub({
                 </section>
               ) : (
                 <section className="edu-section">
-                  <div className="edu-section-title"><ClipboardList size={17} /><strong>{selectedClass.role === "teacher" ? "班级作业" : "我的学习任务"}</strong><span>{assignments.length}</span></div>
+                  <div className="edu-section-heading-row">
+                    <div className="edu-section-title"><ClipboardList size={17} /><strong>{selectedClass.role === "teacher" ? "班级作业" : "我的学习任务"}</strong><span>{assignments.length}</span></div>
+                    {selectedClass.role === "teacher" && <div className="edu-assignment-heading-actions"><button type="button" className="edu-button ghost" onClick={() => onOpenClassStatistics(selectedClass.id)}><BarChart3 size={14} />成绩统计</button><button type="button" className="edu-button primary" onClick={() => onOpenDirectCreate(selectedClass.id)}><Plus size={14} />创建作业</button></div>}
+                  </div>
                   <div className="edu-assignment-grid">
                     {assignments.map(item => (
                       <article className="edu-assignment" key={item.id}>
                         <div className={`edu-status ${item.status}`}>{item.status === "draft" ? "草稿" : "已发布"}</div>
                         <h3>{item.title}</h3><p>{item.summary || `${item.path.steps.length} 个学习步骤`}</p>
-                        <p className="edu-assignment-source">课程图谱：{courseGraphById.get(item.snapshotId)?.filename || "已绑定课程图谱"}</p>
-                        <div className="edu-assignment-meta"><span>{item.path.steps.length} 步</span><span>截止 {formatDate(item.dueAt)}</span></div>
+                        <p className="edu-assignment-source">{item.assignmentType === "direct" ? `${item.assessments.reduce((sum, assessment) => sum + assessment.questionCount, 0)} 道题` : `课程图谱：${courseGraphById.get(item.snapshotId)?.filename || "已绑定课程图谱"}`}</p>
+                        <div className="edu-assignment-meta"><span>{item.assignmentType === "direct" ? "题目作业" : `${item.path.steps.length} 步`}</span><span>截止 {formatDate(item.dueAt)}</span></div>
                         <div className="edu-row-actions">
-                          <button className="edu-button primary" onClick={() => onOpenAssignment(item.id)}><BookOpen size={14} />{item.role === "teacher" && item.status === "draft" ? "编辑并发布" : item.role === "student" ? "开始学习" : "查看路径"}</button>
-                          {item.role === "student" && <button className="edu-button ghost" onClick={() => onOpenCourseGraph(item.snapshotId)}><GitBranch size={14} />课程图谱</button>}
-                          {item.role === "teacher" && item.status === "published" && <button className="edu-button ghost" disabled={busy === `overview-${item.id}`} onClick={() => loadOverview(item.id)}><ClipboardList size={14} />批改作业</button>}
-                          {item.role === "teacher" && item.status === "published" && <button className="edu-button ghost" onClick={() => openAssignmentEditor(item)}><Pencil size={14} />编辑</button>}
+                          <button className="edu-button ghost" onClick={() => onOpenAssignment(item.id)}><BookOpen size={14} />{item.assignmentType === "direct" ? item.role === "teacher" && item.status === "draft" ? "继续编辑" : item.role === "student" ? item.submission?.status === "released" ? "查看成绩" : item.submission ? "查看作业" : "开始作答" : "查看作业" : item.role === "teacher" && item.status === "draft" ? "编辑并发布" : item.role === "student" ? "开始学习" : "查看路径"}</button>
+                          {item.role === "student" && item.assignmentType !== "direct" && <button className="edu-button ghost" onClick={() => onOpenCourseGraph(item.snapshotId)}><GitBranch size={14} />课程图谱</button>}
+                          {item.role === "teacher" && item.status === "published" && item.assignmentType === "direct" && <button className="edu-button ghost" onClick={() => onOpenAssignment(item.id, "edit")}><Pencil size={14} />编辑作业</button>}
+                          {item.role === "teacher" && item.status === "published" && item.assignmentType === "direct" && <button className="edu-button ghost" disabled={busy === `overview-${item.id}`} onClick={() => onOpenDirectGrading(item.id)}><ClipboardList size={14} />批改作业</button>}
+                          {item.role === "teacher" && item.status === "published" && item.assignmentType === "direct" && <button className="edu-button ghost" disabled={statisticsOpening === item.id} aria-busy={statisticsOpening === item.id} onClick={() => { setStatisticsOpening(item.id); onOpenStatistics(item.id); }}>{statisticsOpening === item.id ? <Loader2 className="edu-spin" size={14} /> : <BarChart3 size={14} />}查看统计</button>}
+                          {item.role === "teacher" && item.status === "published" && item.assignmentType !== "direct" && <button className="edu-button ghost" disabled={busy === `overview-${item.id}`} onClick={() => loadOverview(item.id)}><ClipboardList size={14} />批改作业</button>}
+                          {item.role === "teacher" && item.status === "published" && item.assignmentType !== "direct" && <button className="edu-button ghost" onClick={() => openAssignmentEditor(item)}><Pencil size={14} />编辑</button>}
                         </div>
                       </article>
                     ))}

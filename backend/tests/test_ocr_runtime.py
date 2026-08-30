@@ -6,6 +6,7 @@ import hashlib
 import io
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -16,11 +17,15 @@ from pypdf import PdfWriter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ocr_runtime import OcrError, OcrManager, PDF_MAX_BYTES
+from ocr_runtime import OcrEngine, OcrError, OcrManager, PDF_MAX_BYTES
 
 
 OBJECT_STREAM_PDF = Path(__file__).resolve().parents[1] / "assets" / "tex_templates" / "elegantbook" / "image" / "cert.pdf"
 MINIMAL_PDF = OBJECT_STREAM_PDF.read_bytes()
+MINIMAL_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c6360000000020001e221bc330000000049454e44ae426082"
+)
 
 
 def make_pdf(page_count: int, *, encrypted: bool = False) -> bytes:
@@ -216,6 +221,34 @@ class OcrRuntimeTests(unittest.TestCase):
             self.assertEqual(upload["page_count"], 1)
             self.assertTrue(Path(upload["source_path"]).is_file())
 
+    def test_streamed_png_upload_is_validated_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = OcrManager(root=Path(directory), manifest_path=Path(directory) / "manifest.json")
+            writer = manager.begin_upload("example.png")
+            writer.write(MINIMAL_PNG)
+            upload = writer.finish()
+
+            self.assertEqual(upload["size_bytes"], len(MINIMAL_PNG))
+            self.assertEqual(upload["page_count"], 1)
+            self.assertTrue(Path(upload["source_path"]).is_file())
+
+    def test_png_multipart_request_uses_standard_boundaries_and_mime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "example.png"
+            path.write_bytes(MINIMAL_PNG)
+
+            body, content_type = OcrEngine._multipart(path, {"backend": "pipeline"}, threading.Event())
+            payload = b"".join(body)
+
+            self.assertIn("multipart/form-data; boundary=", content_type)
+            self.assertIn(b'Content-Disposition: form-data; name="backend"\r\n\r\npipeline\r\n', payload)
+            self.assertIn(
+                b'Content-Disposition: form-data; name="files"; filename="example.png"\r\n'
+                b"Content-Type: image/png\r\n\r\n",
+                payload,
+            )
+            self.assertTrue(payload.endswith(b"\r\n"))
+
     def test_upload_rejects_declared_size_and_signature(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = OcrManager(root=Path(directory), manifest_path=Path(directory) / "manifest.json")
@@ -368,6 +401,37 @@ class OcrRuntimeTests(unittest.TestCase):
             manager._jobs[job_id] = job
             recovered = manager.list_recovery_jobs()
             self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0]["upload_id"], upload["upload_id"])
+
+    def test_recovery_listing_deduplicates_interrupted_jobs_for_same_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = OcrManager(root=Path(directory), manifest_path=Path(directory) / "manifest.json")
+            writer = manager.begin_upload("recovery.pdf")
+            writer.write(MINIMAL_PDF)
+            upload = writer.finish()
+            jobs = [
+                ("11111111-1111-1111-1111-111111111111", "2026-08-28T09:00:00Z"),
+                ("22222222-2222-2222-2222-222222222222", "2026-08-28T10:00:00Z"),
+            ]
+            for job_id, updated_at in jobs:
+                job_dir = manager.jobs_dir / job_id
+                job_dir.mkdir(parents=True)
+                job = {
+                    "ocr_job_id": job_id,
+                    "upload_id": upload["upload_id"],
+                    "filename": upload["filename"],
+                    "status": "interrupted",
+                    "page_count": 1,
+                    "created_at": updated_at,
+                    "updated_at": updated_at,
+                }
+                (job_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+                manager._jobs[job_id] = job
+
+            recovered = manager.list_recovery_jobs()
+
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0]["ocr_job_id"], jobs[1][0])
             self.assertEqual(recovered[0]["upload_id"], upload["upload_id"])
 
     def test_cancelled_install_generation_cannot_write_ready(self) -> None:

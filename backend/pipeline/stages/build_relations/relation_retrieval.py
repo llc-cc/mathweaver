@@ -1149,6 +1149,24 @@ def build_rerank_tasks(
     return tasks
 
 
+def _is_unambiguous_candidate_id_typo(expected_id, actual_id):
+    if not re.fullmatch(r"[0-9a-f]{24}", expected_id or ""):
+        return False
+    if re.fullmatch(r"[0-9a-f]{24}", actual_id or ""):
+        return sum(left != right for left, right in zip(expected_id, actual_id)) == 1
+    if re.fullmatch(r"[0-9a-f]{23}", actual_id or ""):
+        return any(
+            expected_id[:index] + expected_id[index + 1 :] == actual_id
+            for index in range(len(expected_id))
+        )
+    if re.fullmatch(r"[0-9a-f]{25}", actual_id or ""):
+        return any(
+            actual_id[:index] + actual_id[index + 1 :] == expected_id
+            for index in range(len(actual_id))
+        )
+    return False
+
+
 def normalize_rerank_result(task, result):
     if not isinstance(result, dict) or not isinstance(result.get("ranked"), list):
         return None
@@ -1181,11 +1199,7 @@ def normalize_rerank_result(task, result):
         return None
     missing_id = next(iter(missing))
     unexpected_id = next(iter(unexpected))
-    if not (
-        re.fullmatch(r"[0-9a-f]{24}", missing_id)
-        and re.fullmatch(r"[0-9a-f]{24}", unexpected_id)
-        and sum(left != right for left, right in zip(missing_id, unexpected_id)) == 1
-    ):
+    if not _is_unambiguous_candidate_id_typo(missing_id, unexpected_id):
         return None
 
     repaired_ranked = [

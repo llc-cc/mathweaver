@@ -353,29 +353,40 @@ def test_ensure_coverage_retry_merges_from_base_without_duplicates():
         if len(calls) == 1:
             return {}
         return {
-            key: {"content_quote": "Second.", "proof_quote": ""}
+            key: {"content_quote": "Third.", "proof_quote": ""}
             for key in tasks
         }
 
-    source = "# Theorem 1.1\nFirst.\n\n# Definition 1.2\nSecond.\n"
+    source = (
+        "# Theorem 1.1\nFirst.\n\n"
+        "# Definition 1.2\nSecond.\n\n"
+        "# Definition 1.3\nThird.\n"
+    )
     state = {
         "corrected_text": source,
         "problem_dict": {
-            0: {"pos1": "# Theorem 1.1\nFirst.\n\n"},
-            1: {"pos1": "# Definition 1.2\nSecond.\n"},
+            1: {"pos1": "# Theorem 1.1\nFirst.\n\n"},
+            2: {"pos1": "# Definition 1.2\nSecond.\n\n"},
+            3: {"pos1": "# Definition 1.3\nThird.\n"},
         },
         "segment_blocks_report": {
             "blocks": [
                 {
-                    "block_id": 0,
+                    "block_id": 1,
                     "boundary_role": "top_level_logical_unit_start",
                     "label_surface": "Theorem 1.1",
                     "logical_unit_type_hint": "theorem",
                 },
                 {
-                    "block_id": 1,
+                    "block_id": 2,
                     "boundary_role": "top_level_logical_unit_start",
                     "label_surface": "Definition 1.2",
+                    "logical_unit_type_hint": "definition",
+                },
+                {
+                    "block_id": 3,
+                    "boundary_role": "top_level_logical_unit_start",
+                    "label_surface": "Definition 1.3",
                     "logical_unit_type_hint": "definition",
                 },
             ]
@@ -383,9 +394,14 @@ def test_ensure_coverage_retry_merges_from_base_without_duplicates():
         "unsplit_statement_dict": {
             0: {
                 "pos1": {"node_type": "theorem", "label": "Theorem 1.1", "content": "First.", "proof": ""},
-                "_orig_key": 0,
+                "_orig_key": 1,
                 "source_text": "# Theorem 1.1\nFirst.\n\n",
-            }
+            },
+            1: {
+                "pos1": {"node_type": "definition", "label": "Definition 1.2", "content": "Second.", "proof": ""},
+                "_orig_key": 2,
+                "source_text": "# Definition 1.2\nSecond.\n\n",
+            },
         },
     }
     with tempfile.TemporaryDirectory() as tmp, patch.object(
@@ -396,9 +412,9 @@ def test_ensure_coverage_retry_merges_from_base_without_duplicates():
         state, report = ensure_coverage_stage.rerun_failed_tasks(context, state, max_rounds=2)
 
     labels = [wrapper["pos1"].get("label") for wrapper in state["unsplit_statement_dict"].values()]
-    assert calls == [["block:1"], ["block:1"]]
+    assert calls == [["block:3"], ["block:3"]]
     assert report["status"] == "resolved"
-    assert labels == ["Theorem 1.1", "Definition 1.2"]
+    assert labels == ["Theorem 1.1", "Definition 1.2", "Definition 1.3"]
 
 
 def test_relation_both_mode_recovers_each_branch_with_matching_mode():

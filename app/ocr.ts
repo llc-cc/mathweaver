@@ -103,6 +103,25 @@ export interface OcrJobStatus {
   retryable: boolean;
   error?: string | null;
   error_code?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function dedupeOcrRecoveryJobs(jobs: OcrJobStatus[]): OcrJobStatus[] {
+  const latestByUpload = new Map<string, OcrJobStatus>();
+  const recoveryKey = (job: OcrJobStatus) => [
+    job.updated_at || job.created_at || "",
+    job.created_at || "",
+    job.ocr_job_id,
+  ].join("\u0000");
+
+  for (const job of jobs) {
+    const current = latestByUpload.get(job.upload_id);
+    if (!current || recoveryKey(job) > recoveryKey(current)) {
+      latestByUpload.set(job.upload_id, job);
+    }
+  }
+  return Array.from(latestByUpload.values());
 }
 
 export interface OcrResult {

@@ -10,11 +10,10 @@ interface FloatingBadgeProps {
   hidden?: boolean;
 }
 
-function JobDetailPanel({ job, onViewResult, onDismiss, onClose, onPause, onResume, onCancel }: {
+export function JobDetailPanel({ job, onViewResult, onDismiss, onPause, onResume, onCancel }: {
   job: BackgroundJob;
   onViewResult: (id: string) => void;
   onDismiss: (id: string) => void;
-  onClose: () => void;
   onPause: (id: string) => void;
   onResume: (id: string) => void;
   onCancel: (id: string) => void;
@@ -151,7 +150,7 @@ function JobDetailPanel({ job, onViewResult, onDismiss, onClose, onPause, onResu
           </button>
           <button
             style={{ width: "100%", margin: 0, display: "flex", alignItems: "center", justifyContent: "center", boxSizing: "border-box", background: "none", border: "1px solid var(--line)", color: "var(--muted)", borderRadius: 6, padding: "6px 0", fontSize: 12, cursor: "pointer", textAlign: "center" }}
-            onClick={onClose}
+            onClick={() => onDismiss(job.id)}
           >
             关闭
           </button>
@@ -265,7 +264,6 @@ export function FloatingBadge({ onViewResult, hidden = false }: FloatingBadgePro
                 job={job}
                 onViewResult={(id) => { onViewResult(id); closeSoftly(); }}
                 onDismiss={dismissJob}
-                onClose={closeSoftly}
                 onPause={(id) => { void pauseJob(id); }}
                 onResume={(id) => { void resumeJob(id); }}
                 onCancel={(id) => { void cancelJob(id); }}

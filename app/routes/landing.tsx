@@ -12,7 +12,6 @@ import {
   BookOpen,
   BrainCircuit,
   CheckCircle2,
-  ChevronDown,
   CircleDot,
   FileText,
   GraduationCap,
@@ -23,7 +22,6 @@ import {
   ScanText,
   Search,
   Sparkles,
-  Upload,
 } from "lucide-react";
 import "./landing.css";
 
@@ -126,17 +124,7 @@ const RELATION_COLORS: Record<string, string> = {
   推导: "#4f78aa",
 };
 
-const PIPELINE_STAGES = [
-  ["文档理解", "识别数学段落与命题边界"],
-  ["实体抽取", "抽取定义、定理、引理与推论"],
-  ["逻辑分析", "解析条件、结论和证明结构"],
-  ["关系识别", "建立定义依赖和推导关系"],
-  ["质量检查", "修复缺失或异常中间结果"],
-  ["图谱构建", "生成可探索的知识网络"],
-];
-
 const ALL_NODE_IDS = DEMO_NODES.map((node) => node.id);
-const CORE_NODE_IDS = [1, 3, 4, 5, 6, 7, 8, 11];
 const PATH_NODE_IDS = [4, 3, 5, 6, 7];
 
 function useVisibleLoop(stepCount: number, intervalMs: number, initialStep = 0) {
@@ -830,54 +818,6 @@ function HeroSection() {
 
 
 
-function GenerationSection() {
-  const loop = useVisibleLoop(12, 950);
-  const uploaded = loop.step >= 1;
-  const activeStage = Math.max(-1, Math.min(5, loop.step - 2));
-  const graphReady = loop.step >= 7;
-  return (
-    <section className="brief-section brief-advanced-section" id="advanced" ref={loop.ref}>
-      <SectionHeading
-        number="05"
-        kicker="进阶功能"
-        title="想把自己的教材变成图谱，也可以从这里开始"
-        lead="上传 PDF、Markdown、TeX 或纯文本，系统会按阶段识别数学内容、检查关系并生成一张可以继续探索的知识图谱。"
-      />
-      <div className="brief-generation-grid">
-        <ProductWindow title="自主生成知识图谱" meta="数学文档" className="brief-upload-demo">
-          <div className="brief-workspace-tabs"><button className="active">文档生成</button><button>图谱导入</button></div>
-          <div className={`brief-dropzone ${uploaded ? "uploaded" : ""}`}>
-            <Upload size={25} />
-            {uploaded ? <><strong>高等代数·线性空间.pdf</strong><span>8.4 MB · 文件已就绪</span></> : <><strong>拖放数学文档到这里</strong><span>支持 PDF、Markdown、TeX 与纯文本</span></>}
-          </div>
-          <div className="brief-or-divider">或直接粘贴文本</div>
-          <div className="brief-pastebox">设 V 为有限维向量空间，v₁,…,vₘ 为一组线性无关向量……</div>
-          <div className="brief-config-row"><span><Sparkles size={14} /> AI 配置</span><b>当前配置</b><ChevronDown size={14} /></div>
-          <button className="brief-workspace-submit">{loop.step >= 2 && loop.step <= 7 ? "正在分析教材…" : "开始分析"}</button>
-        </ProductWindow>
-        <div className="brief-stage-rail">
-          {PIPELINE_STAGES.map(([title, text], index) => (
-            <div className={`${activeStage === index ? "active" : ""} ${activeStage > index ? "done" : ""}`} key={title}>
-              <i>{activeStage > index ? "✓" : index + 1}</i>
-              <span><strong>{title}</strong><small>{text}</small></span>
-            </div>
-          ))}
-        </div>
-        <ProductWindow title="高等代数知识图谱" meta={graphReady ? "20节点 · 26关系" : "等待生成"} className={`brief-generated-graph ${graphReady ? "ready" : ""}`}>
-          <GraphNetwork
-            nodeIds={CORE_NODE_IDS}
-            focusId={graphReady ? [4, 5, 6, 7][loop.step % 4] : undefined}
-            layout="dag"
-            active={loop.active}
-          />
-          {!graphReady && <div className="brief-graph-placeholder"><NetworkIcon size={28} /><span>处理完成后将在这里生成图谱</span></div>}
-        </ProductWindow>
-      </div>
-      <div className="brief-advanced-cta"><span><strong>准备好自己的材料了吗？</strong><small>进入工作台开始自主建图，生成结果可以继续用于探索与学习。</small></span><Link to="/workspace">开始自主建图 <ArrowRight size={15} /></Link></div>
-    </section>
-  );
-}
-
 function StudioSection() {
   const loop = useVisibleLoop(5, 1900);
   const sequence = [6, 6, 7, 7, 6];
@@ -1283,8 +1223,6 @@ function BriefFooter() {
             <a href="#graph">图谱探索</a>
             <a href="#node-study">节点学习</a>
             <a href="#learning-space">学习空间</a>
-            <a href="#advanced">进阶建图</a>
-            <Link to="/workspace">工作台</Link>
           </nav>
         </div>
         <div className="brief-footer-divider" />
@@ -1324,7 +1262,6 @@ export default function Landing() {
           <a href="#graph">图谱探索</a>
           <a href="#node-study">节点学习</a>
           <a href="#learning-space">学习空间</a>
-          <a href="#advanced">进阶建图</a>
         </div>
         <Link to="/workspace?edu=hub" className="brief-nav-cta">进入学习空间 <ArrowRight size={15} /></Link>
         <div className="brief-reading-progress"><i style={{ width: `${progress}%` }} /></div>
@@ -1335,7 +1272,6 @@ export default function Landing() {
       <SourceProofSection />
       <LearningWorkspaceSection />
       <LearningProgressSection />
-      <GenerationSection />
       <BriefFooter />
     </main>
   );

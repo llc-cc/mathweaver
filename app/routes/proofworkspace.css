@@ -645,8 +645,8 @@
 
 .proof-ws-formula-tabs {
   display: flex;
-  gap: 4px;
-  padding: 7px 12px 6px;
+  gap: 2px;
+  padding: 7px 8px 6px;
   overflow-x: auto;
   border-bottom: 1px solid var(--line, #e7e2da);
   scrollbar-width: none;
@@ -655,9 +655,10 @@
 .proof-ws-formula-tabs::-webkit-scrollbar { display: none; }
 
 .proof-ws-formula-tabs button {
-  flex: 0 0 auto;
+  flex: 1 1 auto;
+  min-width: 0;
   min-height: 29px;
-  padding: 5px 9px;
+  padding: 5px 7px;
   white-space: nowrap;
   font-size: 10.5px;
 }
