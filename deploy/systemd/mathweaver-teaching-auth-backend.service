@@ -1,0 +1,32 @@
+[Unit]
+Description=MathWeaver isolated authentication backend
+After=network.target mysql.service
+PartOf=mathweaver-teaching-backend.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=nginx
+Group=nginx
+WorkingDirectory=/opt/mathweaver/current-teaching/backend
+EnvironmentFile=/opt/mathweaver/.env.teaching
+Environment=MATHWEAVER_RUNTIME_DIR=/run/mathweaver
+RuntimeDirectory=mathweaver
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/opt/mathweaver/current-teaching/.venv/bin/gunicorn --bind 127.0.0.1:5005 --worker-class gthread --workers 2 --threads 4 --backlog 1024 --timeout 30 --graceful-timeout 30 --keep-alive 2 --max-requests 1000 --max-requests-jitter 100 --access-logfile - --error-logfile - api_v2:app
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=40
+PrivateTmp=true
+NoNewPrivileges=true
+LimitNOFILE=65536
+TasksMax=256
+CPUWeight=80
+MemoryHigh=1G
+MemoryMax=1500M
+OOMScoreAdjust=100
+
+[Install]
+WantedBy=multi-user.target

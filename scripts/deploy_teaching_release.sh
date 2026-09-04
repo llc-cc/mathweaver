@@ -7,6 +7,7 @@ CURRENT=/opt/mathweaver/current-teaching
 PREVIOUS=/opt/mathweaver/previous-teaching
 ENV_FILE=/opt/mathweaver/.env.teaching
 BACKEND_UNIT=mathweaver-teaching-backend.service
+AUTH_BACKEND_UNIT=mathweaver-teaching-auth-backend.service
 AI_BACKEND_UNIT=mathweaver-teaching-ai-backend.service
 PIPELINE_BACKEND_UNIT=mathweaver-teaching-pipeline-backend.service
 FRONTEND_UNIT=mathweaver-teaching-frontend.service
@@ -15,6 +16,7 @@ BACKUP_UNIT=mathweaver-teaching-backup.service
 BACKUP_TIMER=mathweaver-teaching-backup.timer
 NGINX_ROUTING_CONFIG=/etc/nginx/conf.d/00-mathweaver-teaching-routing.conf
 NGINX_LEGACY_CONFIG=/etc/nginx/conf.d/mathweaver-teaching-18080.conf
+NGINX_DOMAIN_CONFIG=/etc/nginx/conf.d/mathweaver.cn.conf
 NEO4J_DATA_ROOT=/opt/mathweaver/neo4j
 # 目标服务器的 python3 仍指向 3.6；固定使用已安装的 3.11，避免 pip 静默降级依赖。
 PYTHON_BIN=python3.11
@@ -58,6 +60,7 @@ check_sidecar_ports_available() {
 5002 $BACKEND_UNIT
 5003 $AI_BACKEND_UNIT
 5004 $PIPELINE_BACKEND_UNIT
+5005 $AUTH_BACKEND_UNIT
 5174 $FRONTEND_UNIT
 18080 nginx.service
 EOF
@@ -78,28 +81,65 @@ check_legacy_listener_scope() {
   fi
 }
 
-install_nginx_routing() {
-  local source backup had_existing=0
-  source="$RELEASE_DIR/deploy/nginx/mathweaver-routing.conf"
-  backup=$(mktemp /tmp/mathweaver-nginx-routing.XXXXXX)
-  if [ -f "$NGINX_ROUTING_CONFIG" ]; then
-    cp -a "$NGINX_ROUTING_CONFIG" "$backup"
-    had_existing=1
-  fi
-  install -m 0644 "$source" "$NGINX_ROUTING_CONFIG"
+install_nginx_configs() {
+  local backup_dir source destination backup
+
+  for source in \
+    "$RELEASE_DIR/deploy/nginx/mathweaver-routing.conf" \
+    "$RELEASE_DIR/deploy/nginx/mathweaver-teaching-18080.conf" \
+    "$RELEASE_DIR/deploy/nginx/mathweaver.cn.conf"; do
+    [ -f "$source" ] || {
+      echo "missing Nginx release asset: $source" >&2
+      return 1
+    }
+  done
+
+  backup_dir=$(mktemp -d /tmp/mathweaver-nginx-configs.XXXXXX)
+
+  while read -r source destination; do
+    backup="$backup_dir/$(basename "$destination")"
+    if [ -f "$destination" ]; then
+      cp -a "$destination" "$backup"
+    else
+      touch "$backup.missing"
+    fi
+    install -m 0644 "$source" "$destination"
+  done <<EOF
+$RELEASE_DIR/deploy/nginx/mathweaver-routing.conf $NGINX_ROUTING_CONFIG
+$RELEASE_DIR/deploy/nginx/mathweaver-teaching-18080.conf $NGINX_LEGACY_CONFIG
+$RELEASE_DIR/deploy/nginx/mathweaver.cn.conf $NGINX_DOMAIN_CONFIG
+EOF
+
   if nginx -t; then
-    rm -f "$backup"
+    rm -r -- "$backup_dir"
     return 0
   fi
-  if [ "$had_existing" -eq 1 ]; then
-    cp -a "$backup" "$NGINX_ROUTING_CONFIG"
-  else
-    rm -f "$NGINX_ROUTING_CONFIG"
-  fi
-  rm -f "$backup"
+
+  while read -r source destination; do
+    backup="$backup_dir/$(basename "$destination")"
+    if [ -f "$backup.missing" ]; then
+      rm -f -- "$destination"
+    else
+      cp -a "$backup" "$destination"
+    fi
+  done <<EOF
+$RELEASE_DIR/deploy/nginx/mathweaver-routing.conf $NGINX_ROUTING_CONFIG
+$RELEASE_DIR/deploy/nginx/mathweaver-teaching-18080.conf $NGINX_LEGACY_CONFIG
+$RELEASE_DIR/deploy/nginx/mathweaver.cn.conf $NGINX_DOMAIN_CONFIG
+EOF
+  rm -r -- "$backup_dir"
   nginx -t >/dev/null
-  echo "new Nginx routing was rejected; the previous valid config was restored" >&2
+  echo "new Nginx configuration was rejected; the previous valid files were restored" >&2
   return 1
+}
+
+retire_legacy_backend_override() {
+  local legacy=/etc/systemd/system/mathweaver-teaching-backend.service.d/ai-isolation.conf
+  local retired=/opt/mathweaver/retired-systemd-overrides
+  if [ -f "$legacy" ]; then
+    install -d -o root -g root -m 0700 "$retired"
+    mv -- "$legacy" "$retired/ai-isolation.conf.$(date +%Y%m%d-%H%M%S)"
+  fi
 }
 
 load_environment() {
@@ -232,23 +272,27 @@ start_release() {
   prepare_persistent_storage
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$NEO4J_UNIT" "/etc/systemd/system/$NEO4J_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKEND_UNIT" "/etc/systemd/system/$BACKEND_UNIT"
+  install -m 0644 "$RELEASE_DIR/deploy/systemd/$AUTH_BACKEND_UNIT" "/etc/systemd/system/$AUTH_BACKEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$AI_BACKEND_UNIT" "/etc/systemd/system/$AI_BACKEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$PIPELINE_BACKEND_UNIT" "/etc/systemd/system/$PIPELINE_BACKEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$FRONTEND_UNIT" "/etc/systemd/system/$FRONTEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKUP_UNIT" "/etc/systemd/system/$BACKUP_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKUP_TIMER" "/etc/systemd/system/$BACKUP_TIMER"
+  retire_legacy_backend_override
   check_legacy_listener_scope
-  install_nginx_routing
+  install_nginx_configs
+  check_legacy_listener_scope
   activate_link "$RELEASE_DIR"
   systemctl daemon-reload
   systemctl enable --now "$NEO4J_UNIT"
   systemctl enable --now "$BACKUP_TIMER"
-  systemctl enable "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
+  systemctl enable "$BACKEND_UNIT" "$AUTH_BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
   # enable --now 不会重启已运行进程；切换软链后必须显式重启，确保执行的是新发布目录。
-  systemctl restart "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
+  systemctl restart "$BACKEND_UNIT" "$AUTH_BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
   wait_for_url "http://127.0.0.1:5002/health/ready"
   wait_for_url "http://127.0.0.1:5003/health/ready"
   wait_for_url "http://127.0.0.1:5004/health/ready"
+  wait_for_url "http://127.0.0.1:5005/health/ready"
   wait_for_url "http://127.0.0.1:5174/"
   nginx -t
   systemctl reload nginx
@@ -266,10 +310,11 @@ rollback() {
   prepare_persistent_storage
   activate_link "$target"
   systemctl enable --now "$NEO4J_UNIT"
-  systemctl restart "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
+  systemctl restart "$BACKEND_UNIT" "$AUTH_BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
   wait_for_url "http://127.0.0.1:5002/health/ready"
   wait_for_url "http://127.0.0.1:5003/health/ready"
   wait_for_url "http://127.0.0.1:5004/health/ready"
+  wait_for_url "http://127.0.0.1:5005/health/ready"
   wait_for_url "http://127.0.0.1:5174/"
   echo "rolled back teaching sidecar to: $target"
 }
