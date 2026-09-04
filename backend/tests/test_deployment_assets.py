@@ -11,9 +11,12 @@ BACKEND_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-backend.service"
 AI_BACKEND_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-ai-backend.service"
 PIPELINE_BACKEND_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-pipeline-backend.service"
 FRONTEND_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-frontend.service"
+BACKUP_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-backup.service"
+BACKUP_TIMER = ROOT / "deploy/systemd/mathweaver-teaching-backup.timer"
 NGINX = ROOT / "deploy/nginx/mathweaver-teaching-18080.conf"
 DEPLOY = ROOT / "scripts/deploy_teaching_release.sh"
 SMOKE = ROOT / "scripts/smoke_teaching_release.sh"
+BACKUP = ROOT / "scripts/backup_teaching_data.sh"
 BUILD = ROOT / "scripts/build_release.ps1"
 GIT_ATTRIBUTES = ROOT / ".gitattributes"
 
@@ -53,10 +56,10 @@ def test_expensive_ai_and_pipeline_workloads_are_process_isolated() -> None:
     assert "--max-requests" not in pipeline_backend
 
 
-def test_nginx_uses_18080_and_proxies_api_to_5002() -> None:
+def test_nginx_uses_loopback_18080_and_proxies_api_to_5002() -> None:
     nginx = _text(NGINX)
 
-    assert re.search(r"listen\s+18080\s*;", nginx)
+    assert re.search(r"listen\s+127\.0\.0\.1:18080\s*;", nginx)
     assert "location /api/" in nginx
     assert "proxy_pass http://127.0.0.1:5002" in nginx
     assert "proxy_pass http://127.0.0.1:5174" in nginx
@@ -66,7 +69,10 @@ def test_deploy_script_never_overwrites_3000_or_5001_services() -> None:
     deploy = _text(DEPLOY)
 
     assert "mathweaver-teaching-backend.service" in deploy
+    assert "mathweaver-teaching-ai-backend.service" in deploy
+    assert "mathweaver-teaching-pipeline-backend.service" in deploy
     assert "mathweaver-teaching-frontend.service" in deploy
+    assert "mathweaver-neo4j.service" in deploy
     assert "systemctl restart mathweaver.service" not in deploy
     assert "systemctl stop mathweaver.service" not in deploy
     assert "proxy_pass http://127.0.0.1:5001" not in deploy
@@ -105,7 +111,9 @@ def test_service_start_uses_a_bounded_readiness_wait() -> None:
     assert "wait_for_url()" in deploy
     assert 'while [ "$attempt" -lt 30 ]' in deploy
     assert "sleep 1" in deploy
-    assert 'wait_for_url "http://127.0.0.1:5002/api/v2/ready"' in deploy
+    assert 'wait_for_url "http://127.0.0.1:5002/health/ready"' in deploy
+    assert 'wait_for_url "http://127.0.0.1:5003/health/ready"' in deploy
+    assert 'wait_for_url "http://127.0.0.1:5004/health/ready"' in deploy
     assert 'wait_for_url "http://127.0.0.1:5174/"' in deploy
 
 
@@ -119,9 +127,10 @@ def test_start_restarts_active_sidecars_after_switching_the_release_link() -> No
     )
 
     assert start_body is not None
-    assert 'systemctl enable "$BACKEND_UNIT" "$FRONTEND_UNIT"' in start_body["body"]
-    assert 'systemctl restart "$BACKEND_UNIT" "$FRONTEND_UNIT"' in start_body["body"]
-    assert not re.search(r"systemctl\s+enable\s+--now", start_body["body"])
+    assert 'systemctl enable "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"' in start_body["body"]
+    assert 'systemctl restart "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"' in start_body["body"]
+    assert 'systemctl enable --now "$NEO4J_UNIT"' in start_body["body"]
+    assert 'systemctl enable --now "$BACKUP_TIMER"' in start_body["body"]
 
 
 def test_release_uses_version_directory_and_atomic_symlink() -> None:
@@ -133,6 +142,19 @@ def test_release_uses_version_directory_and_atomic_symlink() -> None:
     assert "mv -Tf" in deploy
     assert "previous-teaching" in deploy
     assert "rollback" in deploy
+
+
+def test_backup_covers_all_persistent_stores_and_is_scheduled() -> None:
+    backup = _text(BACKUP)
+    unit = _text(BACKUP_UNIT)
+    timer = _text(BACKUP_TIMER)
+
+    assert "--single-transaction" in backup
+    assert "export_graph_backup.py" in backup
+    assert "data-teaching.tar.gz" in backup
+    assert "sha256sum -c SHA256SUMS" in backup
+    assert "/opt/mathweaver/current-teaching/scripts/backup_teaching_data.sh" in unit
+    assert "OnCalendar=" in timer and "Persistent=true" in timer
 
 
 def test_release_builder_excludes_runtime_and_secret_files() -> None:
@@ -153,7 +175,20 @@ def test_linux_deployment_assets_are_forced_to_lf_in_release_archives() -> None:
 
 def test_no_secret_literal_exists_in_deploy_assets() -> None:
     content = "\n".join(
-        _text(path) for path in (BACKEND_UNIT, FRONTEND_UNIT, NGINX, DEPLOY, SMOKE, BUILD)
+        _text(path)
+        for path in (
+            BACKEND_UNIT,
+            AI_BACKEND_UNIT,
+            PIPELINE_BACKEND_UNIT,
+            FRONTEND_UNIT,
+            BACKUP_UNIT,
+            BACKUP_TIMER,
+            NGINX,
+            DEPLOY,
+            SMOKE,
+            BACKUP,
+            BUILD,
+        )
     )
 
     assert not re.search(r"(?i)(password|api[_-]?key)\s*=\s*['\"][^$'\"]+", content)

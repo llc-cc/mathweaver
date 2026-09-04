@@ -7,8 +7,14 @@ CURRENT=/opt/mathweaver/current-teaching
 PREVIOUS=/opt/mathweaver/previous-teaching
 ENV_FILE=/opt/mathweaver/.env.teaching
 BACKEND_UNIT=mathweaver-teaching-backend.service
+AI_BACKEND_UNIT=mathweaver-teaching-ai-backend.service
+PIPELINE_BACKEND_UNIT=mathweaver-teaching-pipeline-backend.service
 FRONTEND_UNIT=mathweaver-teaching-frontend.service
+NEO4J_UNIT=mathweaver-neo4j.service
+BACKUP_UNIT=mathweaver-teaching-backup.service
+BACKUP_TIMER=mathweaver-teaching-backup.timer
 NGINX_CONFIG=/etc/nginx/conf.d/mathweaver-teaching-18080.conf
+NEO4J_DATA_ROOT=/opt/mathweaver/neo4j
 # 目标服务器的 python3 仍指向 3.6；固定使用已安装的 3.11，避免 pip 静默降级依赖。
 PYTHON_BIN=python3.11
 
@@ -38,13 +44,67 @@ resolve_release() {
   }
 }
 
-check_sidecar_ports_free() {
-  local port
-  for port in 5002 5174 18080; do
+check_sidecar_ports_available() {
+  local port unit
+  while read -r port unit; do
     if ss -ltnH | awk '{print $4}' | grep -Eq "(^|:)$port$"; then
-      echo "sidecar port $port is already occupied" >&2
-      exit 69
+      if ! systemctl is-active --quiet "$unit"; then
+        echo "sidecar port $port is occupied outside $unit" >&2
+        exit 69
+      fi
     fi
+  done <<EOF
+5002 $BACKEND_UNIT
+5003 $AI_BACKEND_UNIT
+5004 $PIPELINE_BACKEND_UNIT
+5174 $FRONTEND_UNIT
+18080 nginx.service
+EOF
+}
+
+load_environment() {
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+  : "${MATHWEAVER_DATABASE_URL:?MATHWEAVER_DATABASE_URL is required}"
+  : "${MATHWEAVER_DATABASE_NAME:?MATHWEAVER_DATABASE_NAME is required}"
+  : "${NEO4J_URI:?NEO4J_URI is required}"
+  : "${MATHWEAVER_DATA_KEY_FILE:?MATHWEAVER_DATA_KEY_FILE is required}"
+  : "${MATHGRAPH_DATA_DIR:?MATHGRAPH_DATA_DIR is required}"
+  if [ -z "${NEO4J_PASSWORD:-}" ] && [ -z "${NEO4J_PASSWORD_FILE:-}" ]; then
+    echo "NEO4J_PASSWORD or NEO4J_PASSWORD_FILE is required" >&2
+    exit 74
+  fi
+}
+
+prepare_persistent_storage() {
+  load_environment
+  install -d -o nginx -g nginx -m 0750 \
+    "$MATHGRAPH_DATA_DIR" \
+    "$MATHGRAPH_DATA_DIR/jobs" \
+    "$MATHGRAPH_DATA_DIR/uploads/source_pdfs" \
+    "$MATHGRAPH_DATA_DIR/education" \
+    "$MATHGRAPH_DATA_DIR/graph-staging"
+  install -d -o neo4j -g neo4j -m 0750 \
+    "$NEO4J_DATA_ROOT/data" \
+    "$NEO4J_DATA_ROOT/logs" \
+    "$NEO4J_DATA_ROOT/run"
+  local path
+  for path in \
+    "$MATHGRAPH_DATA_DIR" \
+    "$MATHGRAPH_DATA_DIR/jobs" \
+    "$MATHGRAPH_DATA_DIR/uploads/source_pdfs" \
+    "$MATHGRAPH_DATA_DIR/education" \
+    "$MATHGRAPH_DATA_DIR/graph-staging"; do
+    runuser -u nginx -- test -r "$path"
+    runuser -u nginx -- test -w "$path"
+    runuser -u nginx -- test -x "$path"
+  done
+  for path in "$NEO4J_DATA_ROOT/data" "$NEO4J_DATA_ROOT/logs" "$NEO4J_DATA_ROOT/run"; do
+    runuser -u neo4j -- test -r "$path"
+    runuser -u neo4j -- test -w "$path"
+    runuser -u neo4j -- test -x "$path"
   done
 }
 
@@ -82,9 +142,12 @@ preflight() {
   command -v nginx >/dev/null
   command -v curl >/dev/null
   command -v ss >/dev/null
+  command -v systemctl >/dev/null
   command -v setfacl >/dev/null
+  command -v runuser >/dev/null
   getent passwd nginx >/dev/null || { echo "required nginx service account is missing" >&2; exit 73; }
-  check_sidecar_ports_free
+  getent passwd neo4j >/dev/null || { echo "required neo4j service account is missing" >&2; exit 73; }
+  check_sidecar_ports_available
   df -Pk "$ROOT" | awk 'NR==2 { if ($4 < 2097152) exit 1 }'
   echo "preflight ok: $RELEASE_DIR"
 }
@@ -100,19 +163,7 @@ migrate() {
   # 服务器只运行 Web 旁路服务，跳过不会被使用且依赖外网下载的 Electron 桌面二进制。
   ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix "$RELEASE_DIR" ci
   npm --prefix "$RELEASE_DIR" run build
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
-  : "${MATHWEAVER_DATABASE_URL:?MATHWEAVER_DATABASE_URL is required}"
-  : "${MATHWEAVER_DATABASE_NAME:?MATHWEAVER_DATABASE_NAME is required}"
-  : "${NEO4J_URI:?NEO4J_URI is required}"
-  : "${MATHWEAVER_DATA_KEY_FILE:?MATHWEAVER_DATA_KEY_FILE is required}"
-  : "${MATHGRAPH_DATA_DIR:?MATHGRAPH_DATA_DIR is required}"
-  if [ -z "${NEO4J_PASSWORD:-}" ] && [ -z "${NEO4J_PASSWORD_FILE:-}" ]; then
-    echo "NEO4J_PASSWORD or NEO4J_PASSWORD_FILE is required" >&2
-    exit 74
-  fi
+  load_environment
   cd "$RELEASE_DIR"
   "$RELEASE_DIR/.venv/bin/python" backend/scripts/upgrade_database.py
   "$RELEASE_DIR/.venv/bin/python" backend/scripts/migrate_legacy_mysql_storage.py --apply
@@ -135,17 +186,27 @@ start_release() {
   # 根目录与当前发布都保持 750，仅给 nginx 穿越权限，不开放目录枚举或敏感文件读取。
   setfacl -m u:nginx:--x "$ROOT"
   setfacl -m u:nginx:--x "$RELEASE_DIR"
+  prepare_persistent_storage
   activate_link "$RELEASE_DIR"
+  install -m 0644 "$RELEASE_DIR/deploy/systemd/$NEO4J_UNIT" "/etc/systemd/system/$NEO4J_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKEND_UNIT" "/etc/systemd/system/$BACKEND_UNIT"
+  install -m 0644 "$RELEASE_DIR/deploy/systemd/$AI_BACKEND_UNIT" "/etc/systemd/system/$AI_BACKEND_UNIT"
+  install -m 0644 "$RELEASE_DIR/deploy/systemd/$PIPELINE_BACKEND_UNIT" "/etc/systemd/system/$PIPELINE_BACKEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$FRONTEND_UNIT" "/etc/systemd/system/$FRONTEND_UNIT"
+  install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKUP_UNIT" "/etc/systemd/system/$BACKUP_UNIT"
+  install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKUP_TIMER" "/etc/systemd/system/$BACKUP_TIMER"
   install -m 0644 "$RELEASE_DIR/deploy/nginx/mathweaver-teaching-18080.conf" "$NGINX_CONFIG"
   systemctl daemon-reload
-  systemctl enable "$BACKEND_UNIT" "$FRONTEND_UNIT"
+  systemctl enable --now "$NEO4J_UNIT"
+  systemctl enable --now "$BACKUP_TIMER"
+  systemctl enable "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
   # enable --now 不会重启已运行进程；切换软链后必须显式重启，确保执行的是新发布目录。
-  systemctl restart "$BACKEND_UNIT" "$FRONTEND_UNIT"
+  systemctl restart "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
   nginx -t
   systemctl reload nginx
   wait_for_url "http://127.0.0.1:5002/health/ready"
+  wait_for_url "http://127.0.0.1:5003/health/ready"
+  wait_for_url "http://127.0.0.1:5004/health/ready"
   wait_for_url "http://127.0.0.1:5174/"
   echo "sidecar release started: $RELEASE_DIR"
 }
@@ -158,9 +219,13 @@ rollback() {
     "$RELEASES"/*) ;;
     *) echo "previous release target is invalid" >&2; exit 72 ;;
   esac
+  prepare_persistent_storage
   activate_link "$target"
-  systemctl restart "$BACKEND_UNIT" "$FRONTEND_UNIT"
+  systemctl enable --now "$NEO4J_UNIT"
+  systemctl restart "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
   wait_for_url "http://127.0.0.1:5002/health/ready"
+  wait_for_url "http://127.0.0.1:5003/health/ready"
+  wait_for_url "http://127.0.0.1:5004/health/ready"
   wait_for_url "http://127.0.0.1:5174/"
   echo "rolled back teaching sidecar to: $target"
 }
