@@ -24,9 +24,12 @@ sha256sum -c SHA256SUMS
 ```
 
 The installed timer runs the same online logical backup once each night. MySQL
-uses a single transaction, every Neo4j graph is checked against the MySQL graph
-registry, and the persistent file tree is archived without changing application
-data.
+uses a single transaction and includes the application schema, triggers, and all
+rows. Stored routines and MySQL Events are intentionally excluded because this
+application does not define them and the production application account does not
+need elevated routine/event privileges. Every Neo4j graph is checked against the
+MySQL graph registry, and the persistent file tree is archived without changing
+application data.
 
 ## Recovery order
 

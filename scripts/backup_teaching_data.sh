@@ -80,7 +80,7 @@ chmod 600 "$MYSQL_DEFAULTS"
 
 mysqldump \
   --defaults-extra-file="$MYSQL_DEFAULTS" \
-  --single-transaction --quick --routines --triggers --events --hex-blob \
+  --single-transaction --quick --triggers --hex-blob \
   --no-tablespaces --set-gtid-purged=OFF \
   "$DATABASE_NAME" | gzip -c >"$PARTIAL_DIR/mysql.sql.gz"
 
