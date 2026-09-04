@@ -3,6 +3,7 @@ import os
 import random
 import threading
 import time
+import uuid
 from queue import Empty, Queue
 
 from tqdm import tqdm
@@ -213,10 +214,20 @@ class MultiProcessor:
             checkpoint_path = self.checkpoint_path_1
             self.choose_checkpoint = True
 
-        temp_path = f"{checkpoint_path}.tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(self._json_safe(existing_results), f, ensure_ascii=False, indent=4)
-        os.replace(temp_path, checkpoint_path)
+        temp_path = (
+            f"{checkpoint_path}.tmp.{os.getpid()}."
+            f"{threading.get_ident()}.{uuid.uuid4().hex}"
+        )
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(self._json_safe(existing_results), f, ensure_ascii=False, indent=4)
+            os.replace(temp_path, checkpoint_path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     def load_checkpoint(self):
         checkpoint_path = self.checkpoint_path_1 if self.choose_checkpoint else self.checkpoint_path_0
@@ -270,6 +281,8 @@ class MultiProcessor:
         checkpoint_interval = max(1, int(checkpoint))
         results_lock = threading.Lock()
         checkpoint_lock = threading.Lock()
+        worker_errors = []
+        worker_errors_lock = threading.Lock()
 
         for index, key_dict in remaining_tasks.items():
             queue.put((str(index), key_dict))
@@ -291,18 +304,18 @@ class MultiProcessor:
                         with results_lock:
                             results[index] = self._json_safe(result)
 
-                    should_save = False
-                    current_counter = 0
                     with checkpoint_lock:
                         checkpoint_counter += 1
                         current_counter = checkpoint_counter
                         should_save = checkpoint_counter % checkpoint_interval == 0
-
-                    if should_save:
-                        print(f"Saving checkpoint at counter {current_counter}")
-                        with results_lock:
-                            snapshot = results.copy()
-                        self.save_checkpoint(snapshot)
+                        if should_save:
+                            print(f"Saving checkpoint at counter {current_counter}")
+                            with results_lock:
+                                snapshot = results.copy()
+                            self.save_checkpoint(snapshot)
+                except Exception as exc:
+                    with worker_errors_lock:
+                        worker_errors.append(exc)
                 finally:
                     queue.task_done()
                     pbar.update(1)
@@ -318,6 +331,11 @@ class MultiProcessor:
 
             for thread in threads:
                 thread.join()
+
+        if worker_errors:
+            raise RuntimeError(
+                f"{len(worker_errors)} worker(s) failed while saving task progress"
+            ) from worker_errors[0]
 
         with results_lock:
             final_snapshot = results.copy()

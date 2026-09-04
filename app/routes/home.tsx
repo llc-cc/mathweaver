@@ -3527,10 +3527,13 @@ export default function Home() {
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
+        const capacityBusy = res.status === 429 || body.code === "pipeline_capacity_busy";
         const nextError: ErrorInfo = {
-          code: res.status === 400 ? "document_input" : "internal",
-          title: res.status === 400 ? "文档内容无法处理" : "文档提交失败",
-          msg: res.status === 400
+          code: capacityBusy ? "service_limit" : res.status === 400 ? "document_input" : "internal",
+          title: capacityBusy ? "服务器正在处理其他分析任务" : res.status === 400 ? "文档内容无法处理" : "文档提交失败",
+          msg: capacityBusy
+            ? "当前安全处理名额已满。服务器仍在正常运行，请保留本页并稍后重新提交。"
+            : res.status === 400
             ? "请确认文件内容和 API 配置完整后重新提交。"
             : "后端暂时无法接收该任务，请稍后重试。",
           detail: body.error ?? body.message ?? "",

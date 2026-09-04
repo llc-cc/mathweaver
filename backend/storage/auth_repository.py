@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -15,6 +15,7 @@ from storage.models import LoginSession, User
 
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
+SESSION_LAST_USED_WRITE_INTERVAL = timedelta(seconds=60)
 
 
 class UserAlreadyExistsError(RuntimeError):
@@ -106,7 +107,16 @@ class AuthRepository:
             if row is None:
                 return None
             user, login_session = row
-            login_session.last_used_at = now
+            last_used_at = login_session.last_used_at
+            comparable_now = now.replace(tzinfo=None)
+            comparable_last_used = (
+                last_used_at.replace(tzinfo=None) if last_used_at is not None else None
+            )
+            if (
+                comparable_last_used is None
+                or comparable_now - comparable_last_used >= SESSION_LAST_USED_WRITE_INTERVAL
+            ):
+                login_session.last_used_at = now
             return user
 
     def revoke_session(self, token_hash: str, now: datetime) -> None:

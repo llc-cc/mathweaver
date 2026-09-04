@@ -120,7 +120,10 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
         const timeout = setTimeout(() => ctrl.abort(), 15000);
         let res: Response;
         try {
-          res = await fetch(apiUrl(`/api/v2/jobs/${id}/status`), { signal: ctrl.signal });
+          res = await fetch(apiUrl(`/api/v2/jobs/${id}/status`), {
+            headers: mutationHeaders(),
+            signal: ctrl.signal,
+          });
           statusCode = res.status;
         } finally {
           clearTimeout(timeout);
@@ -160,7 +163,9 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
 
         if (status.status === "done") {
           try {
-            const rRes = await fetch(apiUrl(`/api/v2/jobs/${id}/result`));
+            const rRes = await fetch(apiUrl(`/api/v2/jobs/${id}/result`), {
+              headers: mutationHeaders(),
+            });
             const result = await rRes.json();
             patchJob(id, { phase: "done", result, pct: 100, pendingAction: null });
           } catch {

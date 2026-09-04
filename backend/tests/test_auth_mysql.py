@@ -40,6 +40,22 @@ def test_register_login_and_logout_store_only_token_hash(database) -> None:
     assert service.authenticate(registration.token) is None
 
 
+def test_repeated_authentication_does_not_rewrite_session_immediately(database) -> None:
+    service = AuthService(AuthRepository())
+    registration = service.register_student("polling@example.com", "secret1")
+
+    assert service.authenticate(registration.token) is not None
+    with session_scope() as session:
+        first_touch = session.scalar(select(LoginSession)).last_used_at
+
+    assert service.authenticate(registration.token) is not None
+    with session_scope() as session:
+        second_touch = session.scalar(select(LoginSession)).last_used_at
+
+    assert first_touch is not None
+    assert second_touch == first_touch
+
+
 def test_duplicate_registration_has_stable_domain_error(database) -> None:
     service = AuthService(AuthRepository())
     service.register_student("student@example.com", "secret1")

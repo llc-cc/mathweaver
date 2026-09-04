@@ -90,6 +90,7 @@ from ocr_runtime import (
     OcrError,
     get_ocr_manager,
 )
+from runtime_capacity import ProcessCapacityPool
 from storage.database import (
     DatabaseConfigurationError,
     IntegrityError,
@@ -108,13 +109,47 @@ from storage.graph_service import (
 from integrations.neo4j_handler import GraphStoreError, get_graph_store
 from storage.secrets import decrypt_secret, encrypt_secret, session_token_hash
 
+def _bounded_env_int(name: str, default: int, *, minimum: int = 1, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = _bounded_env_int(
+    "MATHWEAVER_MAX_REQUEST_BYTES",
+    120 * 1024 * 1024,
+    minimum=1024 * 1024,
+    maximum=512 * 1024 * 1024,
+)
 CORS(app)
 
 # ── MySQL business storage / Neo4j graph storage ─────────────────────────────
 
 _DATA_ROOT = Path(os.environ.get("MATHGRAPH_DATA_DIR", str(Path(__file__).parent))).expanduser()
 _DATA_ROOT.mkdir(parents=True, exist_ok=True)
+_RUNTIME_ROOT = Path(
+    os.environ.get("MATHWEAVER_RUNTIME_DIR", str(_DATA_ROOT / "runtime"))
+).expanduser()
+_CAPACITY_ROOT = _RUNTIME_ROOT / "capacity"
+_AI_CAPACITY_POOL = ProcessCapacityPool(
+    _CAPACITY_ROOT,
+    "ai",
+    _bounded_env_int("MATHWEAVER_AI_MAX_ACTIVE", 4, maximum=32),
+)
+_PIPELINE_CAPACITY_POOL = ProcessCapacityPool(
+    _CAPACITY_ROOT,
+    "pipeline",
+    _bounded_env_int("MATHWEAVER_PIPELINE_MAX_ACTIVE", 2, maximum=16),
+)
+_CAPACITY_RETRY_AFTER = _bounded_env_int(
+    "MATHWEAVER_CAPACITY_RETRY_AFTER_SECONDS", 5, maximum=60
+)
+_JOB_MEMORY_TTL_SECONDS = _bounded_env_int(
+    "MATHWEAVER_JOB_MEMORY_TTL_SECONDS", 3600, minimum=60, maximum=7 * 24 * 3600
+)
 _SOURCE_PDF_ROOT = _DATA_ROOT / "uploads" / "source_pdfs"
 _EDUCATION_ROOT = _DATA_ROOT / "education"
 _EDUCATION_SNAPSHOT_ROOT = _EDUCATION_ROOT / "snapshots"
@@ -203,8 +238,11 @@ def _invalidate_api_graph(graph_id: str) -> None:
 
 def _current_user():
     """Return user row if request carries a valid Bearer token, else None."""
+    if hasattr(g, "mathweaver_current_user"):
+        return g.mathweaver_current_user
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
+        g.mathweaver_current_user = None
         return None
     token = auth[7:]
     db = _get_db()
@@ -212,7 +250,8 @@ def _current_user():
         "SELECT u.*, s.education_role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
         (session_token_hash(token),),
     ).fetchone()
-    return row
+    g.mathweaver_current_user = row
+    return g.mathweaver_current_user
 
 
 def _public_source_pdf_meta(meta: dict | None) -> dict | None:
@@ -1070,7 +1109,15 @@ def history_save():
     body = request.get_json(silent=True) or {}
     job_id = body.get("job_id") or ""
     job = _jobs.get(job_id)
-    if not job or job["status"] != "done":
+    if not job:
+        row = _get_db().execute(
+            "SELECT status FROM history WHERE id = ? AND user_id = ?",
+            (job_id, user["id"]),
+        ).fetchone()
+        if row and (row["status"] or "done") == "done":
+            return jsonify({"ok": True, "id": job_id}), 201
+        return jsonify({"error": "job not done or not found"}), 400
+    if job["status"] != "done":
         return jsonify({"error": "job not done or not found"}), 400
     if not _upsert_job_history(job, "done", int(user["id"])):
         return jsonify({"error": "unable to save history"}), 500
@@ -1230,6 +1277,8 @@ def history_resume(hist_id):
     error = _begin_pipeline_resume(hist_id)
     if error:
         message, status_code = error
+        if status_code == 429:
+            return _pipeline_busy_response()
         return jsonify({"error": message}), status_code
     with _jobs_lock:
         snapshot = _job_tracking_snapshot(_jobs[hist_id])
@@ -1425,7 +1474,10 @@ def _education_ai_error_code(error) -> str | None:
 def _education_ai_error_response(error, fallback_code: str, fallback_status: int = 503):
     code = _education_ai_error_code(error) or fallback_code
     status = error.status if isinstance(error, EducationAIError) else fallback_status
-    return jsonify({"error": str(error), "code": code}), status
+    response = jsonify({"error": str(error), "code": code})
+    if code == "education_ai_busy":
+        response.headers["Retry-After"] = str(_CAPACITY_RETRY_AFTER)
+    return response, status
 
 
 def _education_safe_error_message(error, config: dict | None = None) -> str:
@@ -1847,49 +1899,59 @@ def _education_ai_tasks(
             "education AI is not configured",
             503,
         )
-    allowed, _remaining = _education_consume_ai_quota(user_id)
-    if not allowed:
+    capacity_lease = _AI_CAPACITY_POOL.try_acquire()
+    if capacity_lease is None:
         raise EducationAIError(
-            "education_ai_limit_reached",
-            "education AI daily limit reached",
+            "education_ai_busy",
+            "education AI capacity is busy; retry shortly",
             429,
         )
-    record_id = uuid.uuid4().hex
-    now = datetime.utcnow().isoformat()
-    db = _get_db()
-    db.execute(
-        """INSERT INTO education_ai_tasks
-             (id, task_key, user_id, task_kind, scope, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 'running', ?, ?)""",
-        (record_id, task_id, user_id, task_kind, scope, now, now),
-    )
-    db.commit()
     try:
-        context = create_education_context(_DATA_ROOT, config)
-        checkpoint_dir = _EDUCATION_ROOT / scope / "llm_tasks" / task_kind
-        result = run_structured_education_tasks(
-            context=context,
-            tasks=tasks,
-            task_kind=task_kind,
-            checkpoint_dir=checkpoint_dir,
-        )
+        allowed, _remaining = _education_consume_ai_quota(user_id)
+        if not allowed:
+            raise EducationAIError(
+                "education_ai_limit_reached",
+                "education AI daily limit reached",
+                429,
+            )
+        record_id = uuid.uuid4().hex
+        now = datetime.utcnow().isoformat()
+        db = _get_db()
         db.execute(
-            "UPDATE education_ai_tasks SET status = 'done', updated_at = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), record_id),
+            """INSERT INTO education_ai_tasks
+                 (id, task_key, user_id, task_kind, scope, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'running', ?, ?)""",
+            (record_id, task_id, user_id, task_kind, scope, now, now),
         )
         db.commit()
-        return result
-    except Exception as exc:
-        safe_error = _education_safe_error_message(exc, config)
-        db.execute(
-            """UPDATE education_ai_tasks
-               SET status = 'failed', error = ?, updated_at = ? WHERE id = ?""",
-            (safe_error[:1000], datetime.utcnow().isoformat(), record_id),
-        )
-        db.commit()
-        if safe_error != str(exc):
-            raise RuntimeError(safe_error) from None
-        raise
+        try:
+            context = create_education_context(_DATA_ROOT, config)
+            checkpoint_dir = _EDUCATION_ROOT / scope / "llm_tasks" / task_kind
+            result = run_structured_education_tasks(
+                context=context,
+                tasks=tasks,
+                task_kind=task_kind,
+                checkpoint_dir=checkpoint_dir,
+            )
+            db.execute(
+                "UPDATE education_ai_tasks SET status = 'done', updated_at = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), record_id),
+            )
+            db.commit()
+            return result
+        except Exception as exc:
+            safe_error = _education_safe_error_message(exc, config)
+            db.execute(
+                """UPDATE education_ai_tasks
+                   SET status = 'failed', error = ?, updated_at = ? WHERE id = ?""",
+                (safe_error[:1000], datetime.utcnow().isoformat(), record_id),
+            )
+            db.commit()
+            if safe_error != str(exc):
+                raise RuntimeError(safe_error) from None
+            raise
+    finally:
+        capacity_lease.release()
 
 
 def _education_ai_task(*, user_id: int, task_id: str, task_kind: str, payload: dict, scope: str):
@@ -6877,6 +6939,64 @@ _jobs: dict[str, dict] = {}
 _jobs_lock = threading.RLock()
 _job_runtimes: dict[str, dict] = {}
 
+
+class PipelineCapacityUnavailable(RuntimeError):
+    """The server is healthy but all safe pipeline slots are occupied."""
+
+
+def _prune_terminal_jobs(now: float | None = None) -> int:
+    """Bound retained in-process results without deleting persisted history."""
+    cutoff = (time.time() if now is None else now) - _JOB_MEMORY_TTL_SECONDS
+    disposable_artifacts: list[tuple[str, str | None]] = []
+    removed_count = 0
+    with _jobs_lock:
+        for job_id, job in tuple(_jobs.items()):
+            if job_id in _job_runtimes:
+                continue
+            if job.get("status") not in {"done", "error"}:
+                continue
+            finished_at = job.get("_finished_at")
+            if finished_at is None or float(finished_at) > cutoff:
+                continue
+            removed = _jobs.pop(job_id, None)
+            removed_count += int(removed is not None)
+            if removed and not removed.get("_persistent_artifacts"):
+                disposable_artifacts.append((job_id, removed.get("_artifact_dir")))
+    for job_id, artifact_dir in disposable_artifacts:
+        try:
+            _remove_job_artifacts(job_id, artifact_dir)
+        except (OSError, ValueError):
+            pass
+    return removed_count
+
+
+def _release_capacity_leases(leases) -> None:
+    for lease in reversed(tuple(leases or ())):
+        lease.release()
+
+
+def _acquire_pipeline_capacity_leases():
+    pipeline_lease = _PIPELINE_CAPACITY_POOL.try_acquire()
+    if pipeline_lease is None:
+        raise PipelineCapacityUnavailable("pipeline capacity is busy")
+    ai_lease = _AI_CAPACITY_POOL.try_acquire()
+    if ai_lease is None:
+        pipeline_lease.release()
+        raise PipelineCapacityUnavailable("AI capacity is busy")
+    return pipeline_lease, ai_lease
+
+
+def _pipeline_busy_response():
+    response = jsonify({
+        "error": "server_busy",
+        "code": "pipeline_capacity_busy",
+        "message": "服务器正在处理其他分析任务，请稍后重试。",
+        "retry_after": _CAPACITY_RETRY_AFTER,
+    })
+    response.headers["Retry-After"] = str(_CAPACITY_RETRY_AFTER)
+    return response, 429
+
+
 STAGE_DEFS = list(FIXED_STAGE_DEFS)
 
 
@@ -7692,10 +7812,15 @@ def _execute_pipeline_worker(payload: dict, emit):
             embedding_api_url=llm["embedding_url"],
             embedding_api_key=llm["embedding_api_key"],
             embedding_model_name=llm["embedding_model"],
+            num_threads=_bounded_env_int(
+                "MATHWEAVER_PIPELINE_LLM_THREADS", 4, maximum=32
+            ),
             enable_analysis=True,
             source_format=source_format,
             source_origin=source_origin,
-            checkpoint=1,
+            checkpoint=_bounded_env_int(
+                "MATHWEAVER_PIPELINE_CHECKPOINT_INTERVAL", 10, maximum=1000
+            ),
             cache_policy="minimal",
         )
         matrix_flow_runner = MatrixFlowRunner(ctx)
@@ -7830,6 +7955,7 @@ def _apply_pipeline_event(job_id: str, attempt_token: str | None, event: dict):
                 job["partial"] = event["partial"]
         elif event_type == "done":
             job["status"] = "done"
+            job["_finished_at"] = time.time()
             job["stage"] = None
             job["stage_label"] = None
             job["stage_index"] = max(0, len(stage_defs) - 1)
@@ -7847,6 +7973,7 @@ def _apply_pipeline_event(job_id: str, attempt_token: str | None, event: dict):
                 _upsert_job_history(job, "done")
         elif event_type == "error":
             job["status"] = "error"
+            job["_finished_at"] = time.time()
             job["error"] = event.get("error") or "Pipeline worker failed"
             job["error_detail"] = event.get("error_detail") or ""
             presentation = _classify_job_error(
@@ -7861,11 +7988,19 @@ def _apply_pipeline_event(job_id: str, attempt_token: str | None, event: dict):
             )
             if job.get("_history_persisted"):
                 _upsert_job_history(job, "error")
+        elif event_type not in {"source_pdf_start", "source_pdf", "stage_start", "stage_complete"}:
+            return False
+        if (
+            event_type in {"source_pdf", "stage_start", "stage_complete"}
+            and job.get("_history_persisted")
+        ):
+            _upsert_job_history(job, "running")
         return event_type in {"done", "error"}
 
 
 def _monitor_pipeline_process(job_id: str, attempt_token: str, process, event_queue):
     terminal_event = False
+    capacity_leases = ()
     while True:
         try:
             event = event_queue.get(timeout=0.2)
@@ -7885,6 +8020,7 @@ def _monitor_pipeline_process(job_id: str, attempt_token: str, process, event_qu
         job = _jobs.get(job_id)
         if runtime and runtime.get("attempt_token") == attempt_token:
             _job_runtimes.pop(job_id, None)
+            capacity_leases = runtime.get("capacity_leases") or ()
         paused = bool(runtime and runtime.get("pause_requested"))
         if (
             job
@@ -7894,6 +8030,7 @@ def _monitor_pipeline_process(job_id: str, attempt_token: str, process, event_qu
             and not paused
         ):
             job["status"] = "error"
+            job["_finished_at"] = time.time()
             raw_error = f"Pipeline worker exited unexpectedly (exit code {process.exitcode})"
             presentation = _classify_job_error(
                 RuntimeError(raw_error),
@@ -7910,6 +8047,7 @@ def _monitor_pipeline_process(job_id: str, attempt_token: str, process, event_qu
         event_queue.close()
     except Exception:
         pass
+    _release_capacity_leases(capacity_leases)
 
 
 def _job_worker_payload(job: dict, *, resume: bool):
@@ -7929,42 +8067,65 @@ def _job_worker_payload(job: dict, *, resume: bool):
 
 
 def _start_pipeline_attempt(job_id: str, *, resume: bool):
-    with _jobs_lock:
-        job = _jobs[job_id]
-        attempt_token = uuid.uuid4().hex
-        context = multiprocessing.get_context("spawn")
-        event_queue = context.Queue()
-        process = context.Process(
-            target=_pipeline_process_main,
-            args=(_job_worker_payload(job, resume=resume), event_queue, attempt_token),
-            daemon=True,
-            name=f"pipeline-{job_id[:8]}",
-        )
-        job["_attempt_token"] = attempt_token
-        runtime = {
-            "attempt_token": attempt_token,
-            "process": process,
-            "queue": event_queue,
-            "pause_requested": False,
-        }
-        _job_runtimes[job_id] = runtime
-        try:
-            process.start()
-        except Exception:
-            _job_runtimes.pop(job_id, None)
+    capacity_leases = _acquire_pipeline_capacity_leases()
+    process = None
+    event_queue = None
+    attempt_token = None
+    try:
+        with _jobs_lock:
+            job = _jobs[job_id]
+            attempt_token = uuid.uuid4().hex
+            context = multiprocessing.get_context("spawn")
+            event_queue = context.Queue()
+            process = context.Process(
+                target=_pipeline_process_main,
+                args=(_job_worker_payload(job, resume=resume), event_queue, attempt_token),
+                daemon=True,
+                name=f"pipeline-{job_id[:8]}",
+            )
+            job["_attempt_token"] = attempt_token
+            runtime = {
+                "attempt_token": attempt_token,
+                "process": process,
+                "queue": event_queue,
+                "pause_requested": False,
+                "capacity_leases": capacity_leases,
+            }
+            _job_runtimes[job_id] = runtime
+            try:
+                process.start()
+            except Exception:
+                _job_runtimes.pop(job_id, None)
+                try:
+                    event_queue.close()
+                except Exception:
+                    pass
+                raise
+            monitor = threading.Thread(
+                target=_monitor_pipeline_process,
+                args=(job_id, attempt_token, process, event_queue),
+                daemon=True,
+                name=f"pipeline-monitor-{job_id[:8]}",
+            )
+            runtime["monitor"] = monitor
+            monitor.start()
+    except Exception:
+        with _jobs_lock:
+            runtime = _job_runtimes.get(job_id)
+            if runtime and runtime.get("attempt_token") == attempt_token:
+                _job_runtimes.pop(job_id, None)
+        if process is not None:
+            try:
+                _terminate_pipeline_process(process)
+            except Exception:
+                pass
+        if event_queue is not None:
             try:
                 event_queue.close()
             except Exception:
                 pass
-            raise
-        monitor = threading.Thread(
-            target=_monitor_pipeline_process,
-            args=(job_id, attempt_token, process, event_queue),
-            daemon=True,
-            name=f"pipeline-monitor-{job_id[:8]}",
-        )
-        runtime["monitor"] = monitor
-        monitor.start()
+        _release_capacity_leases(capacity_leases)
+        raise
 
 
 def _run_pipeline(job_id: str, md_path: str, llm: dict, enable_analysis: bool, source_format: str = "auto", source_origin: str = "markdown"):
@@ -7999,6 +8160,7 @@ def _parse_bool_flag(value) -> bool:
 
 @app.route("/api/v2/jobs", methods=["POST"])
 def create_job():
+    _prune_terminal_jobs()
     text_content = None
     filename = "input.md"
 
@@ -8062,7 +8224,7 @@ def create_job():
     with open(md_path, "w", encoding="utf-8", newline="") as f:
         f.write(text_content)
 
-    _jobs[job_id] = {
+    job = {
         "job_id": job_id,
         "status": "running",
         "filename": filename,
@@ -8098,10 +8260,35 @@ def create_job():
         "_history_persisted": False,
         "created_at": datetime.utcnow().isoformat(),
     }
+    with _jobs_lock:
+        _jobs[job_id] = job
 
-    _start_pipeline_attempt(job_id, resume=False)
+    try:
+        _start_pipeline_attempt(job_id, resume=False)
+    except PipelineCapacityUnavailable:
+        with _jobs_lock:
+            _jobs.pop(job_id, None)
+        try:
+            _remove_job_artifacts(job_id, tmp_dir)
+        except (OSError, ValueError):
+            pass
+        return _pipeline_busy_response()
+    except Exception:
+        with _jobs_lock:
+            _jobs.pop(job_id, None)
+        try:
+            _remove_job_artifacts(job_id, tmp_dir)
+        except (OSError, ValueError):
+            pass
+        return jsonify({
+            "error": "pipeline_start_failed",
+            "message": "分析任务暂时无法启动，请稍后重试。",
+        }), 503
 
-    return jsonify({"job_id": job_id}), 202
+    if user:
+        _upsert_job_history(job, "running", int(user["id"]))
+
+    return jsonify({"job_id": job_id, "status": "running"}), 202
 
 
 def _read_uploaded_json(upload, label):
@@ -8197,6 +8384,7 @@ def _remove_job_artifacts(job_id: str, artifact_dir: str | os.PathLike | None):
 
 
 def _cancel_job_record(job_id: str, owner_id: int | None, *, artifact_dir=None):
+    capacity_leases = ()
     with _jobs_lock:
         job = _jobs.get(job_id)
         runtime = _job_runtimes.get(job_id)
@@ -8224,16 +8412,20 @@ def _cancel_job_record(job_id: str, owner_id: int | None, *, artifact_dir=None):
     _remove_job_artifacts(job_id, selected_artifact_dir)
     with _jobs_lock:
         runtime = _job_runtimes.pop(job_id, None)
+        if runtime:
+            capacity_leases = runtime.get("capacity_leases") or ()
         if runtime and runtime.get("queue"):
             try:
                 runtime["queue"].close()
             except Exception:
                 pass
         _jobs.pop(job_id, None)
+    _release_capacity_leases(capacity_leases)
 
 
 @app.route("/api/v2/agent-import", methods=["POST"])
 def agent_import():
+    _prune_terminal_jobs()
     try:
         node_payload = _read_uploaded_json(request.files.get("nodes_file"), "Node")
         edge_payload = _read_uploaded_json(request.files.get("edges_file"), "Edge")
@@ -8303,6 +8495,7 @@ def agent_import():
         "latex_macro_warnings": latex_macro_warnings,
         "source": "agent",
         "created_at": datetime.utcnow().isoformat(),
+        "_finished_at": time.time(),
     }
     if is_tex:
         threading.Thread(
@@ -8325,23 +8518,57 @@ def agent_import():
 def job_status(job_id):
     with _jobs_lock:
         job = _jobs.get(job_id)
-        if not job:
+        if job:
+            data = {
+                k: v
+                for k, v in job.items()
+                if not k.startswith("_")
+                and k not in (
+                    "result",
+                    "source_markdown",
+                    "source_pdf",
+                    "error",
+                    "error_detail",
+                    "error_user_message",
+                )
+            }
+            data.update(_job_error_presentation(job))
+            data["source_pdf"] = _public_source_pdf_meta(job.get("source_pdf"))
+        else:
+            data = None
+    if data is None:
+        user = _current_user()
+        row = (
+            _get_db().execute(
+                """SELECT id, filename, status, stage, stage_label, stage_index,
+                          total_stages, stages_done_json, source_pdf_json
+                     FROM history WHERE id = ? AND user_id = ?""",
+                (job_id, user["id"]),
+            ).fetchone()
+            if user
+            else None
+        )
+        if not row:
             return jsonify({"error": "Not found"}), 404
+        status = row["status"] or "done"
         data = {
-            k: v
-            for k, v in job.items()
-            if not k.startswith("_")
-            and k not in (
-                "result",
-                "source_markdown",
-                "source_pdf",
-                "error",
-                "error_detail",
-                "error_user_message",
-            )
+            "job_id": row["id"],
+            "status": status,
+            "filename": row["filename"],
+            "stage": row["stage"],
+            "stage_label": row["stage_label"],
+            "stage_index": int(row["stage_index"] or 0),
+            "total_stages": int(row["total_stages"] or 0),
+            "stages_done": json.loads(row["stages_done_json"] or "[]"),
+            "source": "pipeline",
+            "source_pdf": _public_source_pdf_meta(_read_source_pdf_meta(row)),
         }
-        data.update(_job_error_presentation(job))
-        data["source_pdf"] = _public_source_pdf_meta(job.get("source_pdf"))
+        if status == "error":
+            data.update({
+                "error_code": "internal",
+                "error_title": "分析任务未能完成",
+                "error": "任务进度已安全保存，可以从历史记录中恢复。",
+            })
     return jsonify(data)
 
 
@@ -8455,6 +8682,8 @@ def resume_job(job_id):
     error = _begin_pipeline_resume(job_id)
     if error:
         message, status_code = error
+        if status_code == 429:
+            return _pipeline_busy_response()
         return jsonify({"error": message}), status_code
     return jsonify({"ok": True, "status": "running", "job_id": job_id}), 202
 
@@ -8474,6 +8703,7 @@ def _begin_pipeline_resume(job_id: str):
         old_runtime = _job_runtimes.get(job_id)
         if old_runtime and old_runtime.get("process") and old_runtime["process"].is_alive():
             return "Pipeline worker is still running", 409
+        previous_status = job.get("status")
         job["status"] = "running"
         job["error"] = None
         job.pop("error_detail", None)
@@ -8506,6 +8736,14 @@ def _begin_pipeline_resume(job_id: str):
             _upsert_job_history(job, "running")
     try:
         _start_pipeline_attempt(job_id, resume=True)
+    except PipelineCapacityUnavailable:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job:
+                job["status"] = previous_status
+                if job.get("_history_persisted"):
+                    _upsert_job_history(job, str(previous_status))
+        return "Pipeline capacity is busy", 429
     except Exception as exc:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -8544,12 +8782,39 @@ def _job_tracking_snapshot(job: dict):
 
 @app.route("/api/v2/jobs/<job_id>/result")
 def job_result(job_id):
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Not found"}), 404
-    if job["status"] != "done":
-        return jsonify({"error": "Job not complete"}), 400
-    return jsonify(_project_display_result(job["result"], job.get("source_markdown") or ""))
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job:
+            if job["status"] != "done":
+                return jsonify({"error": "Job not complete"}), 400
+            result = copy.deepcopy(job["result"])
+            source_markdown = job.get("source_markdown") or ""
+        else:
+            result = None
+            source_markdown = ""
+    if result is None:
+        user = _current_user()
+        row = (
+            _get_db().execute(
+                "SELECT * FROM history WHERE id = ? AND user_id = ?",
+                (job_id, user["id"]),
+            ).fetchone()
+            if user
+            else None
+        )
+        if not row:
+            return jsonify({"error": "Not found"}), 404
+        if (row["status"] or "done") != "done":
+            return jsonify({"error": "Job not complete"}), 400
+        source_markdown = row["source_markdown"] or ""
+        graph = _load_api_graph(job_id)
+        result = {
+            "nodes": copy.deepcopy(graph["nodes"]),
+            "edges": copy.deepcopy(graph["edges"]),
+            "latex_macros": json.loads(row["latex_macros"] or "{}"),
+            "source_pdf": _public_source_pdf_meta(_read_source_pdf_meta(row)),
+        }
+    return jsonify(_project_display_result(result, source_markdown))
 
 
 def _source_pdf_context(job_id: str) -> tuple[dict | None, list[dict]]:

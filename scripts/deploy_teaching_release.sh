@@ -104,9 +104,18 @@ migrate() {
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
+  : "${MATHWEAVER_DATABASE_URL:?MATHWEAVER_DATABASE_URL is required}"
+  : "${MATHWEAVER_DATABASE_NAME:?MATHWEAVER_DATABASE_NAME is required}"
+  : "${NEO4J_URI:?NEO4J_URI is required}"
+  : "${MATHWEAVER_DATA_KEY_FILE:?MATHWEAVER_DATA_KEY_FILE is required}"
+  : "${MATHGRAPH_DATA_DIR:?MATHGRAPH_DATA_DIR is required}"
+  if [ -z "${NEO4J_PASSWORD:-}" ] && [ -z "${NEO4J_PASSWORD_FILE:-}" ]; then
+    echo "NEO4J_PASSWORD or NEO4J_PASSWORD_FILE is required" >&2
+    exit 74
+  fi
   cd "$RELEASE_DIR"
-  "$RELEASE_DIR/.venv/bin/python" -m alembic -c backend/migrations/alembic.ini current
-  "$RELEASE_DIR/.venv/bin/python" -m alembic -c backend/migrations/alembic.ini upgrade head
+  "$RELEASE_DIR/.venv/bin/python" backend/scripts/upgrade_database.py
+  "$RELEASE_DIR/.venv/bin/python" backend/scripts/migrate_legacy_mysql_storage.py --apply
   echo "migration ok: $RELEASE_DIR"
 }
 
@@ -136,7 +145,7 @@ start_release() {
   systemctl restart "$BACKEND_UNIT" "$FRONTEND_UNIT"
   nginx -t
   systemctl reload nginx
-  wait_for_url "http://127.0.0.1:5002/api/v2/ready"
+  wait_for_url "http://127.0.0.1:5002/health/ready"
   wait_for_url "http://127.0.0.1:5174/"
   echo "sidecar release started: $RELEASE_DIR"
 }
@@ -151,7 +160,7 @@ rollback() {
   esac
   activate_link "$target"
   systemctl restart "$BACKEND_UNIT" "$FRONTEND_UNIT"
-  wait_for_url "http://127.0.0.1:5002/api/v2/ready"
+  wait_for_url "http://127.0.0.1:5002/health/ready"
   wait_for_url "http://127.0.0.1:5174/"
   echo "rolled back teaching sidecar to: $target"
 }

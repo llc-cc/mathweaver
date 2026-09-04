@@ -1,0 +1,19 @@
+# MathWeaver production Neo4j configuration.
+# The Bolt endpoint is intentionally loopback-only; application traffic reaches
+# it from the co-located backend process.
+server.default_listen_address=127.0.0.1
+server.bolt.enabled=true
+server.bolt.listen_address=127.0.0.1:7687
+server.http.enabled=false
+server.https.enabled=false
+
+server.directories.data=/opt/mathweaver/neo4j/data
+server.directories.logs=/opt/mathweaver/neo4j/logs
+server.directories.run=/opt/mathweaver/neo4j/run
+
+server.memory.heap.initial_size=512m
+server.memory.heap.max_size=1g
+server.memory.pagecache.size=512m
+server.jvm.additional=-XX:+ExitOnOutOfMemoryError
+
+dbms.security.auth_enabled=true

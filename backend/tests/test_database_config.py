@@ -30,6 +30,22 @@ def test_build_engine_enables_stale_connection_detection() -> None:
         engine.dispose()
 
 
+def test_mysql_pool_is_bounded_by_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MATHWEAVER_DATABASE_NAME", "mathweaver")
+    monkeypatch.setenv("MATHWEAVER_DB_POOL_SIZE", "3")
+    monkeypatch.setenv("MATHWEAVER_DB_MAX_OVERFLOW", "2")
+    monkeypatch.setenv("MATHWEAVER_DB_POOL_TIMEOUT", "7")
+    engine = build_engine(
+        "mysql+pymysql://user:secret@127.0.0.1:3306/mathweaver"
+    )
+    try:
+        assert engine.pool.size() == 3
+        assert engine.pool._max_overflow == 2  # noqa: SLF001 - 验证连接总量上限
+        assert engine.pool._timeout == 7  # noqa: SLF001 - 验证快速背压
+    finally:
+        engine.dispose()
+
+
 def test_get_session_factory_uses_configured_engine() -> None:
     configure_database("sqlite+pysqlite:///:memory:")
 

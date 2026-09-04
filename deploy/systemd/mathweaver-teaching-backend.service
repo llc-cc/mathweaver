@@ -1,6 +1,9 @@
 [Unit]
 Description=MathWeaver teaching backend sidecar
-After=network.target mysql.service
+After=network.target mysql.service mathweaver-neo4j.service
+Wants=mathweaver-neo4j.service mathweaver-teaching-ai-backend.service mathweaver-teaching-pipeline-backend.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -8,12 +11,20 @@ User=nginx
 Group=nginx
 WorkingDirectory=/opt/mathweaver/current-teaching/backend
 EnvironmentFile=/opt/mathweaver/.env.teaching
-ExecStart=/opt/mathweaver/current-teaching/.venv/bin/gunicorn --bind 127.0.0.1:5002 --workers 2 --threads 2 --timeout 180 --access-logfile - --error-logfile - api_v2:app
+Environment=MATHWEAVER_RUNTIME_DIR=/run/mathweaver
+RuntimeDirectory=mathweaver
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/opt/mathweaver/current-teaching/.venv/bin/gunicorn --bind 127.0.0.1:5002 --worker-class gthread --workers 2 --threads 4 --backlog 512 --timeout 330 --graceful-timeout 60 --keep-alive 2 --max-requests 1000 --max-requests-jitter 100 --access-logfile - --error-logfile - api_v2:app
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=30
+TimeoutStopSec=75
 PrivateTmp=true
 NoNewPrivileges=true
+LimitNOFILE=65536
+TasksMax=384
+CPUWeight=100
+OOMScoreAdjust=-100
 
 [Install]
 WantedBy=multi-user.target

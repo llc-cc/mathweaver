@@ -13,7 +13,7 @@ from sqlalchemy.engine import Connection, Engine, make_url
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-_SCHEMA_REVISION = "20260901_0004"
+_SCHEMA_REVISION = "20260904_04"
 _ENGINE: Engine | None = None
 _ENGINE_URL: str | None = None
 _SESSION_FACTORY: sessionmaker[Session] | None = None

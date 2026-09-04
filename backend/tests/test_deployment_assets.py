@@ -8,6 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-backend.service"
+AI_BACKEND_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-ai-backend.service"
+PIPELINE_BACKEND_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-pipeline-backend.service"
 FRONTEND_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-frontend.service"
 NGINX = ROOT / "deploy/nginx/mathweaver-teaching-18080.conf"
 DEPLOY = ROOT / "scripts/deploy_teaching_release.sh"
@@ -22,14 +24,33 @@ def _text(path: Path) -> str:
 
 def test_units_bind_only_to_127_0_0_1_sidecar_ports() -> None:
     backend = _text(BACKEND_UNIT)
+    ai_backend = _text(AI_BACKEND_UNIT)
+    pipeline_backend = _text(PIPELINE_BACKEND_UNIT)
     frontend = _text(FRONTEND_UNIT)
 
     assert "127.0.0.1:5002" in backend
+    assert "127.0.0.1:5003" in ai_backend
+    assert "127.0.0.1:5004" in pipeline_backend
     assert "127.0.0.1" in frontend and "5174" in frontend
-    assert "0.0.0.0" not in backend + frontend
-    assert "/opt/mathweaver/.env.teaching" in backend
-    assert "User=nginx" in backend and "Group=nginx" in backend
+    all_backends = backend + ai_backend + pipeline_backend
+    assert "0.0.0.0" not in all_backends + frontend
+    assert all_backends.count("/opt/mathweaver/.env.teaching") == 3
+    assert all_backends.count("User=nginx") == 3
+    assert all_backends.count("Group=nginx") == 3
     assert "User=nginx" in frontend and "Group=nginx" in frontend
+
+
+def test_expensive_ai_and_pipeline_workloads_are_process_isolated() -> None:
+    backend = _text(BACKEND_UNIT)
+    ai_backend = _text(AI_BACKEND_UNIT)
+    pipeline_backend = _text(PIPELINE_BACKEND_UNIT)
+
+    assert "--workers 2 --threads 4" in backend
+    assert "--workers 2 --threads 3" in ai_backend
+    assert "--workers 1 --threads 4" in pipeline_backend
+    assert "MemoryMax=3G" in ai_backend
+    assert "MemoryMax=4G" in pipeline_backend
+    assert "--max-requests" not in pipeline_backend
 
 
 def test_nginx_uses_18080_and_proxies_api_to_5002() -> None:

@@ -12,8 +12,8 @@ def main(argv: list[str] | None = None) -> int:
     from alembic.config import Config
 
     backend_root = Path(__file__).resolve().parents[1]
-    config = Config(str(backend_root / "alembic.ini"))
-    config.set_main_option("script_location", str(backend_root / "alembic"))
+    config = Config(str(backend_root / "migrations" / "alembic.ini"))
+    config.set_main_option("script_location", str(backend_root / "migrations"))
     command.upgrade(config, "head")
     print("MySQL schema is at Alembic head.")
     return 0

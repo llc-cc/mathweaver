@@ -1,0 +1,28 @@
+[Unit]
+Description=MathWeaver Neo4j graph database
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=neo4j
+Group=neo4j
+WorkingDirectory=/opt/mathweaver/neo4j-server
+ExecStart=/opt/mathweaver/neo4j-server/bin/neo4j console
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=120
+LimitNOFILE=40000
+TasksMax=512
+MemoryMax=2304M
+MemorySwapMax=1024M
+OOMPolicy=stop
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/mathweaver/neo4j/data /opt/mathweaver/neo4j/logs /opt/mathweaver/neo4j/run
+
+[Install]
+WantedBy=multi-user.target

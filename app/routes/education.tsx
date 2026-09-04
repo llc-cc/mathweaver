@@ -698,6 +698,7 @@ export function educationErrorMessage(cause: unknown) {
   if (error.message === "title must be at most 160 characters") return "任务名称不能超过 160 个字符。";
   if (error.message === "dueAt must be an ISO date string or null") return "截止时间格式无效。";
   switch (error.code) {
+    case "education_ai_busy": return "当前 AI 请求较多，服务器已保护性限流，请稍后重试。";
     case "invalid_invite_code": return "邀请码无效或班级已失效，请检查后重试。";
     case "class_role_conflict": return "该账号已经是此班级的教师，不能重复加入。";
     case "class_membership_removed": return "你已被移出该班级，请联系教师恢复加入。";

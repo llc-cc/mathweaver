@@ -1,0 +1,34 @@
+[Unit]
+Description=MathWeaver isolated synchronous AI backend
+After=network.target mysql.service
+PartOf=mathweaver-teaching-backend.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=nginx
+Group=nginx
+WorkingDirectory=/opt/mathweaver/current-teaching/backend
+EnvironmentFile=/opt/mathweaver/.env.teaching
+Environment=LLM_HTTP_CONNECT_TIMEOUT=10
+Environment=LLM_HTTP_TIMEOUT=120
+Environment=MATHWEAVER_RUNTIME_DIR=/run/mathweaver
+RuntimeDirectory=mathweaver
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/opt/mathweaver/current-teaching/.venv/bin/gunicorn --bind 127.0.0.1:5003 --worker-class gthread --workers 2 --threads 3 --backlog 32 --timeout 330 --graceful-timeout 60 --keep-alive 2 --max-requests 300 --max-requests-jitter 50 --access-logfile - --error-logfile - api_v2:app
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=75
+PrivateTmp=true
+NoNewPrivileges=true
+LimitNOFILE=65536
+TasksMax=256
+CPUWeight=50
+MemoryHigh=2G
+MemoryMax=3G
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target

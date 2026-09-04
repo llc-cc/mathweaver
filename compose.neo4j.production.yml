@@ -1,0 +1,39 @@
+name: mathweaver-neo4j-production
+
+services:
+  neo4j:
+    image: neo4j:2026.07.1-community@${NEO4J_IMAGE_DIGEST:?Set NEO4J_IMAGE_DIGEST}
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH_FILE: /run/secrets/neo4j_auth
+      NEO4J_server_default__listen__address: 0.0.0.0
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-512m}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-1G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512m}
+    ports:
+      - 127.0.0.1:7687:7687
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    secrets:
+      - neo4j_auth
+      - neo4j_password
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p "$$(cat /run/secrets/neo4j_password)" 'RETURN 1' >/dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 60s
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+
+secrets:
+  neo4j_auth:
+    file: ${NEO4J_AUTH_SECRET_FILE:?Set NEO4J_AUTH_SECRET_FILE}
+  neo4j_password:
+    file: ${NEO4J_PASSWORD_SECRET_FILE:?Set NEO4J_PASSWORD_SECRET_FILE}
