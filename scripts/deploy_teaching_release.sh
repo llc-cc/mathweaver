@@ -13,7 +13,8 @@ FRONTEND_UNIT=mathweaver-teaching-frontend.service
 NEO4J_UNIT=mathweaver-neo4j.service
 BACKUP_UNIT=mathweaver-teaching-backup.service
 BACKUP_TIMER=mathweaver-teaching-backup.timer
-NGINX_CONFIG=/etc/nginx/conf.d/mathweaver-teaching-18080.conf
+NGINX_ROUTING_CONFIG=/etc/nginx/conf.d/00-mathweaver-teaching-routing.conf
+NGINX_LEGACY_CONFIG=/etc/nginx/conf.d/mathweaver-teaching-18080.conf
 NEO4J_DATA_ROOT=/opt/mathweaver/neo4j
 # 目标服务器的 python3 仍指向 3.6；固定使用已安装的 3.11，避免 pip 静默降级依赖。
 PYTHON_BIN=python3.11
@@ -60,6 +61,45 @@ check_sidecar_ports_available() {
 5174 $FRONTEND_UNIT
 18080 nginx.service
 EOF
+}
+
+check_legacy_listener_scope() {
+  [ -f "$NGINX_LEGACY_CONFIG" ] || {
+    echo "missing loopback-only teaching listener: $NGINX_LEGACY_CONFIG" >&2
+    exit 75
+  }
+  grep -Eq '^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:18080([[:space:]]|;)' "$NGINX_LEGACY_CONFIG" || {
+    echo "teaching port 18080 must be bound to 127.0.0.1 only" >&2
+    exit 75
+  }
+  if grep -Eq '^[[:space:]]*listen[[:space:]]+(\[::\]:|0\.0\.0\.0:)?18080([[:space:]]|;)' "$NGINX_LEGACY_CONFIG"; then
+    echo "teaching port 18080 has a public listen directive" >&2
+    exit 75
+  fi
+}
+
+install_nginx_routing() {
+  local source backup had_existing=0
+  source="$RELEASE_DIR/deploy/nginx/mathweaver-routing.conf"
+  backup=$(mktemp /tmp/mathweaver-nginx-routing.XXXXXX)
+  if [ -f "$NGINX_ROUTING_CONFIG" ]; then
+    cp -a "$NGINX_ROUTING_CONFIG" "$backup"
+    had_existing=1
+  fi
+  install -m 0644 "$source" "$NGINX_ROUTING_CONFIG"
+  if nginx -t; then
+    rm -f "$backup"
+    return 0
+  fi
+  if [ "$had_existing" -eq 1 ]; then
+    cp -a "$backup" "$NGINX_ROUTING_CONFIG"
+  else
+    rm -f "$NGINX_ROUTING_CONFIG"
+  fi
+  rm -f "$backup"
+  nginx -t >/dev/null
+  echo "new Nginx routing was rejected; the previous valid config was restored" >&2
+  return 1
 }
 
 load_environment() {
@@ -147,6 +187,7 @@ preflight() {
   command -v runuser >/dev/null
   getent passwd nginx >/dev/null || { echo "required nginx service account is missing" >&2; exit 73; }
   getent passwd neo4j >/dev/null || { echo "required neo4j service account is missing" >&2; exit 73; }
+  check_legacy_listener_scope
   check_sidecar_ports_available
   df -Pk "$ROOT" | awk 'NR==2 { if ($4 < 2097152) exit 1 }'
   echo "preflight ok: $RELEASE_DIR"
@@ -179,15 +220,16 @@ start_release() {
   if [ -L "$CURRENT" ]; then
     local old_target previous_next
     old_target=$(readlink -f "$CURRENT")
-    previous_next="$ROOT/.previous-teaching.next"
-    ln -sfn "$old_target" "$previous_next"
-    mv -Tf "$previous_next" "$PREVIOUS"
+    if [ "$old_target" != "$RELEASE_DIR" ]; then
+      previous_next="$ROOT/.previous-teaching.next"
+      ln -sfn "$old_target" "$previous_next"
+      mv -Tf "$previous_next" "$PREVIOUS"
+    fi
   fi
   # 根目录与当前发布都保持 750，仅给 nginx 穿越权限，不开放目录枚举或敏感文件读取。
   setfacl -m u:nginx:--x "$ROOT"
   setfacl -m u:nginx:--x "$RELEASE_DIR"
   prepare_persistent_storage
-  activate_link "$RELEASE_DIR"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$NEO4J_UNIT" "/etc/systemd/system/$NEO4J_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKEND_UNIT" "/etc/systemd/system/$BACKEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$AI_BACKEND_UNIT" "/etc/systemd/system/$AI_BACKEND_UNIT"
@@ -195,19 +237,21 @@ start_release() {
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$FRONTEND_UNIT" "/etc/systemd/system/$FRONTEND_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKUP_UNIT" "/etc/systemd/system/$BACKUP_UNIT"
   install -m 0644 "$RELEASE_DIR/deploy/systemd/$BACKUP_TIMER" "/etc/systemd/system/$BACKUP_TIMER"
-  install -m 0644 "$RELEASE_DIR/deploy/nginx/mathweaver-teaching-18080.conf" "$NGINX_CONFIG"
+  check_legacy_listener_scope
+  install_nginx_routing
+  activate_link "$RELEASE_DIR"
   systemctl daemon-reload
   systemctl enable --now "$NEO4J_UNIT"
   systemctl enable --now "$BACKUP_TIMER"
   systemctl enable "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
   # enable --now 不会重启已运行进程；切换软链后必须显式重启，确保执行的是新发布目录。
   systemctl restart "$BACKEND_UNIT" "$AI_BACKEND_UNIT" "$PIPELINE_BACKEND_UNIT" "$FRONTEND_UNIT"
-  nginx -t
-  systemctl reload nginx
   wait_for_url "http://127.0.0.1:5002/health/ready"
   wait_for_url "http://127.0.0.1:5003/health/ready"
   wait_for_url "http://127.0.0.1:5004/health/ready"
   wait_for_url "http://127.0.0.1:5174/"
+  nginx -t
+  systemctl reload nginx
   echo "sidecar release started: $RELEASE_DIR"
 }
 

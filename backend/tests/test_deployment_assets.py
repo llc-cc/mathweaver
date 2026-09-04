@@ -14,6 +14,7 @@ FRONTEND_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-frontend.service"
 BACKUP_UNIT = ROOT / "deploy/systemd/mathweaver-teaching-backup.service"
 BACKUP_TIMER = ROOT / "deploy/systemd/mathweaver-teaching-backup.timer"
 NGINX = ROOT / "deploy/nginx/mathweaver-teaching-18080.conf"
+NGINX_ROUTING = ROOT / "deploy/nginx/mathweaver-routing.conf"
 DEPLOY = ROOT / "scripts/deploy_teaching_release.sh"
 SMOKE = ROOT / "scripts/smoke_teaching_release.sh"
 BACKUP = ROOT / "scripts/backup_teaching_data.sh"
@@ -63,6 +64,19 @@ def test_nginx_uses_loopback_18080_and_proxies_api_to_5002() -> None:
     assert "location /api/" in nginx
     assert "proxy_pass http://127.0.0.1:5002" in nginx
     assert "proxy_pass http://127.0.0.1:5174" in nginx
+
+
+def test_nginx_routes_expensive_work_to_isolated_process_pools() -> None:
+    routing = _text(NGINX_ROUTING)
+    deploy = _text(DEPLOY)
+
+    assert "default 5002;" in routing
+    assert '"POST:/api/v2/proof-assist" 5003;' in routing
+    assert '"~^(GET|POST|DELETE):/api/v2/jobs(?:/|$)" 5004;' in routing
+    assert "zone=mathweaver_ai_pool_connections:64k" in routing
+    assert 'install_nginx_routing' in deploy
+    assert 'check_legacy_listener_scope' in deploy
+    assert 'install -m 0644 "$RELEASE_DIR/deploy/nginx/mathweaver-teaching-18080.conf"' not in deploy
 
 
 def test_deploy_script_never_overwrites_3000_or_5001_services() -> None:
@@ -184,6 +198,7 @@ def test_no_secret_literal_exists_in_deploy_assets() -> None:
             BACKUP_UNIT,
             BACKUP_TIMER,
             NGINX,
+            NGINX_ROUTING,
             DEPLOY,
             SMOKE,
             BACKUP,
