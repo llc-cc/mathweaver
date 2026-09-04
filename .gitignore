@@ -84,3 +84,16 @@ backend/scripts/_tmp_pipeline_context/
 
 # Codex 实施计划使用的隔离工作树
 /.worktrees/
+
+# MySQL/Neo4j migration runtime state and local secrets
+backend/graph-staging/
+backend/migration-backups/
+graph-staging/
+migration-backups/
+migration-report*.json
+.tmp-migration-*.json
+.tmp-*-tag.json
+.env.db.local
+backend/storage.env
+deploy/secrets/
+*.secret

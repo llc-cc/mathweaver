@@ -21,7 +21,6 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=100)
     args = parser.parse_args()
-    api_v2._init_db()
     config = api_v2._education_llm_config()
     if not config:
         print(json.dumps({"error": "education AI is not configured"}, ensure_ascii=False))

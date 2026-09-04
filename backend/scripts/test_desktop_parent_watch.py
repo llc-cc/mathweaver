@@ -29,7 +29,13 @@ def wait_until(predicate, timeout: float = 5.0) -> bool:
 def run_tests() -> None:
     with tempfile.TemporaryDirectory(prefix="mathweaver-parent-watch-") as data_dir:
         os.environ["MATHGRAPH_DATA_DIR"] = data_dir
+        os.environ.pop("MATHWEAVER_DESKTOP_ENV_TEST", None)
+        Path(data_dir, "storage.env").write_text(
+            "MATHWEAVER_DESKTOP_ENV_TEST=loaded\n", encoding="utf-8"
+        )
         from desktop_app import _start_parent_exit_watcher
+
+        assert os.environ.get("MATHWEAVER_DESKTOP_ENV_TEST") == "loaded"
 
         parent = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(0.2)"],

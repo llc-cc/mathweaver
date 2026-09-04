@@ -1,0 +1,32 @@
+
+.edu-reward-feedback { position: fixed; right: 24px; bottom: 24px; z-index: 140; width: min(360px, calc(100vw - 32px)); display: grid; gap: 13px; padding: 16px; border: 1px solid color-mix(in srgb, var(--edu-blue) 38%, var(--edu-line)); border-radius: 14px; background: var(--edu-surface); color: var(--edu-ink); box-shadow: 0 14px 42px rgba(25,22,17,.18); animation: edu-reward-in .24s ease-out both; }
+.edu-reward-feedback-head { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 9px; }
+.edu-reward-feedback-icon { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 9px; color: var(--edu-blue); background: var(--edu-blue-soft); }
+.edu-reward-feedback-head > div { display: grid; gap: 3px; }
+.edu-reward-feedback-head strong { font-size: 12px; }
+.edu-reward-feedback-head span { color: var(--edu-muted); font-size: 10px; }
+.edu-reward-feedback-head b { color: var(--edu-green); font-size: 13px; }
+.edu-reward-feedback-progress { display: grid; gap: 6px; padding: 10px 11px; border-radius: 10px; background: var(--edu-bg); }
+.edu-reward-feedback-progress > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--edu-muted); font-size: 9px; }
+.edu-reward-feedback-progress > div b { color: var(--edu-ink); }
+.edu-reward-bar { height: 5px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--edu-blue) 12%, var(--edu-line)); }
+.edu-reward-bar span { display: block; height: 100%; border-radius: inherit; transition: width .3s ease; }
+.edu-reward-bar.level span { background: var(--edu-green); }
+.edu-reward-bar.weekly span { background: var(--edu-blue); }
+.edu-reward-achievements { display: grid; gap: 7px; }
+.edu-reward-section-label { display: inline-flex; align-items: center; gap: 5px; color: var(--edu-muted); font-size: 9px; font-weight: 750; }
+.edu-reward-achievement { display: flex; align-items: flex-start; gap: 7px; color: var(--edu-green); }
+.edu-reward-achievement > span { display: grid; gap: 2px; }
+.edu-reward-achievement strong { color: var(--edu-ink); font-size: 10px; }
+.edu-reward-achievement small { color: var(--edu-muted); font-size: 9px; line-height: 1.4; }
+.edu-reward-feedback-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.edu-reward-feedback-actions .edu-button { min-height: 30px; padding: 6px 9px; font-size: 10px; }
+.edu-reward-feedback .edu-button { min-height: 30px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 9px; border: 1px solid transparent; border-radius: 8px; color: var(--edu-ink); background: var(--edu-surface); font-family: inherit; font-size: 10px; font-weight: 600; line-height: 1.2; cursor: pointer; }
+.edu-reward-feedback .edu-button.primary { color: #fff; border-color: var(--edu-blue); background: var(--edu-blue); }
+.edu-reward-feedback .edu-button.ghost { border-color: var(--edu-line); color: var(--edu-ink); background: var(--edu-surface); }
+.edu-reward-feedback .edu-button:focus-visible, .edu-reward-feedback .edu-icon-button:focus-visible { outline: 2px solid var(--edu-blue); outline-offset: 2px; }
+.edu-reward-feedback .edu-icon-button { width: 27px; height: 27px; display: grid; place-items: center; padding: 0; border: 1px solid transparent; border-radius: 7px; color: var(--edu-muted); background: transparent; cursor: pointer; }
+.edu-reward-feedback .edu-icon-button:hover { color: var(--edu-ink); background: var(--edu-bg); }
+@keyframes edu-reward-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@media (max-width: 520px) { .edu-reward-feedback { right: 16px; bottom: 16px; } }
+@media (prefers-reduced-motion: reduce) { .edu-reward-feedback { animation: none; } .edu-reward-bar span { transition: none; } }

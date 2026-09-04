@@ -51,11 +51,22 @@ describe("education graph presentation", () => {
     ]);
 
     expect(grouped).toHaveLength(4);
-    expect(grouped[0].id).toBe("old");
-    expect(grouped[0].snapshotIds).toEqual(["new", "old"]);
-    expect(grouped[0].boundAssignmentCount).toBe(3);
+    expect(grouped.map(graph => graph.id)).toEqual(["legacy-b", "legacy-a", "old", "revision"]);
+    expect(grouped.find(graph => graph.id === "old")?.snapshotIds).toEqual(["new", "old"]);
+    expect(grouped.find(graph => graph.id === "old")?.boundAssignmentCount).toBe(3);
     expect(grouped.find(graph => graph.id === "revision")?.filename).toBe("chapter.tex");
     expect(grouped.filter(graph => graph.sourceGraphId == null)).toHaveLength(2);
+  });
+
+  it("prefers the saved class course order and otherwise keeps a stable first-joined fallback", () => {
+    const grouped = groupCourseGraphs([
+      { id: "later", classId: "c1", sourceGraphId: "source-later", filename: "later.tex", nodeCount: 2, edgeCount: 1, courseOrder: 2, createdAt: "2026-08-03T00:00:00" },
+      { id: "fallback-b", classId: "c1", filename: "fallback-b.tex", nodeCount: 2, edgeCount: 1, createdAt: "2026-08-02T00:00:00" },
+      { id: "first", classId: "c1", sourceGraphId: "source-first", filename: "first.tex", nodeCount: 2, edgeCount: 1, courseOrder: 0, createdAt: "2026-08-04T00:00:00" },
+      { id: "middle", classId: "c1", sourceGraphId: "source-middle", filename: "middle.tex", nodeCount: 2, edgeCount: 1, courseOrder: 1, createdAt: "2026-08-05T00:00:00" },
+      { id: "fallback-a", classId: "c1", filename: "fallback-a.tex", nodeCount: 2, edgeCount: 1, createdAt: "2026-08-01T00:00:00" },
+    ]);
+    expect(grouped.map(graph => graph.id)).toEqual(["first", "middle", "later", "fallback-a", "fallback-b"]);
   });
 
   it("puts prerequisite-first learning edges before dimmed graph edges", () => {
@@ -352,5 +363,6 @@ describe("assignment grading helpers", () => {
     expect(educationErrorMessage(Object.assign(new Error("x"), { code: "assignment_incomplete" }))).toContain("完成所有非免考节点");
     expect(educationErrorMessage(Object.assign(new Error("x"), { code: "assessment_scoring_required" }))).toContain("总分恰好为 100");
     expect(educationErrorMessage(Object.assign(new Error("x"), { code: "grading_incomplete" }))).toContain("尚未完成教师评分");
+    expect(educationErrorMessage(Object.assign(new Error("x"), { code: "grading_no_submissions" }))).toContain("暂无需要进行 AI 评价");
   });
 });

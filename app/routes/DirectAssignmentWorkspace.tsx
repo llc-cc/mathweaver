@@ -40,16 +40,19 @@ import { ProofWorkspace } from "./ProofWorkspace";
 import { FormulaComposer } from "./FormulaComposer";
 import { commitFormula, findFormulaAt, type FormulaPresentation } from "./formula-input";
 import { MathText } from "./math";
-import { buildDirectImageMarkdown, DirectQuestionContent, DirectQuestionEditor, insertDirectTextAtSelection, type DirectQuestionEditorHandle } from "./direct-question-content";
+import { EducationRewardFeedback } from "./EducationRewardFeedback";
+import { buildDirectImageMarkdown, DirectQuestionContent, DirectQuestionEditor, directQuestionEditorKey, insertDirectTextAtSelection, releaseDirectQuestionEditorInteraction, type DirectQuestionEditorHandle } from "./direct-question-content";
 import type { DirectImportOrigin } from "~/components/DirectQuestionImport";
 import {
   assessmentAnswersComplete,
   completeEducationAssessmentAttempt,
   createDirectEducationAssignment,
   educationErrorMessage,
+  evaluateAllEducationSubmissions,
   evaluateEducationSubmission,
   generateDirectQuestionStandard,
   loadEducationGradingOverview,
+  loadEducationGameSummary,
   loadEducationSubmission,
   publishEducationAssignment,
   publishEducationGrades,
@@ -71,6 +74,16 @@ import type {
   MatrixCheckReport,
   QuestionGrade,
 } from "./education";
+import {
+  chooseRecommendedDirectChallengeNode,
+  deriveDirectChallengeQuestionNodes,
+  directChallengeCompletionCount,
+  educationRewardKey,
+  isDirectChallengeReadyToSubmit,
+  isRenderableEducationReward,
+  type EducationRewardReceipt,
+} from "./education-game";
+import { DirectChallengeMap, DirectQuestionCompletionTransition } from "./DirectChallengeMap";
 import type { GraphNode, LLMConfig } from "./home";
 import {
   directQuestionDraftsForAssignment,
@@ -107,6 +120,16 @@ type DirectQuestionItem = {
 };
 
 type DirectAttemptMap = Record<string, AssessmentAttempt>;
+
+type DirectStudentExperience = "loading" | "classic" | "map" | "blocked";
+
+interface DirectQuestionCompletionState {
+  key: string;
+  questionOrder: number;
+  completedCount: number;
+  total: number;
+  reward?: EducationRewardReceipt | null;
+}
 
 function toLocalDateTime(value?: string | null) {
   if (!value) return "";
@@ -228,12 +251,13 @@ export function DirectAssignmentWorkspace(props: DirectAssignmentWorkspaceProps)
   return <DirectAssignmentReview {...props} mode={props.mode} />;
 }
 
-function DirectAssignmentShell({ children, theme, title, subtitle, eyebrow = "题目作业", showTitle = true, showSubtitle = true, centerTitle = false, leftEyebrow = false, onBack, actions, className = "" }: {
+function DirectAssignmentShell({ children, theme, title, subtitle, eyebrow = "题目作业", backLabel = "返回班级作业", showTitle = true, showSubtitle = true, centerTitle = false, leftEyebrow = false, onBack, actions, className = "", containerRef }: {
   children: ReactNode;
   theme: "light" | "dark";
   title: string;
   subtitle?: string;
   eyebrow?: string;
+  backLabel?: string;
   showTitle?: boolean;
   showSubtitle?: boolean;
   centerTitle?: boolean;
@@ -241,10 +265,11 @@ function DirectAssignmentShell({ children, theme, title, subtitle, eyebrow = "�
   onBack: () => void;
   actions?: React.ReactNode;
   className?: string;
+  containerRef?: React.Ref<HTMLDivElement>;
 }) {
-  return <div className={`direct-workspace edu-root ${className}`} data-theme={theme}>
+  return <div ref={containerRef} className={`direct-workspace edu-root ${className}`} data-theme={theme}>
     <header className="direct-workspace-header">
-      {centerTitle && leftEyebrow ? <div className="direct-workspace-header-left"><button type="button" className="edu-button ghost" onClick={onBack}><ChevronLeft size={15} />返回班级作业</button><span className="edu-kicker">{eyebrow}</span></div> : <button type="button" className="edu-button ghost" onClick={onBack}><ChevronLeft size={15} />返回班级作业</button>}
+      {centerTitle && leftEyebrow ? <div className="direct-workspace-header-left"><button type="button" className="edu-button ghost" onClick={onBack}><ChevronLeft size={15} />{backLabel}</button><span className="edu-kicker">{eyebrow}</span></div> : <button type="button" className="edu-button ghost" onClick={onBack}><ChevronLeft size={15} />{backLabel}</button>}
       <div className={`direct-workspace-heading${centerTitle ? " direct-centered-heading" : ""}`}>{(!centerTitle || !leftEyebrow) && <span className="edu-kicker">{eyebrow}</span>}{centerTitle ? <div className="direct-centered-title-row">{showTitle && <h1>{title}</h1>}{showSubtitle && subtitle && <small>{subtitle}</small>}</div> : <>{showTitle && <h1>{title}</h1>}{showSubtitle && subtitle && <small>{subtitle}</small>}</>}</div>
       <div className="direct-workspace-actions">{actions}</div>
     </header>
@@ -353,6 +378,7 @@ function DirectAssignmentReviewContent({ token, theme, assignment, mode, onBack,
   const generationAssignmentIdRef = useRef(assignment.id);
   const draftsRef = useRef(drafts);
   const ocrAbortRef = useRef<AbortController | null>(null);
+  const workspaceRef = useRef<HTMLDivElement | null>(null);
 
   const showFeedback = useCallback((message: string) => {
     if (feedbackTimer.current !== null) window.clearTimeout(feedbackTimer.current);
@@ -807,9 +833,16 @@ function DirectAssignmentReviewContent({ token, theme, assignment, mode, onBack,
     } catch (cause) { setError(educationErrorMessage(cause)); }
     finally { setBusy(null); }
   };
+  const releaseEditorInteraction = () => {
+    releaseDirectQuestionEditorInteraction(workspaceRef.current);
+    setFormulaOpen(false);
+    setFormulaTarget(null);
+  };
   const removeAssignment = async () => {
     const expectedAction = assignment.status === "draft" ? "delete" : "archive";
     if (managementConfirm !== expectedAction || busy || importing || generatingQuestionIds.size > 0) return;
+    releaseEditorInteraction();
+    setManagementConfirm(null);
     setBusy("remove"); setError(""); setFeedback("");
     try {
       await removeEducationAssignment(token, assignment.id);
@@ -825,7 +858,8 @@ function DirectAssignmentReviewContent({ token, theme, assignment, mode, onBack,
     eyebrow="作业发布"
     showTitle={false}
     showSubtitle={false}
-    onBack={onBack}
+    onBack={() => { releaseEditorInteraction(); onBack(); }}
+    containerRef={workspaceRef}
     className="direct-review-workspace"
     actions={<>{editable && <button type="button" className="edu-button ghost" disabled={busy !== null || importing || generatingQuestionIds.size > 0 || (!metadataDirty && !questionsDirty)} onClick={() => void saveAll(false)}>{busy === "save" ? <Loader2 className="edu-spin" size={14} /> : <Save size={14} />}保存草稿</button>}{editable && <button type="button" className="edu-button primary" disabled={busy !== null || importing || generatingQuestionIds.size > 0 || !scoring.ready} onClick={() => void saveAll(true)}>{busy === "publish" ? <Loader2 className="edu-spin" size={14} /> : <Send size={14} />}{assignment.status === "published" ? "重新发布" : "确认发布"}</button>}</>}
   >
@@ -871,11 +905,11 @@ function DirectAssignmentReviewContent({ token, theme, assignment, mode, onBack,
         {active ? <div className="direct-content-panels">
           <section className={`direct-content-panel${editable && activeEditorField === "question" ? " active-input" : ""}`}>
             <div className="direct-content-panel-heading"><strong>题目内容</strong><small>{editable ? "可直接输入或粘贴文字，图片将直接显示" : "支持 Markdown、LaTeX、纯文本和图片"}</small></div>
-            {editable ? <DirectQuestionEditor ref={questionEditorRef} value={active.question} onSelectionChange={selection => rememberEditorSelection("question", selection)} onChange={(value, selection) => { updateQuestion(active.id, { question: value }); rememberEditorSelection("question", selection); }} ariaLabel="题目内容" placeholder="直接输入或粘贴题目内容，支持 Markdown 与 LaTeX" /> : <div className="direct-content-readonly"><DirectQuestionContent text={active.question} /></div>}
+            {editable ? <DirectQuestionEditor key={directQuestionEditorKey(active.id, "question")} ref={questionEditorRef} value={active.question} onSelectionChange={selection => rememberEditorSelection("question", selection)} onChange={(value, selection) => { updateQuestion(active.id, { question: value }); rememberEditorSelection("question", selection); }} ariaLabel="题目内容" placeholder="直接输入或粘贴题目内容，支持 Markdown 与 LaTeX" /> : <div className="direct-content-readonly"><DirectQuestionContent text={active.question} /></div>}
           </section>
            <section className={`direct-content-panel${editable && activeEditorField === "referenceAnswer" ? " active-input" : ""}`}>
              <div className="direct-content-panel-heading"><strong>参考答案</strong>{editable ? <button type="button" className="direct-generate-button" disabled={busy !== null || importing || !active.question.trim() || generatingQuestionIds.has(active.id)} onMouseDown={event => event.preventDefault()} onClick={() => void generateStandard(active.id)}>{generatingQuestionIds.has(active.id) ? <Loader2 className="edu-spin" size={13} /> : <Brain size={13} />}{generatingQuestionIds.has(active.id) ? "生成中" : "生成答案和评分点"}</button> : <small>供教师审核和评分使用</small>}</div>
-            {editable ? <DirectQuestionEditor ref={answerEditorRef} value={active.referenceAnswer} onSelectionChange={selection => rememberEditorSelection("referenceAnswer", selection)} onChange={(value, selection) => { updateQuestion(active.id, { referenceAnswer: value }); rememberEditorSelection("referenceAnswer", selection); }} ariaLabel="参考答案" placeholder="直接输入或粘贴参考答案，支持 Markdown 与 LaTeX" /> : <div className="direct-content-readonly"><DirectQuestionContent text={active.referenceAnswer || "暂无参考答案。"} /></div>}
+            {editable ? <DirectQuestionEditor key={directQuestionEditorKey(active.id, "referenceAnswer")} ref={answerEditorRef} value={active.referenceAnswer} onSelectionChange={selection => rememberEditorSelection("referenceAnswer", selection)} onChange={(value, selection) => { updateQuestion(active.id, { referenceAnswer: value }); rememberEditorSelection("referenceAnswer", selection); }} ariaLabel="参考答案" placeholder="直接输入或粘贴参考答案，支持 Markdown 与 LaTeX" /> : <div className="direct-content-readonly"><DirectQuestionContent text={active.referenceAnswer || "暂无参考答案。"} /></div>}
           </section>
         </div> : <div className="direct-state"><FileText size={20} />暂无题目。</div>}
       </main>
@@ -922,12 +956,69 @@ function DirectAssignmentStudentContent({ token, theme, assignment, llmConfig, o
   const [error, setError] = useState("");
   const [submission, setSubmission] = useState(assignment.submission || null);
   const [releasedSubmission, setReleasedSubmission] = useState<EducationSubmission | null>(null);
+  const [reward, setReward] = useState<EducationRewardReceipt | null>(null);
+  const [challengeMode, setChallengeMode] = useState<DirectStudentExperience>("loading");
+  const [modeNotice, setModeNotice] = useState("");
+  const [completionTransition, setCompletionTransition] = useState<DirectQuestionCompletionState | null>(null);
+  const [recentlyCompletedKey, setRecentlyCompletedKey] = useState<string | null>(null);
+  const [focusMapAfterTransition, setFocusMapAfterTransition] = useState(false);
+  const shownRewardKeysRef = useRef(new Set<string>());
+  const challengeSelectionInitializedRef = useRef(false);
   const dirtyNodesRef = useRef(new Set<number>());
   const loadingNodesRef = useRef(new Set<number>());
+  const mapNodeRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const mapFinishNodeRef = useRef<HTMLButtonElement | null>(null);
+  const showReward = useCallback((nextReward: EducationRewardReceipt | null | undefined) => {
+    if (!isRenderableEducationReward(nextReward)) { setReward(null); return; }
+    const key = educationRewardKey(nextReward);
+    if (shownRewardKeysRef.current.has(key)) return;
+    shownRewardKeysRef.current.add(key);
+    setReward(nextReward);
+  }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    setChallengeMode("loading");
+    setModeNotice("");
+    loadEducationGameSummary(token, assignment.classId)
+      .then(summary => {
+        if (cancelled) return;
+        if (!summary) {
+          setChallengeMode("classic");
+          setModeNotice("探索答题路线暂不可用，已显示经典答题页。");
+          return;
+        }
+        setChallengeMode(summary.enabled && summary.settings.studentExperience === "map" ? "map" : "classic");
+      })
+      .catch(cause => {
+        if (cancelled) return;
+        const status = (cause as { status?: number }).status;
+        if (status === 401 || status === 403) {
+          setChallengeMode("blocked");
+          setError(educationErrorMessage(cause));
+          return;
+        }
+        setChallengeMode("classic");
+        setModeNotice("探索答题路线暂不可用，已显示经典答题页。");
+      });
+    return () => { cancelled = true; };
+  }, [assignment.classId, token]);
+
+  useEffect(() => {
+    challengeSelectionInitializedRef.current = false;
     setActiveKey(current => items.some(item => item.key === current) ? current : items[0]?.key || "");
-  }, [items]);
+    setCompletionTransition(null);
+    setRecentlyCompletedKey(null);
+    setFocusMapAfterTransition(false);
+  }, [assignment.id, items]);
+
+  useEffect(() => {
+    if (challengeMode !== "map" || challengeSelectionInitializedRef.current) return;
+    challengeSelectionInitializedRef.current = true;
+    const initialNodes = deriveDirectChallengeQuestionNodes(items, {}, assignment.assessments);
+    const initialRecommended = chooseRecommendedDirectChallengeNode(initialNodes);
+    setActiveKey(initialRecommended?.key || items[0]?.key || "");
+  }, [assignment.assessments, assignment.id, challengeMode, items]);
 
   useEffect(() => {
     if (!submission?.id) return;
@@ -943,6 +1034,10 @@ function DirectAssignmentStudentContent({ token, theme, assignment, llmConfig, o
   const activeAttempt = activeItem ? attempts[String(activeItem.nodeId)] : undefined;
   const activeQuestion = activeAttempt?.questions[activeItem?.questionIndex || 0];
   const isSubmitted = Boolean(submission);
+  const challengeNodes = deriveDirectChallengeQuestionNodes(items, attempts, assignment.assessments);
+  const challengeCompletionCount = directChallengeCompletionCount(challengeNodes);
+  const recommendedChallengeNode = chooseRecommendedDirectChallengeNode(challengeNodes);
+  const challengeReadyToSubmit = isDirectChallengeReadyToSubmit(challengeNodes);
   const completion = items.length > 0 && items.every(item => attempts[String(item.nodeId)]?.status === "completed" || assignment.assessments.find(assessment => assessment.nodeId === item.nodeId)?.attemptStatus === "completed");
 
   const ensureAttempt = useCallback(async (nodeId: number) => {
@@ -961,8 +1056,9 @@ function DirectAssignmentStudentContent({ token, theme, assignment, llmConfig, o
   }, [assignment.id, attempts, isSubmitted, token]);
 
   useEffect(() => {
-    if (activeItem) void ensureAttempt(activeItem.nodeId);
-  }, [activeItem, ensureAttempt]);
+    if (!activeItem || challengeMode === "loading" || challengeMode === "blocked") return;
+    void ensureAttempt(activeItem.nodeId);
+  }, [activeItem, challengeMode, ensureAttempt]);
 
   const persistAnswers = useCallback(async (nodeId: number, answers: Record<string, string>) => {
     const attempt = attempts[String(nodeId)];
@@ -985,6 +1081,23 @@ function DirectAssignmentStudentContent({ token, theme, assignment, llmConfig, o
     return () => window.clearTimeout(timer);
   }, [activeAttempt?.answers, activeItem, isSubmitted, persistAnswers]);
 
+  useEffect(() => {
+    if (!recentlyCompletedKey) return;
+    const timer = window.setTimeout(() => setRecentlyCompletedKey(null), 900);
+    return () => window.clearTimeout(timer);
+  }, [recentlyCompletedKey]);
+
+  useEffect(() => {
+    if (!focusMapAfterTransition || challengeMode !== "map") return;
+    const target = challengeReadyToSubmit
+      ? mapFinishNodeRef.current
+      : recommendedChallengeNode ? mapNodeRefs.current[recommendedChallengeNode.key] : null;
+    const reducedMotion = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    target?.scrollIntoView?.({ block: "center", inline: "nearest", behavior: reducedMotion ? "auto" : "smooth" });
+    target?.focus();
+    setFocusMapAfterTransition(false);
+  }, [challengeMode, challengeReadyToSubmit, focusMapAfterTransition, recommendedChallengeNode]);
+
   const updateAnswer = (value: string) => {
     if (!activeItem || !activeAttempt || isSubmitted) return;
     dirtyNodesRef.current.add(activeItem.nodeId);
@@ -1000,25 +1113,63 @@ function DirectAssignmentStudentContent({ token, theme, assignment, llmConfig, o
     } catch { /* keep the current question visible */ }
   };
 
+  const openQuestion = async (key: string) => {
+    if (completionTransition || saving || completing || !items.some(item => item.key === key)) return;
+    if (key === activeKey) return;
+    try {
+      if (activeItem && activeAttempt && dirtyNodesRef.current.has(activeItem.nodeId)) await persistAnswers(activeItem.nodeId, activeAttempt.answers);
+      setRecentlyCompletedKey(null);
+      setActiveKey(key);
+    } catch { /* keep the current question visible */ }
+  };
+
+  const continueAfterCompletion = useCallback(() => {
+    if (!completionTransition) return;
+    setRecentlyCompletedKey(completionTransition.key);
+    if (recommendedChallengeNode) setActiveKey(recommendedChallengeNode.key);
+    setCompletionTransition(null);
+    setFocusMapAfterTransition(true);
+  }, [completionTransition, recommendedChallengeNode]);
+
   const completeCurrent = async () => {
-    if (!activeItem || !activeAttempt || completing || isSubmitted || !assessmentAnswersComplete(activeAttempt)) return;
+    if (!activeItem || !activeAttempt || completing || isSubmitted) return;
+    if (activeAttempt.status === "completed") {
+      if (dirtyNodesRef.current.has(activeItem.nodeId)) await persistAnswers(activeItem.nodeId, activeAttempt.answers);
+      return;
+    }
+    if (!assessmentAnswersComplete(activeAttempt)) return;
     setCompleting(true); setError("");
     try {
       if (dirtyNodesRef.current.has(activeItem.nodeId)) await persistAnswers(activeItem.nodeId, activeAttempt.answers);
       const result = await completeEducationAssessmentAttempt(token, activeAttempt.id, activeAttempt.answers);
-      setAttempts(current => ({ ...current, [String(activeItem.nodeId)]: result.attempt }));
-      const nextIndex = items.findIndex(item => item.key === activeItem.key) + 1;
-      if (nextIndex < items.length) setActiveKey(items[nextIndex].key);
+      const nextAttempts = { ...attempts, [String(activeItem.nodeId)]: result.attempt };
+      const nextNodes = deriveDirectChallengeQuestionNodes(items, nextAttempts, assignment.assessments);
+      setAttempts(nextAttempts);
+      if (challengeMode === "map") {
+        setCompletionTransition({
+          key: activeItem.key,
+          questionOrder: activeItem.order,
+          completedCount: directChallengeCompletionCount(nextNodes),
+          total: nextNodes.length,
+          reward: result.reward ?? null,
+        });
+      } else {
+        showReward(result.reward);
+        const nextIndex = items.findIndex(item => item.key === activeItem.key) + 1;
+        if (nextIndex < items.length) setActiveKey(items[nextIndex].key);
+      }
     } catch (cause) { setError(educationErrorMessage(cause)); }
     finally { setCompleting(false); }
   };
 
   const submit = async () => {
-    if (!completion || submitting || isSubmitted) return;
+    const canSubmit = challengeMode === "map" ? challengeReadyToSubmit : completion;
+    if (!canSubmit || submitting || isSubmitted) return;
     setSubmitting(true); setError("");
     try {
-      const next = await submitEducationAssignment(token, assignment.id);
-      setSubmission(next);
+      const result = await submitEducationAssignment(token, assignment.id);
+      setSubmission(result.submission);
+      showReward(result.reward);
     } catch (cause) { setError(educationErrorMessage(cause)); }
     finally { setSubmitting(false); }
   };
@@ -1027,18 +1178,70 @@ function DirectAssignmentStudentContent({ token, theme, assignment, llmConfig, o
   if (isSubmitted) {
     return <DirectAssignmentShell theme={theme} title={assignment.title} subtitle={assignment.dueAt ? `截止 ${new Date(assignment.dueAt).toLocaleString("zh-CN")}` : undefined} centerTitle leftEyebrow onBack={onBack} className="direct-student-workspace direct-student-result-workspace" actions={<span className={`direct-status-pill ${submission?.status || "submitted"}`}>{submissionStatusLabel(submission?.status || "submitted")}</span>}>
       <main className="direct-student-result">
+        <EducationRewardFeedback reward={reward} nextAction={{ label: "返回教育空间", onClick: onBack }} onClose={() => setReward(null)} />
         {releasedSubmission ? <>
           <section className="direct-result-summary"><div><span>最终得分</span><strong>{releasedSubmission.teacherTotal?.toFixed(1) ?? "—"}</strong><small>/ 100</small></div><p>{releasedSubmission.teacherSummary || "教师未填写整体评语。"}</p></section>
-          <div className="direct-result-list">{releasedGrades.map((grade, index) => <article key={grade.questionId} className="direct-result-question"><header><span>{index + 1}</span><div><strong>{directQuestionLabel(index + 1)}</strong><small>{grade.teacherScore?.toFixed(1) ?? "—"} / {grade.maxScore.toFixed(1)}</small></div></header><section><h3>题目</h3><DirectQuestionContent text={grade.question} /></section><section><h3>我的答案</h3><MathText text={grade.studentAnswer} /></section><div className="direct-result-columns"><section><h3>教师评语</h3><p>{grade.teacherFeedback || "教师未填写逐题评语。"}</p></section><section><h3>参考答案与评分点</h3><DirectQuestionContent text={grade.referenceAnswer} />{grade.expectedPoints.length > 0 && <ul>{grade.expectedPoints.map((point, pointIndex) => <li key={pointIndex}><MathText text={point} /></li>)}</ul>}</section></div></article>)}</div>
-        </> : <div className="direct-state"><CheckCircle2 size={22} />作业已提交，等待教师批改和发布成绩。</div>}
+          <div className="direct-result-list">{releasedGrades.map((grade, index) => <article key={grade.questionId} className="direct-result-question"><header><span>{index + 1}</span><div><strong>{directQuestionLabel(index + 1)}</strong><small>{grade.teacherScore?.toFixed(1) ?? "—"} / {grade.maxScore.toFixed(1)}</small></div></header><section><h3>题目</h3><DirectQuestionContent text={grade.question} /></section><section><h3>我的答案</h3><MathText text={grade.studentAnswer} /></section>{(grade.teacherFeedback || grade.expectedPoints?.length > 0) && <section className="direct-result-correction">{grade.teacherFeedback && <><h3>教师反馈</h3><p>{grade.teacherFeedback}</p></>}{grade.expectedPoints?.length > 0 && <><h3>评分点</h3><ul>{grade.expectedPoints.map(point => <li key={point}>{point}</li>)}</ul></>}</section>}</article>)}</div>
+        </> : <div className="direct-state"><CheckCircle2 size={22} />挑战已提交，等待教师结算。</div>}
       </main>
     </DirectAssignmentShell>;
   }
 
-  return <DirectAssignmentShell theme={theme} title={assignment.title} subtitle={assignment.dueAt ? `截止 ${new Date(assignment.dueAt).toLocaleString("zh-CN")}` : undefined} centerTitle leftEyebrow onBack={onBack} className="direct-student-workspace" actions={<><span className="direct-completion-pill">{items.filter(item => attempts[String(item.nodeId)]?.status === "completed" || assignment.assessments.find(assessment => assessment.nodeId === item.nodeId)?.attemptStatus === "completed").length} / {items.length} 已完成</span><button type="button" className="edu-button primary" disabled={!completion || submitting} onClick={() => void submit()}>{submitting ? <Loader2 className="edu-spin" size={14} /> : <Send size={14} />}提交作业</button></>}>
+  if (challengeMode === "loading") {
+    return <DirectAssignmentShell theme={theme} title={assignment.title} subtitle="正在准备挑战路线" centerTitle leftEyebrow onBack={onBack} className="direct-student-workspace direct-challenge-map-workspace"><div className="direct-state"><Loader2 className="edu-spin" size={20} />正在准备挑战路线…</div></DirectAssignmentShell>;
+  }
+
+  if (challengeMode === "blocked") {
+    return <DirectAssignmentShell theme={theme} title={assignment.title} centerTitle leftEyebrow onBack={onBack} className="direct-student-workspace"><div className="direct-state"><AlertTriangle size={20} />{error || "暂时无法加载学生答题模式。"}</div></DirectAssignmentShell>;
+  }
+
+  if (challengeMode === "map") {
+    return <DirectAssignmentShell
+      theme={theme}
+      title={assignment.title}
+      subtitle={assignment.dueAt ? `截止 ${new Date(assignment.dueAt).toLocaleString("zh-CN")}` : undefined}
+      centerTitle
+      leftEyebrow
+      onBack={onBack}
+      className="direct-student-workspace direct-challenge-answer-workspace"
+      actions={<span className="direct-completion-pill">{challengeCompletionCount} / {challengeNodes.length} 已完成</span>}
+    >
+      <div className="direct-challenge-answer-layout">
+        <DirectChallengeMap
+          assignment={assignment}
+          nodes={challengeNodes}
+          activeKey={activeItem?.key || null}
+          completionCount={challengeCompletionCount}
+          recommendedKey={recommendedChallengeNode?.key || null}
+          recentlyCompletedKey={recentlyCompletedKey}
+          readyToSubmit={challengeReadyToSubmit}
+          busy={saving || completing || Boolean(completionTransition)}
+          submitting={submitting}
+          onOpenQuestion={key => { void openQuestion(key); }}
+          onSubmit={() => void submit()}
+          registerNodeRef={(key, element) => { mapNodeRefs.current[key] = element; }}
+          registerFinishRef={element => { mapFinishNodeRef.current = element; }}
+        />
+        <main className="direct-challenge-answer-main">
+          <section className="direct-challenge-progress" aria-label="题目挑战进度"><div><span>挑战进度</span><strong>{challengeCompletionCount} / {challengeNodes.length}</strong></div><div className="direct-challenge-progress-bar"><span style={{ width: `${challengeNodes.length ? Math.round((challengeCompletionCount / challengeNodes.length) * 100) : 0}%` }} /></div></section>
+          {loading && !activeAttempt ? <div className="direct-state"><Loader2 className="edu-spin" size={20} />正在加载题目…</div> : activeQuestion && activeAttempt && activeItem ? <>
+            <section className="direct-student-prompt"><span className="edu-kicker">{directQuestionLabel(activeItem.order)}</span><h2>{directQuestionLabel(activeItem.order)}</h2><DirectQuestionContent text={activeQuestion.question} />{activeQuestion.focus && <small>检查重点：{activeQuestion.focus}</small>}</section>
+            <ProofWorkspace key={activeQuestion.id} graphId={`direct-assignment:${assignment.id}:${activeAttempt.id}`} node={syntheticDirectNode(activeQuestion.question, activeItem.nodeId, activeItem.order)} token={token} llmConfig={llmConfig} answerMode={{ key: activeQuestion.id, value: activeAttempt.answers[activeQuestion.id] || "", title: "我的作答", subtitle: "可直接输入，也可上传 PDF 或图片手稿进行 OCR", placeholder: "写下你的回答或证明思路，可以使用 Markdown 与 LaTeX 记号。", onChange: updateAnswer, onSave: async value => { if (activeItem) await persistAnswers(activeItem.nodeId, { ...activeAttempt.answers, [activeQuestion.id]: value }); } }} />
+            <div className="direct-student-navigation direct-challenge-answer-navigation"><button type="button" className="edu-button primary" disabled={saving || completing || (activeAttempt.status !== "completed" && !assessmentAnswersComplete(activeAttempt))} onClick={() => void completeCurrent()}>{completing ? <Loader2 className="edu-spin" size={14} /> : <CheckCircle2 size={14} />}{activeAttempt.status === "completed" ? "保存修改" : "完成本题"}<ChevronRight size={14} /></button></div>
+          </> : <div className="direct-state"><AlertTriangle size={20} />当前题目暂不可用。</div>}
+          {error && <div className="direct-workspace-feedback error">{error}</div>}
+        </main>
+      </div>
+      {completionTransition && <DirectQuestionCompletionTransition questionOrder={completionTransition.questionOrder} completedCount={completionTransition.completedCount} total={completionTransition.total} reward={completionTransition.reward} onContinue={continueAfterCompletion} />}
+    </DirectAssignmentShell>;
+  }
+
+  return <DirectAssignmentShell theme={theme} title={assignment.title} subtitle={assignment.dueAt ? `截止 ${new Date(assignment.dueAt).toLocaleString("zh-CN")}` : undefined} centerTitle leftEyebrow onBack={onBack} className="direct-student-workspace" actions={<><span className="direct-completion-pill">{items.filter(item => attempts[String(item.nodeId)]?.status === "completed" || assignment.assessments.find(assessment => assessment.nodeId === item.nodeId)?.attemptStatus === "completed").length} / {items.length} 已完成</span><button type="button" className="edu-button primary" disabled={!completion || submitting} onClick={() => void submit()}>{submitting ? <Loader2 className="edu-spin" size={14} /> : <Send size={14} />}提交挑战</button></>}>
     <div className="direct-student-layout">
-      <aside className="direct-question-sidebar direct-student-sidebar"><div className="direct-sidebar-heading"><div><strong>题目列表</strong><small>{items.length} 道题</small></div></div>{items.map(item => { const status = attempts[String(item.nodeId)]?.status || assignment.assessments.find(assessment => assessment.nodeId === item.nodeId)?.attemptStatus || "not_started"; return <button type="button" key={item.key} className={`direct-student-question${item.key === activeItem?.key ? " active" : ""}`} onClick={() => void moveTo(items.indexOf(item))}><span>{item.order}</span><div><strong>{directQuestionLabel(item.order)}</strong><small>{status === "completed" ? "已完成" : status === "draft" ? "作答中" : "未开始"}</small></div>{status === "completed" && <CheckCircle2 size={15} />}</button>; })}</aside>
+      <aside className="direct-question-sidebar direct-student-sidebar">{modeNotice && <div className="direct-challenge-mode-notice">{modeNotice}</div>}<div className="direct-sidebar-heading"><div><strong>题目列表</strong><small>{items.length} 道题</small></div></div>{items.map(item => { const status = attempts[String(item.nodeId)]?.status || assignment.assessments.find(assessment => assessment.nodeId === item.nodeId)?.attemptStatus || "not_started"; return <button type="button" key={item.key} className={`direct-student-question ${status}${item.key === activeItem?.key ? " active" : ""}`} onClick={() => void moveTo(items.indexOf(item))}><span>{item.order}</span><div><strong>{directQuestionLabel(item.order)}</strong><small>{status === "completed" ? "已完成" : status === "draft" ? "作答中" : "未开始"}</small></div>{status === "completed" && <CheckCircle2 size={15} />}</button>; })}</aside>
       <main className="direct-student-main">
+        <EducationRewardFeedback reward={reward} nextAction={{ label: "继续作答", onClick: () => setReward(null) }} onClose={() => setReward(null)} />
+        <section className="direct-challenge-progress" aria-label="题目挑战进度"><div><span>挑战进度</span><strong>{items.filter(item => attempts[String(item.nodeId)]?.status === "completed" || assignment.assessments.find(assessment => assessment.nodeId === item.nodeId)?.attemptStatus === "completed").length} / {items.length}</strong></div><div className="direct-challenge-progress-bar"><span style={{ width: `${items.length ? Math.round((items.filter(item => attempts[String(item.nodeId)]?.status === "completed" || assignment.assessments.find(assessment => assessment.nodeId === item.nodeId)?.attemptStatus === "completed").length / items.length) * 100) : 0}%` }} /></div></section>
         {loading && !activeAttempt ? <div className="direct-state"><Loader2 className="edu-spin" size={20} />正在加载题目…</div> : activeQuestion && activeAttempt && activeItem ? <>
           <section className="direct-student-prompt"><span className="edu-kicker">{directQuestionLabel(activeItem.order)}</span><h2>{directQuestionLabel(activeItem.order)}</h2><DirectQuestionContent text={activeQuestion.question} />{activeQuestion.focus && <small>检查重点：{activeQuestion.focus}</small>}</section>
           <ProofWorkspace key={activeQuestion.id} graphId={`direct-assignment:${assignment.id}:${activeAttempt.id}`} node={syntheticDirectNode(activeQuestion.question, activeItem.nodeId, activeItem.order)} token={token} llmConfig={llmConfig} answerMode={{ key: activeQuestion.id, value: activeAttempt.answers[activeQuestion.id] || "", title: "我的作答", subtitle: "可直接输入，也可上传 PDF 或图片手稿进行 OCR", placeholder: "写下你的回答或证明思路，可以使用 Markdown 与 LaTeX 记号。", onChange: updateAnswer, onSave: async value => { if (activeItem) await persistAnswers(activeItem.nodeId, { ...activeAttempt.answers, [activeQuestion.id]: value }); } }} />
@@ -1060,7 +1263,7 @@ function DirectAssignmentGradingContent({ token, theme, assignment, onBack, onDi
   const [selectedUserId, setSelectedUserId] = useState<number | null>(null);
   const [submission, setSubmission] = useState<EducationSubmission | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
-  const [busy, setBusy] = useState<"load" | "evaluate" | "save" | "publish" | null>(null);
+  const [busy, setBusy] = useState<"load" | "evaluate" | "evaluateAll" | "save" | "publish" | null>(null);
   const [error, setError] = useState("");
   const [feedback, setFeedback] = useState("");
   const feedbackTimer = useRef<number | null>(null);
@@ -1153,6 +1356,28 @@ function DirectAssignmentGradingContent({ token, theme, assignment, onBack, onDi
     } catch (cause) { setError(educationErrorMessage(cause)); }
     finally { setBusy(null); }
   };
+  const bulkAiEligibleCount = overview?.students.filter(student => student.submissionId && student.submissionStatus !== "finalized" && student.submissionStatus !== "released").length || 0;
+  const evaluateAll = async () => {
+    if (!overview || bulkAiEligibleCount === 0 || busy) return;
+    if (gradingDirty && !(await save())) return;
+    setBusy("evaluateAll"); setError(""); setFeedback("");
+    try {
+      const result = await evaluateAllEducationSubmissions(token, assignment.id);
+      const [nextOverview, nextSubmission] = await Promise.all([
+        loadEducationGradingOverview(token, assignment.id),
+        submission ? loadEducationSubmission(token, submission.id) : Promise.resolve(null),
+      ]);
+      setOverview(nextOverview);
+      if (nextSubmission) setSubmission(nextSubmission);
+      setGradingDirty(false);
+      if (result.failedCount > 0) {
+        setError(`已完成 ${result.evaluatedCount} 位学生的 AI 评价，${result.failedCount} 位评价失败，可进入对应学生后重试。`);
+      } else {
+        showFeedback(`已完成 ${result.evaluatedCount} 位学生的 AI 评价，请逐一复核并保存评分。`);
+      }
+    } catch (cause) { setError(educationErrorMessage(cause)); }
+    finally { setBusy(null); }
+  };
   const publish = async () => {
     if (!overview?.canPublish || busy) return;
     if (gradingDirty && !(await save())) return;
@@ -1181,7 +1406,7 @@ function DirectAssignmentGradingContent({ token, theme, assignment, onBack, onDi
     teacherFeedback: active.aiResult?.studentFeedback?.trim() || active.aiResult?.rationale?.trim() || "",
   };
 
-  return <DirectAssignmentShell theme={theme} title={`${assignment.title} · 批改`} eyebrow="作业批改" showTitle={false} showSubtitle={false} onBack={onBack} className="direct-grading-workspace" actions={<><button type="button" className="edu-button primary" disabled={!overview?.canPublish || busy !== null} onClick={() => void publish()}>{busy === "publish" ? <Loader2 className="edu-spin" size={14} /> : <Send size={14} />}发布成绩</button></>}>
+  return <DirectAssignmentShell theme={theme} title={`${assignment.title} · 批改`} eyebrow="作业批改" showTitle={false} showSubtitle={false} onBack={onBack} className="direct-grading-workspace" actions={<><button type="button" className="edu-button secondary" disabled={bulkAiEligibleCount === 0 || busy !== null} onClick={() => void evaluateAll()}>{busy === "evaluateAll" ? <Loader2 className="edu-spin" size={14} /> : <Brain size={14} />}{busy === "evaluateAll" ? "AI 评价中…" : "一键 AI 评价"}</button><button type="button" className="edu-button primary" disabled={!overview?.canPublish || busy !== null} onClick={() => void publish()}>{busy === "publish" ? <Loader2 className="edu-spin" size={14} /> : <Send size={14} />}发布成绩</button></>}>
     <div className="direct-grading-layout">
       <aside className="direct-student-sidebar">
         <div className="direct-sidebar-heading">
@@ -1201,7 +1426,7 @@ function DirectAssignmentGradingContent({ token, theme, assignment, onBack, onDi
       <main className="direct-grading-main">
         {!submission ? <div className="direct-state"><ClipboardCheckIcon />{selectedStudent?.submissionId ? "正在加载提交…" : "请选择已有提交的学生开始批改。"}</div> : <>
           <div className="direct-grading-question-nav">{grades.map((grade, index) => <button type="button" key={grade.questionId} className={index === activeIndex ? "active" : ""} onClick={() => void selectQuestion(index)}><span>{index + 1}</span><small>{grade.teacherScore == null ? "待评分" : `${grade.teacherScore}/${grade.maxScore}`}</small></button>)}</div>
-          {active ? <><section className="direct-grading-question"><span>{directQuestionLabel(activeIndex + 1)} · 满分 {active.maxScore}</span><DirectQuestionContent text={active.question} /></section><section className="direct-grading-block"><h3>学生答案</h3><MathText text={active.studentAnswer} /></section><section className="direct-grading-block"><h3>参考答案与评分点</h3><DirectQuestionContent text={active.referenceAnswer} />{active.expectedPoints.length > 0 && <ul>{active.expectedPoints.map((point, index) => <li key={index}><MathText text={point} /></li>)}</ul>}</section><section className={`direct-grading-block direct-matrix-block ${(active.matrixReport as MatrixCheckReport)?.status || "not_applicable"}`}><h3>过程检查 · {matrixStatusLabel((active.matrixReport as MatrixCheckReport)?.status)}</h3><p>{(active.matrixReport as MatrixCheckReport)?.summary || "本题没有额外的矩阵过程检查。"}</p></section><section className="direct-grading-block direct-ai-block"><div className="direct-block-heading"><h3><Brain size={15} />AI 评分建议</h3>{aiSuggestion && <button type="button" className="edu-button secondary" disabled={readOnly || busy !== null} onClick={() => updateGrade(active.questionId, aiSuggestion)}><Check size={13} />采纳建议</button>}</div>{active.aiResult?.rationale ? <><strong>建议 {active.aiSuggestedScore ?? active.aiResult.suggestedScore} / {active.maxScore}</strong><p>{active.aiResult.rationale}</p>{active.aiResult.studentFeedback && <p><b>给学生的反馈：</b>{active.aiResult.studentFeedback}</p>}</> : <p>尚未生成 AI 评价，可手工评分。</p>}</section></> : <div className="direct-state">该提交没有可评分题目。</div>}
+          {active ? <><section className="direct-grading-question"><span>{directQuestionLabel(activeIndex + 1)} · 满分 {active.maxScore}</span><DirectQuestionContent text={active.question} /></section><section className="direct-grading-block"><h3>学生答案</h3><MathText text={active.studentAnswer} /></section><section className="direct-grading-block"><h3>参考答案与评分点</h3><DirectQuestionContent text={active.referenceAnswer} />{active.expectedPoints.length > 0 && <ul>{active.expectedPoints.map((point, index) => <li key={index}><MathText text={point} /></li>)}</ul>}</section><section className={`direct-grading-block direct-matrix-block ${(active.matrixReport as MatrixCheckReport)?.status || "not_applicable"}`}><h3>过程检查 · {matrixStatusLabel((active.matrixReport as MatrixCheckReport)?.status)}</h3><p>{(active.matrixReport as MatrixCheckReport)?.summary || "本题没有额外的矩阵过程检查。"}</p></section><section className="direct-grading-block direct-ai-block"><div className="direct-block-heading"><h3><Brain size={15} />AI 评分建议</h3>{aiSuggestion && <button type="button" className="edu-button secondary" disabled={readOnly || busy !== null} onClick={() => updateGrade(active.questionId, aiSuggestion)}><Check size={13} />采纳建议</button>}</div>{active.aiResult?.rationale ? <><strong>建议 {active.aiSuggestedScore ?? active.aiResult.suggestedScore} / {active.maxScore}</strong><p>{active.aiResult.rationale}</p>{active.aiResult.studentFeedback && <p><b>给学生的反馈：</b>{active.aiResult.studentFeedback}</p>}</> : <p>尚未生成 AI 评价，可手工评分。</p>}</section><nav className="direct-grading-question-pagination" aria-label="批改题目切换"><button type="button" className="edu-button ghost" disabled={busy !== null || activeIndex === 0} onClick={() => void selectQuestion(activeIndex - 1)}><ChevronLeft size={14} />上一题</button><button type="button" className="edu-button primary" disabled={busy !== null || activeIndex >= grades.length - 1} onClick={() => void selectQuestion(activeIndex + 1)}>下一题<ChevronRight size={14} /></button></nav></> : <div className="direct-state">该提交没有可评分题目。</div>}
         </>}
       </main>
       <aside className="direct-grading-score">

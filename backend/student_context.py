@@ -10,7 +10,6 @@ import hashlib
 import json
 import math
 import re
-import sqlite3
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -18,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from education_service import is_dependency_edge, run_structured_education_tasks
+from storage.graph_service import load_graph
 
 
 CONTEXT_BUDGET_TOKENS = 6000
@@ -68,6 +68,14 @@ def _text(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     return ""
+
+
+def _snapshot_graph(snapshot: Any) -> dict[str, Any]:
+    nodes = snapshot.get("nodes") if hasattr(snapshot, "get") else None
+    edges = snapshot.get("edges") if hasattr(snapshot, "get") else None
+    if isinstance(nodes, list) and isinstance(edges, list):
+        return {"nodes": nodes, "edges": edges}
+    return load_graph(str(snapshot["id"]))
 
 
 def _node_title(node: dict[str, Any]) -> str:
@@ -137,7 +145,7 @@ def _compact_evidence_item(item: dict[str, Any], claim_limit: int) -> dict[str, 
 
 
 def ensure_snapshot_identities(
-    db: sqlite3.Connection,
+    db: Any,
     *,
     class_id: str,
     snapshot_id: str,
@@ -168,9 +176,9 @@ def ensure_snapshot_identities(
             """INSERT INTO education_node_occurrences
                  (snapshot_id, node_id, canonical_node_id, global_id)
                VALUES (?, ?, ?, ?)
-               ON CONFLICT(snapshot_id, node_id) DO UPDATE SET
-                 canonical_node_id = excluded.canonical_node_id,
-                 global_id = excluded.global_id""",
+               ON DUPLICATE KEY UPDATE
+                 canonical_node_id = VALUES(canonical_node_id),
+                 global_id = VALUES(global_id)""",
             (snapshot_id, node_id, canonical_id, global_id),
         )
         mapping[node_id] = canonical_id
@@ -178,7 +186,7 @@ def ensure_snapshot_identities(
 
 
 def _snapshot_maps(
-    db: sqlite3.Connection,
+    db: Any,
     *,
     class_id: str,
     snapshot_id: str,
@@ -216,7 +224,7 @@ def _neighbor_roles(
     return neighbors
 
 
-def current_context_version(db: sqlite3.Connection, *, class_id: str, user_id: int) -> int:
+def current_context_version(db: Any, *, class_id: str, user_id: int) -> int:
     row = db.execute(
         """SELECT COALESCE(MAX(context_version), 0) AS version
              FROM learning_interactions WHERE class_id = ? AND user_id = ?""",
@@ -225,7 +233,7 @@ def current_context_version(db: sqlite3.Connection, *, class_id: str, user_id: i
     return int(row["version"] or 0) if row else 0
 
 
-def _evidence_payload(row: sqlite3.Row, *, node_id: int | None = None) -> dict[str, Any]:
+def _evidence_payload(row: Any, *, node_id: int | None = None) -> dict[str, Any]:
     payload = {
         "id": row["id"],
         "kind": row["kind"],
@@ -248,7 +256,7 @@ def _evidence_payload(row: sqlite3.Row, *, node_id: int | None = None) -> dict[s
     return payload
 
 
-def _model_payload(row: sqlite3.Row, *, node_id: int, title: str) -> dict[str, Any]:
+def _model_payload(row: Any, *, node_id: int, title: str) -> dict[str, Any]:
     direct = _json(row["direct_summary_json"], {})
     risks = _json(row["risk_summary_json"], {})
     return {
@@ -264,13 +272,13 @@ def _model_payload(row: sqlite3.Row, *, node_id: int, title: str) -> dict[str, A
 
 
 def build_student_context_overview(
-    db: sqlite3.Connection,
+    db: Any,
     *,
-    assignment: sqlite3.Row,
-    snapshot: sqlite3.Row,
+    assignment: Any,
+    snapshot: Any,
     user_id: int,
 ) -> dict[str, Any]:
-    nodes = _json(snapshot["nodes_json"], [])
+    nodes = _snapshot_graph(snapshot)["nodes"]
     by_node, by_canonical, node_by_id = _snapshot_maps(
         db,
         class_id=assignment["class_id"],
@@ -305,17 +313,17 @@ def build_student_context_overview(
 
 
 def build_student_context_packet(
-    db: sqlite3.Connection,
+    db: Any,
     *,
-    assignment: sqlite3.Row,
-    snapshot: sqlite3.Row,
+    assignment: Any,
+    snapshot: Any,
     user_id: int,
     node_id: int,
     user_proof: str = "",
     action: str = "",
     budget_tokens: int = CONTEXT_BUDGET_TOKENS,
 ) -> dict[str, Any]:
-    nodes = _json(snapshot["nodes_json"], [])
+    nodes = _snapshot_graph(snapshot)["nodes"]
     by_node, by_canonical, node_by_id = _snapshot_maps(
         db,
         class_id=assignment["class_id"],
@@ -615,7 +623,7 @@ def run_structured_proof_assist(
     }
 
 
-def _summary_entry(row: sqlite3.Row) -> dict[str, Any]:
+def _summary_entry(row: Any) -> dict[str, Any]:
     return {
         "evidenceId": row["id"],
         "claim": row["claim"],
@@ -626,7 +634,7 @@ def _summary_entry(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def refresh_student_node_model(
-    db: sqlite3.Connection,
+    db: Any,
     *, class_id: str,
     user_id: int,
     canonical_node_id: str,
@@ -684,13 +692,13 @@ def refresh_student_node_model(
               direct_summary_json, risk_summary_json, open_evidence_count,
               version, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(class_id, user_id, canonical_node_id) DO UPDATE SET
-             mastery_state = excluded.mastery_state,
-             direct_summary_json = excluded.direct_summary_json,
-             risk_summary_json = excluded.risk_summary_json,
-             open_evidence_count = excluded.open_evidence_count,
-             version = excluded.version,
-             updated_at = excluded.updated_at""",
+           ON DUPLICATE KEY UPDATE
+             mastery_state = VALUES(mastery_state),
+             direct_summary_json = VALUES(direct_summary_json),
+             risk_summary_json = VALUES(risk_summary_json),
+             open_evidence_count = VALUES(open_evidence_count),
+             version = VALUES(version),
+             updated_at = VALUES(updated_at)""",
         (
             class_id,
             user_id,
@@ -714,7 +722,7 @@ def refresh_student_node_model(
 
 
 def _maybe_refresh_node_summary(
-    db: sqlite3.Connection,
+    db: Any,
     *, class_id: str,
     user_id: int,
     canonical_node_id: str,
@@ -725,7 +733,7 @@ def _maybe_refresh_node_summary(
             WHERE class_id = ? AND user_id = ? AND scope_type = 'node' AND scope_id = ?""",
         (class_id, user_id, canonical_node_id),
     ).fetchone()
-    watermark = summary["source_watermark"] if summary else ""
+    watermark = summary["source_watermark"] if summary and summary["source_watermark"] else "1970-01-01T00:00:00"
     stats = db.execute(
         """SELECT COUNT(*) AS count, COALESCE(SUM(token_estimate), 0) AS tokens,
                   MAX(created_at) AS latest
@@ -757,13 +765,13 @@ def _maybe_refresh_node_summary(
              (class_id, user_id, scope_type, scope_id, summary_json,
               source_watermark, schema_version, prompt_version, token_count, updated_at)
            VALUES (?, ?, 'node', ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(class_id, user_id, scope_type, scope_id) DO UPDATE SET
-             summary_json = excluded.summary_json,
-             source_watermark = excluded.source_watermark,
-             schema_version = excluded.schema_version,
-             prompt_version = excluded.prompt_version,
-             token_count = excluded.token_count,
-             updated_at = excluded.updated_at""",
+           ON DUPLICATE KEY UPDATE
+             summary_json = VALUES(summary_json),
+             source_watermark = VALUES(source_watermark),
+             schema_version = VALUES(schema_version),
+             prompt_version = VALUES(prompt_version),
+             token_count = VALUES(token_count),
+             updated_at = VALUES(updated_at)""",
         (
             class_id,
             user_id,
@@ -780,14 +788,14 @@ def _maybe_refresh_node_summary(
 
 
 def _maybe_refresh_course_summary(
-    db: sqlite3.Connection, *, class_id: str, user_id: int, now: str
+    db: Any, *, class_id: str, user_id: int, now: str
 ) -> None:
     summary = db.execute(
         """SELECT updated_at FROM learning_context_summaries
             WHERE class_id = ? AND user_id = ? AND scope_type = 'course' AND scope_id = ?""",
         (class_id, user_id, class_id),
     ).fetchone()
-    since = summary["updated_at"] if summary else ""
+    since = summary["updated_at"] if summary and summary["updated_at"] else "1970-01-01T00:00:00"
     changed = db.execute(
         """SELECT COUNT(*) AS count FROM learning_context_summaries
             WHERE class_id = ? AND user_id = ? AND scope_type = 'node' AND updated_at > ?""",
@@ -820,13 +828,13 @@ def _maybe_refresh_course_summary(
              (class_id, user_id, scope_type, scope_id, summary_json,
               source_watermark, schema_version, prompt_version, token_count, updated_at)
            VALUES (?, ?, 'course', ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(class_id, user_id, scope_type, scope_id) DO UPDATE SET
-             summary_json = excluded.summary_json,
-             source_watermark = excluded.source_watermark,
-             schema_version = excluded.schema_version,
-             prompt_version = excluded.prompt_version,
-             token_count = excluded.token_count,
-             updated_at = excluded.updated_at""",
+           ON DUPLICATE KEY UPDATE
+             summary_json = VALUES(summary_json),
+             source_watermark = VALUES(source_watermark),
+             schema_version = VALUES(schema_version),
+             prompt_version = VALUES(prompt_version),
+             token_count = VALUES(token_count),
+             updated_at = VALUES(updated_at)""",
         (
             class_id,
             user_id,
@@ -842,19 +850,20 @@ def _maybe_refresh_course_summary(
 
 
 def _apply_learning_delta(
-    db: sqlite3.Connection,
+    db: Any,
     *,
     interaction_id: str,
-    assignment: sqlite3.Row,
-    snapshot: sqlite3.Row,
+    assignment: Any,
+    snapshot: Any,
     user_id: int,
     node_id: int,
     user_proof: str,
     learning_delta: list[dict[str, Any]],
     now: str,
 ) -> dict[str, Any]:
-    nodes = _json(snapshot["nodes_json"], [])
-    edges = _json(snapshot["edges_json"], [])
+    graph = _snapshot_graph(snapshot)
+    nodes = graph["nodes"]
+    edges = graph["edges"]
     by_node, _by_canonical, _node_by_id = _snapshot_maps(
         db,
         class_id=assignment["class_id"],
@@ -924,7 +933,7 @@ def _apply_learning_delta(
                 "edgeDescription": edge.get("description") or "",
             }
             db.execute(
-                """INSERT OR IGNORE INTO learning_evidence_nodes
+                """INSERT IGNORE INTO learning_evidence_nodes
                      (evidence_id, canonical_node_id, relation_role, relation_path_json, weight)
                    VALUES (?, ?, ?, ?, ?)""",
                 (
@@ -968,10 +977,10 @@ def _apply_learning_delta(
 
 
 def store_interaction_with_evidence(
-    db: sqlite3.Connection,
+    db: Any,
     *,
-    assignment: sqlite3.Row,
-    snapshot: sqlite3.Row,
+    assignment: Any,
+    snapshot: Any,
     user_id: int,
     node_id: int,
     client_interaction_id: str,
@@ -983,7 +992,7 @@ def store_interaction_with_evidence(
     classification_status: str,
 ) -> dict[str, Any]:
     now = _now()
-    nodes = _json(snapshot["nodes_json"], [])
+    nodes = _snapshot_graph(snapshot)["nodes"]
     by_node, _by_canonical, node_by_id = _snapshot_maps(
         db,
         class_id=assignment["class_id"],
@@ -1042,10 +1051,10 @@ def store_interaction_with_evidence(
 
 
 def pending_context_rebuild_tasks(
-    db: sqlite3.Connection, *, limit: int = 100
+    db: Any, *, limit: int = 100
 ) -> dict[str, dict[str, Any]]:
     rows = db.execute(
-        """SELECT i.*, s.nodes_json, s.edges_json
+        """SELECT i.*
              FROM learning_interactions i
              JOIN education_snapshots s ON s.id = i.snapshot_id
             WHERE i.classification_status = 'pending'
@@ -1056,12 +1065,17 @@ def pending_context_rebuild_tasks(
         (max(1, min(int(limit), 1000)),),
     ).fetchall()
     tasks: dict[str, dict[str, Any]] = {}
+    graph_cache: dict[str, dict[str, Any]] = {}
     for row in rows:
-        nodes = _json(row["nodes_json"], [])
-        node = next((item for item in nodes if item.get("id") == row["node_id"]), {})
+        snapshot_id = str(row["snapshot_id"])
+        graph = graph_cache.get(snapshot_id)
+        if graph is None:
+            graph = load_graph(snapshot_id)
+            graph_cache[snapshot_id] = graph
+        node = next((item for item in graph["nodes"] if item.get("id") == row["node_id"]), {})
         allowed_node_ids = sorted(_neighbor_roles(
             current_node_id=int(row["node_id"]),
-            edges=_json(row["edges_json"], []),
+            edges=graph["edges"],
         ))
         tasks[row["id"]] = {
             "interactionId": row["id"],
@@ -1076,7 +1090,7 @@ def pending_context_rebuild_tasks(
 
 
 def apply_rebuilt_interaction_evidence(
-    db: sqlite3.Connection,
+    db: Any,
     *,
     interaction_id: str,
     learning_delta: list[dict[str, Any]],
@@ -1133,7 +1147,7 @@ def apply_rebuilt_interaction_evidence(
 
 
 def rebuild_pending_student_context(
-    db: sqlite3.Connection,
+    db: Any,
     *,
     context: Any,
     checkpoint_dir: Path,
@@ -1165,7 +1179,7 @@ def rebuild_pending_student_context(
 
 
 def load_idempotent_result(
-    db: sqlite3.Connection,
+    db: Any,
     *,
     assignment_id: str,
     user_id: int,
@@ -1183,7 +1197,7 @@ def load_idempotent_result(
 
 
 def save_interaction_result(
-    db: sqlite3.Connection, *, interaction_id: str, result: dict[str, Any]
+    db: Any, *, interaction_id: str, result: dict[str, Any]
 ) -> None:
     db.execute(
         "UPDATE learning_interactions SET result_json = ? WHERE id = ?",
@@ -1192,7 +1206,7 @@ def save_interaction_result(
 
 
 def update_evidence_status(
-    db: sqlite3.Connection,
+    db: Any,
     *,
     evidence_id: str,
     user_id: int,
@@ -1259,10 +1273,10 @@ def update_evidence_status(
 
 
 def build_teacher_context_summary(
-    db: sqlite3.Connection,
+    db: Any,
     *,
-    assignment: sqlite3.Row,
-    snapshot: sqlite3.Row,
+    assignment: Any,
+    snapshot: Any,
     student_user_id: int,
 ) -> dict[str, Any]:
     overview = build_student_context_overview(
@@ -1308,7 +1322,7 @@ def build_teacher_context_summary(
 
 
 def export_student_context(
-    db: sqlite3.Connection, *, class_id: str, user_id: int
+    db: Any, *, class_id: str, user_id: int
 ) -> dict[str, Any]:
     """Return a student-owned, rebuildable course-context export."""
     interactions = [
@@ -1390,7 +1404,7 @@ def export_student_context(
 
 
 def delete_student_context(
-    db: sqlite3.Connection, *, class_id: str, user_id: int
+    db: Any, *, class_id: str, user_id: int
 ) -> dict[str, int]:
     """Explicitly delete one student's derived and raw context for one course."""
     interaction_count = int(db.execute(

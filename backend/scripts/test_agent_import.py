@@ -1,8 +1,14 @@
+import base64
+from contextlib import contextmanager
 import io
 import json
 import os
+from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
+
+import pytest
 
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -10,6 +16,89 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 import api_v2
+from integrations.neo4j_handler import get_graph_store, reset_graph_store
+from scripts.migrate_storage import TARGET_TABLE_ORDER
+from storage.database import reset_engine
+
+
+def _integration_enabled():
+    return (
+        os.environ.get("MATHWEAVER_INTEGRATION_TESTS") == "1"
+        and bool(os.environ.get("MATHWEAVER_TEST_DATABASE_URL", "").strip())
+        and bool(os.environ.get("MATHWEAVER_TEST_NEO4J_URI", "").strip())
+        and bool(os.environ.get("MATHWEAVER_TEST_NEO4J_PASSWORD_FILE", "").strip())
+    )
+
+
+def _clear_storage():
+    with api_v2.connect_database() as connection:
+        connection.execute("SET FOREIGN_KEY_CHECKS = 0")
+        for table in reversed((*TARGET_TABLE_ORDER, "graph_registry")):
+            connection.execute(f"DELETE FROM `{table}`")
+        connection.execute("SET FOREIGN_KEY_CHECKS = 1")
+    store = get_graph_store()
+    with store.driver.session(database=store.database) as session:
+        session.run("MATCH (n) DETACH DELETE n").consume()
+
+
+@contextmanager
+def _storage_fixture():
+    if not _integration_enabled():
+        pytest.skip("set dedicated Docker MySQL/Neo4j integration-test credentials")
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        root = Path(temp_dir)
+        data_key_file = root / "data-key.txt"
+        data_key_file.write_text(
+            base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("="),
+            encoding="utf-8",
+        )
+        previous = (
+            api_v2._DATA_ROOT,
+            api_v2._SOURCE_PDF_ROOT,
+            api_v2._EDUCATION_ROOT,
+            api_v2._EDUCATION_SNAPSHOT_ROOT,
+            api_v2._EDUCATION_ASSIGNMENT_SOURCE_ROOT,
+        )
+        api_v2._DATA_ROOT = root
+        api_v2._SOURCE_PDF_ROOT = root / "uploads" / "source_pdfs"
+        api_v2._EDUCATION_ROOT = root / "education"
+        api_v2._EDUCATION_SNAPSHOT_ROOT = root / "education" / "snapshots"
+        api_v2._EDUCATION_ASSIGNMENT_SOURCE_ROOT = root / "education" / "assignment_sources"
+        environment = patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": os.environ["MATHWEAVER_TEST_DATABASE_URL"],
+                "NEO4J_URI": os.environ["MATHWEAVER_TEST_NEO4J_URI"],
+                "NEO4J_USER": os.environ.get("MATHWEAVER_TEST_NEO4J_USER", "neo4j"),
+                "NEO4J_PASSWORD_FILE": os.environ["MATHWEAVER_TEST_NEO4J_PASSWORD_FILE"],
+                "MATHWEAVER_DATA_KEY_FILE": str(data_key_file),
+                "MATHGRAPH_DATA_DIR": str(root),
+            },
+            clear=False,
+        )
+        environment.start()
+        reset_engine()
+        reset_graph_store()
+        try:
+            _clear_storage()
+            api_v2._jobs.clear()
+            api_v2._job_runtimes.clear()
+            api_v2.app.config.update(TESTING=True)
+            yield api_v2.app.test_client()
+        finally:
+            api_v2._jobs.clear()
+            api_v2._job_runtimes.clear()
+            _clear_storage()
+            reset_graph_store()
+            reset_engine()
+            environment.stop()
+            (
+                api_v2._DATA_ROOT,
+                api_v2._SOURCE_PDF_ROOT,
+                api_v2._EDUCATION_ROOT,
+                api_v2._EDUCATION_SNAPSHOT_ROOT,
+                api_v2._EDUCATION_ASSIGNMENT_SOURCE_ROOT,
+            ) = previous
 
 
 def _upload_json(payload, filename):
@@ -17,59 +106,50 @@ def _upload_json(payload, filename):
 
 
 def test_agent_import_and_history_markdown():
-    original_db_path = api_v2._DB_PATH
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            api_v2._DB_PATH = os.path.join(temp_dir, "history.db")
-            api_v2._jobs.clear()
-            api_v2._init_db()
-            client = api_v2.app.test_client()
+    with _storage_fixture() as client:
+        nodes = [
+            {"global_id": "def-1", "title": "群", "type": "definition", "content": "群的定义"},
+            {"global_id": "thm-1", "title": "拉格朗日定理", "type": "theorem", "content": "定理内容"},
+        ]
+        edges = [
+            {"from": "def-1", "to": "thm-1", "关系名称": "supports", "关系解释": "定义支撑定理"},
+            {"from": "missing", "to": "thm-1", "relation": "ignored"},
+        ]
+        response = client.post(
+            "/api/v2/agent-import",
+            data={
+                "nodes_file": _upload_json(nodes, "nodes.json"),
+                "edges_file": _upload_json(edges, "edges.json"),
+                "markdown_file": (io.BytesIO("# 群\n\n拉格朗日定理".encode("utf-8")), "source.md"),
+            },
+            content_type="multipart/form-data",
+        )
+        assert response.status_code == 201, response.get_json()
+        body = response.get_json()
+        assert len(body["result"]["nodes"]) == 2
+        assert len(body["result"]["edges"]) == 1
+        assert body["has_markdown"] is True
+        assert len(body["warnings"]) == 1
 
-            nodes = [
-                {"global_id": "def-1", "title": "群", "type": "definition", "content": "群的定义"},
-                {"global_id": "thm-1", "title": "拉格朗日定理", "type": "theorem", "content": "定理内容"},
-            ]
-            edges = [
-                {"from": "def-1", "to": "thm-1", "关系名称": "supports", "关系解释": "定义支撑定理"},
-                {"from": "missing", "to": "thm-1", "relation": "ignored"},
-            ]
-            response = client.post(
-                "/api/v2/agent-import",
-                data={
-                    "nodes_file": _upload_json(nodes, "nodes.json"),
-                    "edges_file": _upload_json(edges, "edges.json"),
-                    "markdown_file": (io.BytesIO("# 群\n\n拉格朗日定理".encode("utf-8")), "source.md"),
-                },
-                content_type="multipart/form-data",
-            )
-            assert response.status_code == 201, response.get_json()
-            body = response.get_json()
-            assert len(body["result"]["nodes"]) == 2
-            assert len(body["result"]["edges"]) == 1
-            assert body["has_markdown"] is True
-            assert len(body["warnings"]) == 1
-
-            register = client.post(
-                "/api/v2/auth/register",
-                json={"email": "agent-test@example.com", "password": "password123"},
-            )
-            assert register.status_code == 201, register.get_json()
-            token = register.get_json()["token"]
-            saved = client.post(
-                "/api/v2/history",
-                json={"job_id": body["job_id"]},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            assert saved.status_code == 201, saved.get_json()
-            history_id = saved.get_json()["id"]
-            markdown = client.get(
-                f"/api/v2/history/{history_id}/markdown",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            assert markdown.status_code == 200
-            assert markdown.get_json()["markdown"].startswith("# 群")
-    finally:
-        api_v2._DB_PATH = original_db_path
+        register = client.post(
+            "/api/v2/auth/register",
+            json={"email": "agent-test@example.com", "password": "password123"},
+        )
+        assert register.status_code == 201, register.get_json()
+        token = register.get_json()["token"]
+        saved = client.post(
+            "/api/v2/history",
+            json={"job_id": body["job_id"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert saved.status_code == 201, saved.get_json()
+        history_id = saved.get_json()["id"]
+        markdown = client.get(
+            f"/api/v2/history/{history_id}/markdown",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert markdown.status_code == 200
+        assert markdown.get_json()["markdown"].startswith("# 群")
 
 
 def test_normalized_ids_title_fallback_and_zero_edges():
@@ -124,7 +204,7 @@ def test_normalized_ids_title_fallback_and_zero_edges():
         raise AssertionError("Expected duplicate global_id to be rejected")
 
 
-def test_tex_display_environments_are_normalized_for_frontend():
+def test_tex_source_environments_are_preserved_for_frontend():
     nodes = [
         {
             "global_id": "exa:e1.1.8",
@@ -147,19 +227,18 @@ def test_tex_display_environments_are_normalized_for_frontend():
     ]
     normalized = api_v2._normalize_nodes(nodes)
     content = normalized[0]["content"]
-    assert "\\begin{itemize}" not in content
-    assert "\\item" not in content
-    assert "\\begin{equation}" not in content
-    assert "\\label{eq:green}" not in content
-    assert "- Green's first formula:" in content
-    assert "$$" in content
+    assert "\\begin{itemize}" in content
+    assert "\\item" in content
+    assert "\\begin{equation}" in content
+    assert "\\label{eq:green}" in content
     assert "\\int_D d\\omega." in content
-    assert "\\color" not in content
-    assert "\\ref" not in content
-    assert "Theorem t1.1.14" in content
+    assert "\\color" in content
+    assert "\\ref{thm:t1.1.14}" in content
+    assert normalized[0]["source_text"] == content
+    assert normalized[0]["source_statement"] == content
 
 
-def test_eqnarray_display_environment_is_normalized_for_frontend():
+def test_eqnarray_source_environment_is_preserved_for_frontend():
     nodes = [
         {
             "global_id": "thm:t1.1.5",
@@ -179,13 +258,12 @@ def test_eqnarray_display_environment_is_normalized_for_frontend():
     ]
     normalized = api_v2._normalize_nodes(nodes)
     content = normalized[0]["content"]
-    assert "\\begin{eqnarray}" not in content
-    assert "\\end{eqnarray}" not in content
-    assert "\\nonumber" not in content
-    assert "\\begin{aligned}" in content
-    assert "$$" in content
+    assert "\\begin{eqnarray}" in content
+    assert "\\end{eqnarray}" in content
+    assert "\\nonumber" in content
     assert "\\bbf^{\\ast}" in content
-    assert normalized[0]["conditions"] == ["This follows from (1.1.3.15)."]
+    assert normalized[0]["conditions"] == ["This follows from (\\ref{1.1.3.15})."]
+    assert normalized[0]["source_statement"] == content
 
 
 def test_agent_import_validation():
@@ -212,9 +290,12 @@ def test_agent_import_validation():
 
 
 if __name__ == "__main__":
-    test_agent_import_and_history_markdown()
+    if _integration_enabled():
+        test_agent_import_and_history_markdown()
+    else:
+        print("agent import history integration test skipped (Docker test credentials not configured)")
     test_normalized_ids_title_fallback_and_zero_edges()
-    test_tex_display_environments_are_normalized_for_frontend()
-    test_eqnarray_display_environment_is_normalized_for_frontend()
+    test_tex_source_environments_are_preserved_for_frontend()
+    test_eqnarray_source_environment_is_preserved_for_frontend()
     test_agent_import_validation()
     print("agent import tests passed")

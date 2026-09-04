@@ -55,11 +55,7 @@ UPLOAD_FOLDER.mkdir(exist_ok=True)
 # ✅ Neo4j 凭据从环境变量读取（连接失败时不阻塞服务启动）
 neo4j_handler = None
 try:
-    neo4j_handler = Neo4jHandler(
-        uri=os.environ.get("NEO4J_URI", ""),
-        user=os.environ.get("NEO4J_USER", "neo4j"),
-        password=os.environ.get("NEO4J_PASSWORD", ""),
-    )
+    neo4j_handler = Neo4jHandler.from_environment()
 except Exception as e:
     print(f"[WARNING] Neo4j 连接失败，图谱功能不可用: {e}")
 

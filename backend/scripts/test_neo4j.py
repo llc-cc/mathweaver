@@ -1,5 +1,6 @@
 # test_neo4j.py
 import os
+from pathlib import Path
 import sys
 
 # 加载 .env
@@ -11,7 +12,12 @@ from neo4j import GraphDatabase, exceptions
 
 URI = os.environ.get("NEO4J_URI", "")
 USER = os.environ.get("NEO4J_USER", "neo4j")
-PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
+password_file = os.environ.get("NEO4J_PASSWORD_FILE", "").strip()
+PASSWORD = (
+    Path(password_file).read_text(encoding="utf-8").strip()
+    if password_file
+    else os.environ.get("NEO4J_PASSWORD", "")
+)
 
 try:
     # 建立连接并测试

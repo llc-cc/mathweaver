@@ -1,0 +1,80 @@
+name: mathweaver-db-production
+
+services:
+  mysql:
+    image: mysql:8.4.11@${MYSQL_IMAGE_DIGEST:?Set MYSQL_IMAGE_DIGEST to the reviewed sha256 manifest digest}
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: mathweaver
+      MYSQL_USER: mathweaver
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_app_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+      TZ: UTC
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+    volumes:
+      - mysql_data:/var/lib/mysql
+    secrets:
+      - mysql_app_password
+      - mysql_root_password
+    networks:
+      - database
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mysqladmin ping -h 127.0.0.1 -uroot --password="$$(cat /run/secrets/mysql_root_password)" --silent
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  neo4j:
+    image: neo4j:2026.07.1-community@${NEO4J_IMAGE_DIGEST:?Set NEO4J_IMAGE_DIGEST to the reviewed sha256 manifest digest}
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH_FILE: /run/secrets/neo4j_auth
+      NEO4J_server_default__listen__address: 0.0.0.0
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-1G}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-2G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    secrets:
+      - neo4j_auth
+      - neo4j_password
+    networks:
+      - database
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p "$$(cat /run/secrets/neo4j_password)" 'RETURN 1' >/dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+
+volumes:
+  mysql_data:
+  neo4j_data:
+  neo4j_logs:
+
+networks:
+  database:
+    internal: true
+
+secrets:
+  mysql_app_password:
+    file: ${MYSQL_APP_PASSWORD_FILE:?Set MYSQL_APP_PASSWORD_FILE}
+  mysql_root_password:
+    file: ${MYSQL_ROOT_PASSWORD_FILE:?Set MYSQL_ROOT_PASSWORD_FILE}
+  neo4j_auth:
+    file: ${NEO4J_AUTH_SECRET_FILE:?Set NEO4J_AUTH_SECRET_FILE}
+  neo4j_password:
+    file: ${NEO4J_PASSWORD_SECRET_FILE:?Set NEO4J_PASSWORD_SECRET_FILE}
+  mathweaver_data_key:
+    file: ${MATHWEAVER_DATA_KEY_SECRET_FILE:?Set MATHWEAVER_DATA_KEY_SECRET_FILE}

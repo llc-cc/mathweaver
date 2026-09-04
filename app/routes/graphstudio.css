@@ -73,7 +73,7 @@
   --gs-topbar-gap: 8px;
   --gs-workspace-reserve: 264px;
   position: relative;
-  flex-shrink: 0; height: 52px; display: flex; align-items: center; justify-content: space-between; gap: var(--gs-topbar-gap);
+  flex-shrink: 0; height: 52px; display: flex; align-items: center; justify-content: flex-start; gap: var(--gs-topbar-gap);
   padding: 0 14px 0 var(--gs-workspace-reserve); background: var(--surface); border-bottom: 1px solid var(--line); z-index: 30;
   overflow: visible; white-space: nowrap;
 }
@@ -85,8 +85,8 @@
 .gs-stats { font-size: 11px; color: var(--muted); white-space: nowrap;
   background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-pill); padding: 3px 9px;
   font-variant-numeric: tabular-nums; }
-.gs-topbar-spacer { display: none; }
-.gs-toolbar-secondary, .gs-toolbar-actions { display: contents; }
+.gs-topbar-spacer { display: block; min-width: 0; flex: 1 1 auto; }
+.gs-toolbar-secondary, .gs-toolbar-actions { display: flex; align-items: center; gap: var(--gs-topbar-gap); flex: 0 0 auto; }
 
 /* segmented control (layout / experience toggles) */
 .gs-seg { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; padding: 3px; background: var(--surface-2);
@@ -604,3 +604,19 @@
 .gs-direct-add-question { justify-self: start; }
 .gs-root[data-theme="dark"] .gs-direct-question-editor-card { background: #282522; }
 @media (max-width: 720px) { .gs-direct-question-fields { grid-template-columns: 1fr; } .gs-direct-question-score { max-width: none; } }
+
+
+/* Learning path state cues: preserve GraphStudio's compact, tool-oriented panel. */
+.gs-learning-step.adventure-locked { border-style: dashed; border-color: color-mix(in srgb, var(--muted) 55%, var(--line)); background: color-mix(in srgb, var(--surface-2) 60%, var(--surface)); }
+.gs-learning-step.adventure-locked .gs-learning-step-index { color: var(--muted); background: var(--surface-3); }
+.gs-learning-step.adventure-available { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.gs-learning-step.adventure-awaiting_review { border-color: color-mix(in srgb, var(--gold) 58%, var(--line)); background: color-mix(in srgb, var(--gold-2) 18%, var(--surface)); }
+.gs-learning-step.adventure-awaiting_review .gs-learning-step-index { color: var(--gold); background: var(--gold-2); }
+.gs-learning-step.adventure-draft { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.gs-learning-step.adventure-exempt { opacity: .72; }
+.gs-learning-lock-note { display: flex; align-items: flex-start; gap: 6px; margin: 0 10px 10px 52px; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface-2); font-size: 9.5px; line-height: 1.5; }
+.gs-learning-lock-note svg { flex: 0 0 auto; margin-top: 1px; color: var(--muted); }
+.gs-learning-step.adventure-mastered .gs-learning-step-index { background: var(--ok); }
+.gs-learning-step.adventure-needs_review .gs-learning-step-index { background: var(--gold); }
+.gs-root .edu-reward-feedback { --edu-bg: var(--bg); --edu-surface: var(--surface); --edu-ink: var(--ink); --edu-muted: var(--muted); --edu-line: var(--line); --edu-blue: var(--accent); --edu-blue-soft: var(--accent-2); --edu-green: var(--ok); }
+@media (max-width: 720px) { .gs-learning-lock-note { margin-left: 10px; } }

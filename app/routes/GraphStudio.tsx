@@ -11,6 +11,9 @@ import {
   LockKeyhole, Brain, ChevronDown, ChevronLeft, ChevronRight, ArrowUp, ArrowDown, Trash2, Save, RotateCcw, Send, ClipboardCheck,
 } from "lucide-react";
 import { MathText, SmartTitle } from "./math";
+import { EducationRewardFeedback } from "./EducationRewardFeedback";
+import { EducationUnsavedChangesDialog } from "~/components/EducationUnsavedChangesDialog";
+import { deriveLearningStepAdventureState, educationRewardKey, isRenderableEducationReward, type EducationRewardReceipt } from "./education-game";
 import type { LatexMacros } from "./math";
 import { parseMdBlocks } from "./markdown";
 import { HistoryPanel } from "./HistoryPanel";
@@ -109,6 +112,7 @@ interface GraphStudioProps {
   onLearningAssignmentChange?: Dispatch<SetStateAction<EducationAssignment | null>>;
   onLearningDirtyChange?: (dirty: boolean) => void;
   courseGraphMode?: boolean;
+  hideSourceTag?: boolean;
 }
 
 type PdfPeek = {
@@ -220,7 +224,7 @@ export default function GraphStudio({
   token, llmConfig, onLoadHistory, onResumeHistory, onNodeSelectionChange,
   onReset, onShowApiGuide, onExport, exporting, learningAssignment,
   onOpenEducation, onImportCourse, onSetLearningTarget, onLearningAssignmentChange, onLearningDirtyChange,
-  courseGraphMode,
+  courseGraphMode, hideSourceTag,
 }: GraphStudioProps) {
   const [settings, setSettings] = useState<StudioSettings>(() => loadStudioSettings());
   const theme = resolveTheme(settings.theme);
@@ -263,11 +267,21 @@ export default function GraphStudio({
   const [tipPos, setTipPos] = useState<{ left: number; top: number } | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [learningDirty, setLearningDirty] = useState(false);
+  const [leaveConfirmOpen, setLeaveConfirmOpen] = useState(false);
   const [learningDetailOpen, setLearningDetailOpen] = useState(false);
   const [assessmentNodeId, setAssessmentNodeId] = useState<number | null>(null);
   const [assessmentInitialFrame, setAssessmentInitialFrame] = useState<AssessmentFrame>({ left: 24, top: 24, width: 920, height: 720 });
   const assessmentOpenRef = useRef(false);
   const [studentGradeReport, setStudentGradeReport] = useState<EducationSubmission | null>(null);
+  const [learningReward, setLearningReward] = useState<EducationRewardReceipt | null>(null);
+  const shownRewardKeysRef = useRef(new Set<string>());
+  const showLearningReward = useCallback((reward: EducationRewardReceipt | null | undefined) => {
+    if (!isRenderableEducationReward(reward)) { setLearningReward(null); return; }
+    const key = educationRewardKey(reward);
+    if (shownRewardKeysRef.current.has(key)) return;
+    shownRewardKeysRef.current.add(key);
+    setLearningReward(reward);
+  }, []);
   const hasLearningAssignment = Boolean(learningAssignment);
   const latexMacros = result.latex_macros;
   const [studentContextStates, setStudentContextStates] = useState<StudentNodeContextState[]>([]);
@@ -294,11 +308,18 @@ export default function GraphStudio({
     [studentContextStates],
   );
 
-  const closeEducation = useCallback(() => {
-    if (learningDirty && !window.confirm("当前作业有未保存修改，确定离开吗？")) return;
+  const completeEducationLeave = useCallback(() => {
+    setLeaveConfirmOpen(false);
     setLearningDirty(false);
     onOpenEducation?.();
-  }, [learningDirty, onOpenEducation]);
+  }, [onOpenEducation]);
+  const closeEducation = useCallback(() => {
+    if (learningDirty) {
+      setLeaveConfirmOpen(true);
+      return;
+    }
+    completeEducationLeave();
+  }, [completeEducationLeave, learningDirty]);
   useEffect(() => {
     onNodeSelectionChange?.(selectedId !== null);
     return () => onNodeSelectionChange?.(false);
@@ -1035,7 +1056,7 @@ export default function GraphStudio({
     });
   }, [learningAssignment, onLearningAssignmentChange]);
 
-  const completeLearningAssessment = useCallback((nodeId: number, path: EducationAssignment["path"]) => {
+  const completeLearningAssessment = useCallback((nodeId: number, path: EducationAssignment["path"], reward?: EducationRewardReceipt | null) => {
     if (!learningAssignment) return;
     onLearningAssignmentChange?.({
       ...learningAssignment,
@@ -1044,8 +1065,9 @@ export default function GraphStudio({
         assessment.nodeId === nodeId ? { ...assessment, attemptStatus: "completed" } : assessment
       )),
     });
+    showLearningReward(reward);
     setAssessmentNodeId(null);
-  }, [learningAssignment, onLearningAssignmentChange]);
+  }, [learningAssignment, onLearningAssignmentChange, showLearningReward]);
 
   const returnToLearningPath = useCallback(() => {
     setLearningDetailOpen(false);
@@ -1055,6 +1077,7 @@ export default function GraphStudio({
   useEffect(() => {
     setLearningDetailOpen(false);
     setAssessmentNodeId(null);
+    setLearningReward(null);
   }, [learningAssignment?.id]);
 
   useEffect(() => {
@@ -1167,7 +1190,7 @@ export default function GraphStudio({
         <div className="gs-brand">
           <img className="gs-brand-mark" src="/mathweaver-icon.png" alt="" aria-hidden="true" />
           <span className="gs-title">{filename || "知识图谱"}</span>
-          <span className="gs-source-tag">{resultSourceMode === "generate" ? "文档生成" : "文件导入"}</span>
+          {!hideSourceTag && <span className="gs-source-tag">{resultSourceMode === "generate" ? "文档生成" : "文件导入"}</span>}
         </div>
         <span className="gs-stats">{nodes.length} 节点 · {edges.length} 关系</span>
 
@@ -1230,13 +1253,13 @@ export default function GraphStudio({
         </div>
         <div className="gs-toolbar-actions">
           {learningAssignment && onOpenEducation && !courseGraphMode && (
-            <button className="gs-btn gs-btn-ghost gs-action-button gs-learning-action" onClick={closeEducation} title="学习空间">
-              <GraduationCap size={16} /><span className="gs-action-label">学习空间</span>
+            <button className="gs-btn gs-btn-ghost gs-action-button gs-learning-action" onClick={closeEducation} title="返回学习空间">
+              <GraduationCap size={16} /><span className="gs-action-label">返回学习空间</span>
             </button>
           )}
           {courseGraphMode && onOpenEducation && (
-            <button className="gs-btn gs-btn-ghost gs-action-button gs-learning-action" onClick={closeEducation} title="学习空间">
-              <GraduationCap size={16} /><span className="gs-action-label">学习空间</span>
+            <button className="gs-btn gs-btn-ghost gs-action-button gs-learning-action" onClick={closeEducation} title="返回学习空间">
+              <GraduationCap size={16} /><span className="gs-action-label">返回学习空间</span>
             </button>
           )}
           {!learningAssignment && onImportCourse && !courseGraphMode && (
@@ -1485,6 +1508,7 @@ export default function GraphStudio({
                   onShowGradeReport={setStudentGradeReport}
                   onChange={onLearningAssignmentChange}
                   onDirtyChange={setLearningDirty}
+                  onReward={showLearningReward}
                 />
               </div>
             </div>
@@ -1583,8 +1607,21 @@ export default function GraphStudio({
           popupZIndex={activePopup === "assessment" ? 62 : 61}
           onActivate={() => setActivePopup("assessment")}
           onAttemptStarted={(status) => updateAssessmentAttemptStatus(assessmentNodeId, status)}
-          onComplete={(path) => completeLearningAssessment(assessmentNodeId, path)}
+          onComplete={(path, reward) => completeLearningAssessment(assessmentNodeId, path, reward)}
           onClose={() => setAssessmentNodeId(null)}
+        />,
+        rootRef.current ?? document.body,
+      )}
+
+      {learningReward && createPortal(
+        <EducationRewardFeedback
+          reward={learningReward}
+          nextAction={learningAssignment ? { label: "继续学习", onClick: () => {
+            setLearningReward(null);
+            const nextStep = learningAssignment.path.steps.find(step => step.state !== "mastered");
+            if (nextStep) focusOnNode(nextStep.nodeId);
+          } } : undefined}
+          onClose={() => setLearningReward(null)}
         />,
         rootRef.current ?? document.body,
       )}
@@ -1593,6 +1630,13 @@ export default function GraphStudio({
         <StudentGradeReportDialog submission={studentGradeReport} macros={latexMacros} onClose={() => setStudentGradeReport(null)} />,
         rootRef.current ?? document.body,
       )}
+
+      <EducationUnsavedChangesDialog
+        open={leaveConfirmOpen}
+        theme={theme}
+        onCancel={() => setLeaveConfirmOpen(false)}
+        onConfirm={completeEducationLeave}
+      />
 
       {/* Settings popover */}
       {showSettings && (
@@ -1712,7 +1756,7 @@ function AssessmentQuestionScoringEditor({ token, assignmentId, nodeId, question
   </div>;
 }
 
-function LearningPathPanel({ assignment, nodeById, activeNodeId, token, macros, onFocus, onOpenSource, onOpenDetail, onStartAssessment, onShowGradeReport, onChange, onDirtyChange }: {
+function LearningPathPanel({ assignment, nodeById, activeNodeId, token, macros, onFocus, onOpenSource, onOpenDetail, onStartAssessment, onShowGradeReport, onChange, onDirtyChange, onReward }: {
   assignment: EducationAssignment;
   nodeById: Map<number, GraphNode>;
   activeNodeId: number | null;
@@ -1725,6 +1769,7 @@ function LearningPathPanel({ assignment, nodeById, activeNodeId, token, macros, 
   onShowGradeReport: (submission: EducationSubmission) => void;
   onChange?: Dispatch<SetStateAction<EducationAssignment | null>>;
   onDirtyChange?: (dirty: boolean) => void;
+  onReward?: (reward: EducationRewardReceipt | null) => void;
 }) {
   const [expandedWhy, setExpandedWhy] = useState<Set<number>>(new Set());
   const [progressBusyNode, setProgressBusyNode] = useState<number | null>(null);
@@ -1895,8 +1940,9 @@ function LearningPathPanel({ assignment, nodeById, activeNodeId, token, macros, 
     setSubmissionBusy("submit");
     setSubmissionError("");
     try {
-      const submission = await submitEducationAssignment(token, assignment.id);
-      onChange?.(current => current && current.id === assignment.id ? { ...current, submission } : current);
+      const result = await submitEducationAssignment(token, assignment.id);
+      onChange?.(current => current && current.id === assignment.id ? { ...current, submission: result.submission } : current);
+      onReward?.(result.reward ?? null);
     } catch (cause) {
       setSubmissionError(educationErrorMessage(cause));
     } finally {
@@ -2051,6 +2097,9 @@ function LearningPathPanel({ assignment, nodeById, activeNodeId, token, macros, 
           const node = nodeById.get(step.nodeId);
           const title = node?.title_zh || node?.title_en || node?.label || `节点 ${step.nodeId}`;
           const assessment = assignment.assessments.find(item => item.nodeId === step.nodeId);
+          const adventureStep = assignment.role === "student" ? deriveLearningStepAdventureState(assignment, step) : null;
+          const locked = adventureStep?.state === "locked";
+          const blockedTitle = adventureStep?.blockedBy ? (nodeById.get(adventureStep.blockedBy.nodeId)?.title_zh || nodeById.get(adventureStep.blockedBy.nodeId)?.title_en || `节点 ${adventureStep.blockedBy.nodeId}`) : "前置节点";
           const assessmentOperation = assessmentOperationForNode(assessmentOperations, step.nodeId);
           const assessmentOperationBusy = Boolean(assessmentOperation);
           const assessmentOperationQueued = assessmentOperation?.status === "queued";
@@ -2127,9 +2176,9 @@ function LearningPathPanel({ assignment, nodeById, activeNodeId, token, macros, 
             );
           }
           return (
-            <article key={step.nodeId} className={`gs-learning-step ${step.state} ${step.role === "target" ? "target" : ""} ${activeNodeId === step.nodeId ? "active" : ""} ${collapsed ? "collapsed" : ""}`}>
+            <article key={step.nodeId} className={`gs-learning-step ${step.state} ${adventureStep ? `adventure-${adventureStep.state}` : ""} ${step.role === "target" ? "target" : ""} ${activeNodeId === step.nodeId ? "active" : ""} ${collapsed ? "collapsed" : ""}`}>
               <button className="gs-learning-step-main" onClick={() => onFocus(step.nodeId)}>
-                <span className="gs-learning-step-index">{step.state === "mastered" ? <CheckCircle2 size={17} /> : step.state === "needs_review" ? <AlertTriangle size={16} /> : <span>{step.order}</span>}</span>
+                <span className="gs-learning-step-index">{adventureStep?.state === "locked" ? <LockKeyhole size={16} /> : adventureStep?.state === "awaiting_review" ? <RotateCcw size={16} /> : step.state === "mastered" ? <CheckCircle2 size={17} /> : step.state === "needs_review" ? <AlertTriangle size={16} /> : <span>{step.order}</span>}</span>
                 <span className="gs-learning-step-copy"><strong><SmartTitle text={title} macros={macros} /></strong><small>{step.role === "target" ? "最终目标" : step.role === "remedial" ? "补弱节点" : step.required ? "必修前置" : "建议前置"}</small></span>
                 {step.required && <LockKeyhole size={12} className="gs-learning-lock" />}
                 {collapsed && <ChevronDown size={14} />}
@@ -2138,10 +2187,11 @@ function LearningPathPanel({ assignment, nodeById, activeNodeId, token, macros, 
                 <button onClick={() => assignment.role === "student" ? onOpenDetail(step.nodeId) : onOpenSource(step.nodeId)}>
                   <BookOpen size={12} />{assignment.role === "student" ? "学习" : "查看原文"}
                 </button>
-                 {assignment.role === "student" && (assessment?.status === "exempt" ? <span className="gs-learning-node-complete"><CheckCircle2 size={12} />本节点免考</span> : assessment?.attemptStatus === "completed" && assignment.submission ? <span className="gs-learning-node-complete"><CheckCircle2 size={12} />已完成本节点</span> : <button onClick={() => onStartAssessment(step.nodeId)} disabled={Boolean(assignment.submission) || progressBusyNode !== null || !assessment || assessment.status === "pending" || assessment.status === "failed"}>{<><CheckCircle2 size={12} />{!assessment ? "考核暂不可用" : assessment.attemptStatus === "completed" ? "修改作答" : assessment.attemptStatus === "draft" ? "继续作答" : "开始作答"}</>}</button>)}
+                 {assignment.role === "student" && (assessment?.status === "exempt" ? <span className="gs-learning-node-complete"><CheckCircle2 size={12} />本节点免考</span> : assessment?.attemptStatus === "completed" && assignment.submission ? <span className="gs-learning-node-complete"><CheckCircle2 size={12} />已完成本节点</span> : <button onClick={() => onStartAssessment(step.nodeId)} disabled={Boolean(assignment.submission) || progressBusyNode !== null || locked || !assessment || assessment.status === "pending" || assessment.status === "failed"}>{<><CheckCircle2 size={12} />{!assessment ? "考核暂不可用" : assessment.attemptStatus === "completed" ? "修改作答" : assessment.attemptStatus === "draft" ? "继续作答" : "开始作答"}</>}</button>)}
                  <button onClick={() => setExpandedWhy(current => { const next = new Set(current); next.has(step.nodeId) ? next.delete(step.nodeId) : next.add(step.nodeId); return next; })}><CircleHelp size={12} />为什么需要它</button>
                </div>}
                {progressErrorNode === step.nodeId && <div className="gs-learning-inline-error">{progressError || "保存失败，请重试"}</div>}
+              {locked && <div className="gs-learning-lock-note"><LockKeyhole size={13} /><span>完成“{blockedTitle}”考核后解锁正式考核。你仍可以先查看学习资料。</span></div>}
               {whyOpen && <div className="gs-learning-rationale">{step.rationale || "该节点位于目标节点的真实前置依赖子图中。"}</div>}
             </article>
           );
@@ -2226,7 +2276,7 @@ function AssessmentDialog({ assignment, node, assessment, token, macros, initial
   popupZIndex: number;
   onActivate: () => void;
   onAttemptStarted: (status: "draft" | "completed") => void;
-  onComplete: (path: EducationAssignment["path"]) => void;
+  onComplete: (path: EducationAssignment["path"], reward?: EducationRewardReceipt | null) => void;
   onClose: () => void;
 }) {
   const [position, setPosition] = useState({ left: initialFrame.left, top: initialFrame.top });
@@ -2444,7 +2494,7 @@ function AssessmentDialog({ assignment, node, assessment, token, macros, initial
       const result = await completeEducationAssessmentAttempt(token, attempt.id, attempt.answers);
       dirtyRef.current = false;
       setAttempt(result.attempt);
-      onComplete(result.path);
+      onComplete(result.path, result.reward ?? null);
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setCompleting(false); }
   };

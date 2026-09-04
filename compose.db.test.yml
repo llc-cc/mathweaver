@@ -1,0 +1,60 @@
+name: mathweaver-db-test
+
+services:
+  mysql-test:
+    image: mysql:8.4.11
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: mathweaver_test
+      MYSQL_USER: mathweaver
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env.db.local}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env.db.local}
+      TZ: UTC
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+    ports:
+      - 127.0.0.1:3307:3306
+    volumes:
+      - mysql_test_data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mysqladmin ping -h 127.0.0.1 -uroot --password="$$MYSQL_ROOT_PASSWORD" --silent
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  neo4j-test:
+    image: neo4j:2026.07.1-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env.db.local}
+      MATHWEAVER_NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env.db.local}
+      NEO4J_server_default__listen__address: 0.0.0.0
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    ports:
+      - 127.0.0.1:17474:7474
+      - 127.0.0.1:17687:7687
+    volumes:
+      - neo4j_test_data:/data
+      - neo4j_test_logs:/logs
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p "$$MATHWEAVER_NEO4J_PASSWORD" 'RETURN 1' >/dev/null 2>&1
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  mysql_test_data:
+  neo4j_test_data:
+  neo4j_test_logs:

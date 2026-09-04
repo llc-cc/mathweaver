@@ -45,6 +45,7 @@ import {
 import { loadStudioSettings, resolveTheme } from "./studio-graph";
 import { ProofWorkspace } from "./ProofWorkspace";
 import { DirectAssignmentWorkspace, type DirectAssignmentWorkspaceMode } from "./DirectAssignmentWorkspace";
+import { EducationUnsavedChangesDialog } from "~/components/EducationUnsavedChangesDialog";
 import { EducationAssignmentStatistics } from "./EducationAssignmentStatistics";
 import { EducationClassStatistics } from "./EducationClassStatistics";
 import { MatrixFlowText } from "./matrix-flow/MatrixFlowViewer";
@@ -2240,7 +2241,7 @@ function ResultScreen({ workspaceMode, result, filename, jobId, sourceMarkdown, 
 
 // ── Studio Wrapper (new experience) ───────────────────────────────────────────
 // Thin shell that owns export state and renders the redesigned GraphStudio.
-function StudioWrapper({ workspaceMode, result, filename, jobId, sourceMarkdown, nodeLanguage, token, llmConfig, onLoadHistory, onResumeHistory, onNodeSelectionChange, onReset, onShowApiGuide, learningAssignment, onOpenEducation, onImportCourse, onSetLearningTarget, onLearningAssignmentChange, onLearningDirtyChange, courseGraphMode }: {
+function StudioWrapper({ workspaceMode, result, filename, jobId, sourceMarkdown, nodeLanguage, token, llmConfig, onLoadHistory, onResumeHistory, onNodeSelectionChange, onReset, onShowApiGuide, learningAssignment, onOpenEducation, onImportCourse, onSetLearningTarget, onLearningAssignmentChange, onLearningDirtyChange, courseGraphMode, hideSourceTag }: {
   workspaceMode: WorkspaceMode; result: GraphResult; filename: string; jobId: string;
   sourceMarkdown?: string; nodeLanguage: NodeLanguage;
   token?: string; llmConfig?: LLMConfig; onLoadHistory?: (result: GraphResult, filename: string, id: string) => void;
@@ -2255,6 +2256,7 @@ function StudioWrapper({ workspaceMode, result, filename, jobId, sourceMarkdown,
   onLearningAssignmentChange?: React.Dispatch<React.SetStateAction<EducationAssignment | null>>;
   onLearningDirtyChange?: (dirty: boolean) => void;
   courseGraphMode?: boolean;
+  hideSourceTag?: boolean;
 }) {
   const [exporting, setExporting] = useState(false);
   const handleExport = async (format: GraphExportFormat) => {
@@ -2319,6 +2321,7 @@ function StudioWrapper({ workspaceMode, result, filename, jobId, sourceMarkdown,
       onLearningAssignmentChange={onLearningAssignmentChange}
       onLearningDirtyChange={onLearningDirtyChange}
       courseGraphMode={courseGraphMode}
+      hideSourceTag={hideSourceTag}
       onExport={handleExport} exporting={exporting}
     />
   );
@@ -2908,6 +2911,8 @@ export default function Home() {
   const [educationAssignment, setEducationAssignment] = useState<EducationAssignment | null>(null);
   const [educationCourseGraph, setEducationCourseGraph] = useState<EducationSnapshot | null>(null);
   const [educationDraftDirty, setEducationDraftDirty] = useState(false);
+  const [educationLeaveConfirmOpen, setEducationLeaveConfirmOpen] = useState(false);
+  const educationLeaveActionRef = useRef<(() => void) | null>(null);
   const [educationLoading, setEducationLoading] = useState(false);
   const [educationError, setEducationError] = useState("");
   const [educationProfileClassId, setEducationProfileClassId] = useState<string | null>(null);
@@ -3035,10 +3040,28 @@ export default function Home() {
     setEducationDraftDirty(false);
     setEducationLocation(null);
   }, [setEducationLocation]);
+  const requestEducationLeave = useCallback((action: () => void) => {
+    if (!educationDraftDirty) {
+      action();
+      return;
+    }
+    educationLeaveActionRef.current = action;
+    setEducationLeaveConfirmOpen(true);
+  }, [educationDraftDirty]);
+  const cancelEducationLeave = useCallback(() => {
+    educationLeaveActionRef.current = null;
+    setEducationLeaveConfirmOpen(false);
+  }, []);
+  const confirmEducationLeave = useCallback(() => {
+    const action = educationLeaveActionRef.current;
+    educationLeaveActionRef.current = null;
+    setEducationLeaveConfirmOpen(false);
+    setEducationDraftDirty(false);
+    action?.();
+  }, []);
   const leaveEducationWorkspace = useCallback((classId?: string | null) => {
-    if (educationDraftDirty && !window.confirm("当前作业有未保存修改，确定离开吗？")) return;
-    returnToEducationHub(classId);
-  }, [educationDraftDirty, returnToEducationHub]);
+    requestEducationLeave(() => returnToEducationHub(classId));
+  }, [requestEducationLeave, returnToEducationHub]);
   const openEducation = useCallback((target?: GraphNode | null) => {
     if (target) setEducationTarget(target);
     setEducationTargetCourseGraphId(null);
@@ -3385,13 +3408,14 @@ export default function Home() {
       openEducation();
       return;
     }
-    if (educationDraftDirty && !window.confirm("当前作业有未保存修改，确定离开吗？")) return;
-    setEducationDraftDirty(false);
-    closeEducation();
-    activeWorkspaceModeRef.current = "generate";
-    setWorkspaceMode("generate");
-    applySnapshot(workspaceStates.current.generate);
-  }, [applySnapshot, auth?.educationRole, closeEducation, educationDraftDirty, educationWorkspaceMode, openEducation]);
+    requestEducationLeave(() => {
+      setEducationDraftDirty(false);
+      closeEducation();
+      activeWorkspaceModeRef.current = "generate";
+      setWorkspaceMode("generate");
+      applySnapshot(workspaceStates.current.generate);
+    });
+  }, [applySnapshot, auth?.educationRole, closeEducation, educationWorkspaceMode, openEducation, requestEducationLeave]);
 
   // Restore the most recent result for both modes.
   useEffect(() => {
@@ -3653,6 +3677,12 @@ export default function Home() {
         onChange={switchEducationMode}
         isGenerating={isGenerating}
       />}
+      <EducationUnsavedChangesDialog
+        open={educationLeaveConfirmOpen}
+        theme={resolveTheme(loadStudioSettings().theme)}
+        onCancel={cancelEducationLeave}
+        onConfirm={confirmEducationLeave}
+      />
       {showApiGuide && (
         <ApiSetupGuide
           config={llm}
@@ -3808,6 +3838,7 @@ export default function Home() {
           onOpenEducation={auth?.educationRole === "teacher" ? undefined : () => openEducation()}
           onImportCourse={auth?.educationRole === "teacher" ? () => openCourseImport(null) : undefined}
           onSetLearningTarget={auth?.educationRole === "teacher" ? (node) => openCourseImport(node) : undefined}
+          hideSourceTag={auth?.educationRole === "student"}
         />
       )}
       {!educationRequested && view === "result" && result && experience === "classic" && (
@@ -3946,6 +3977,7 @@ export default function Home() {
             onSetLearningTarget={educationAssignment.role === "teacher" && educationAssignment.snapshot ? (node) => openEducationTargetFromCourseGraph(educationAssignment.snapshot!.id, educationAssignment.classId, node) : undefined}
             onLearningAssignmentChange={setEducationAssignment}
             onLearningDirtyChange={setEducationDraftDirty}
+            hideSourceTag={educationAssignment.role === "student"}
           />
         );
       })()}
@@ -3964,6 +3996,7 @@ export default function Home() {
           onOpenEducation={() => returnToEducationHub(educationCourseGraph.classId)}
           onSetLearningTarget={auth.educationRole === "teacher" ? (node) => openEducationTargetFromCourseGraph(educationCourseGraph.id, educationCourseGraph.classId, node) : undefined}
           courseGraphMode
+          hideSourceTag={auth.educationRole === "student"}
         />
       )}
     </>

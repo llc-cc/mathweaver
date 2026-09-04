@@ -24,9 +24,19 @@ FORBIDDEN_BACKEND_PATHS = {
     "backend/checkpoint",
 }
 REQUIRED_MODULES = {
+    "cryptography",
+    "dotenv",
+    "neo4j",
     "ocr_runtime",
+    "pymysql",
     "python_multipart",
     "pypdf",
+    "sqlalchemy",
+    "storage.database",
+    "tzdata",
+}
+REQUIRED_DATA_PREFIXES = {
+    "tzdata/zoneinfo/",
 }
 
 
@@ -54,6 +64,10 @@ def main() -> int:
         module for module in REQUIRED_MODULES
         if module not in entries and not any(entry.startswith(f"{module}.") for entry in entries)
     )
+    missing_data = sorted(
+        prefix for prefix in REQUIRED_DATA_PREFIXES
+        if not any(entry.startswith(prefix) for entry in entries)
+    )
     backend_files = {entry for entry in entries if entry.startswith("backend/")}
     unexpected = sorted(backend_files - ALLOWED_BACKEND_FILES)
     missing = sorted(ALLOWED_BACKEND_FILES - backend_files)
@@ -62,9 +76,11 @@ def main() -> int:
         for entry in entries
         if any(entry == path or entry.startswith(f"{path}/") for path in FORBIDDEN_BACKEND_PATHS)
     )
-    if missing_modules or unexpected or missing or forbidden:
+    if missing_modules or missing_data or unexpected or missing or forbidden:
         if missing_modules:
             print("Missing required Python modules:", ", ".join(missing_modules), file=sys.stderr)
+        if missing_data:
+            print("Missing required runtime data:", ", ".join(missing_data), file=sys.stderr)
         if unexpected:
             print("Unexpected backend data:", ", ".join(unexpected), file=sys.stderr)
         if missing:

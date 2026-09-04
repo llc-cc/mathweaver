@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = Path.cwd()
 BACKEND = ROOT / "backend"
@@ -38,9 +38,17 @@ for source, destination in STATIC_RESOURCES:
     if not source.exists():
         raise FileNotFoundError(f"Required static resource not found: {source}")
     datas.append((str(source), destination))
+datas.extend(collect_data_files("tzdata"))
 
-hiddenimports = ["ocr_manifest"]
-for package in ["pipeline", "JoinAgent", "tools", "integrations", "python_multipart", "pypdf"]:
+hiddenimports = [
+    "ocr_manifest",
+    "cryptography.hazmat.primitives.ciphers.aead",
+    "dotenv",
+    "neo4j",
+    "pymysql",
+    "sqlalchemy.dialects.mysql.pymysql",
+]
+for package in ["pipeline", "JoinAgent", "tools", "integrations", "storage", "python_multipart", "pypdf", "tzdata"]:
     hiddenimports.extend(collect_submodules(package))
 
 a = Analysis(

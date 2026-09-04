@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   AlertTriangle, ArrowLeft, BookOpen, Brain, Check, CheckCircle2, ChevronLeft, ChevronRight, ClipboardList,
-  Copy, FileJson, FileText, GitBranch, GraduationCap, Loader2, Pencil, Plus, Route, Save, School, Send, Settings, Trash2, Upload, Users, X, BarChart3,
+  ArrowDown, ArrowUp, Copy, FileJson, FileText, Gem, GitBranch, GraduationCap, GripVertical, Loader2, Pencil, Plus, Route, Save, School, Send, Settings, ShoppingBag, Trash2, Upload, Users, X, BarChart3,
 } from "lucide-react";
 import { apiUrl } from "~/api";
 import type { EducationRole, GraphNode, GraphResult } from "./home";
@@ -11,7 +11,10 @@ import { loadStudioSettings, resolveTheme } from "./studio-graph";
 import "./education.css";
 import type { DirectImportOrigin } from "~/components/DirectQuestionImport";
 import type { DirectQuestionDraft } from "../education-direct";
-
+import { EducationAdventureMap } from "./EducationAdventureMap";
+import { EducationGameHeaderTools } from "./EducationGameHeaderTools";
+import type { EducationGameSettings, EducationGameSummary, EducationRewardReceipt, EducationShopItem, EducationStudentExperience } from "./education-game";
+import { parseEducationGameSettings, parseEducationGameSummary } from "./education-game";
 
 export type LearningStepState = "not_started" | "in_progress" | "mastered" | "needs_review";
 
@@ -182,6 +185,7 @@ export interface EducationSnapshotSummary {
   nodeCount: number;
   edgeCount: number;
   boundAssignmentCount?: number;
+  courseOrder?: number;
   createdAt: string;
 }
 
@@ -218,6 +222,13 @@ export interface EducationAssignment {
   submission?: EducationSubmissionSummary | null;
   snapshot?: EducationSnapshot;
   source?: { filename: string; mimeType: string; origin: string; hasOriginalFile: boolean; url?: string | null };
+  growthChallenge?: {
+    isGrowthChallenge: boolean;
+    locked: boolean;
+    requiredLevel?: number | null;
+    requiredStageKey?: string | null;
+    requiredStageMilestone?: number | null;
+  };
 }
 
 export function unresolvedAssessmentNodeIds(assignment: EducationAssignment): number[] {
@@ -351,6 +362,15 @@ export interface GradingOverview {
   canPublish: boolean;
   pendingUserIds: number[];
   students: GradingStudent[];
+}
+
+export interface BulkEducationEvaluationResult {
+  assignmentId: string;
+  requestedCount: number;
+  evaluatedCount: number;
+  failedCount: number;
+  evaluatedSubmissionIds: string[];
+  failedSubmissionIds: string[];
 }
 
 export interface EducationAssignmentStatistics {
@@ -493,8 +513,24 @@ interface ImportedGraphResponse {
 }
 
 export type PathOrderWarning = { from: number; to: number; message: string };
-type ClassManagementDialog = "rename" | "members" | "dissolve" | null;
+type ClassManagementDialog = "rename" | "members" | "gems" | "shop" | "dissolve" | "experience" | null;
 type AssignmentCreationSource = "snapshot" | null;
+
+interface EducationTeacherGemAward {
+  amount: number;
+  studentName: string;
+  reason: string;
+  createdAt: string;
+}
+
+interface EducationTeacherRedemption {
+  id: string;
+  item: { title?: string };
+  gemCost: number;
+  status: "pending" | "fulfilled" | "cancelled";
+  studentName: string;
+  createdAt: string;
+}
 
 async function educationRequest<T>(token: string, path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(apiUrl(path), {
@@ -522,6 +558,63 @@ async function educationRequest<T>(token: string, path: string, init?: RequestIn
   return body as T;
 }
 
+export async function loadEducationGameSummary(token: string, classId: string): Promise<EducationGameSummary | null> {
+  try {
+    const body = await educationRequest<unknown>(token, `/api/v2/edu/classes/${encodeURIComponent(classId)}/game-summary`);
+    return parseEducationGameSummary(body);
+  } catch (cause) {
+    const error = cause as { status?: number };
+    if (error.status === 404) return null;
+    throw cause;
+  }
+}
+
+export async function updateEducationGameSettings(
+  token: string,
+  classId: string,
+  settings: Partial<Pick<EducationGameSettings, "studentExperience" | "weeklyXpGoal">>,
+): Promise<EducationGameSettings> {
+  const body = await educationRequest<unknown>(token, `/api/v2/edu/classes/${encodeURIComponent(classId)}/game-settings`, {
+    method: "PATCH",
+    body: JSON.stringify(settings),
+  });
+  const parsed = parseEducationGameSettings(body);
+  if (!parsed) throw new Error("游戏设置响应格式无效");
+  return parsed;
+}
+
+export async function updateEducationCourseGraphOrder(
+  token: string,
+  classId: string,
+  graphIds: string[],
+  knownGraphIds: string[],
+): Promise<EducationSnapshotSummary[]> {
+  const body = await educationRequest<{ snapshots?: unknown }>(
+    token,
+    `/api/v2/edu/classes/${encodeURIComponent(classId)}/course-graph-order`,
+    { method: "PATCH", body: JSON.stringify({ graphIds, knownGraphIds }) },
+  );
+  if (!Array.isArray(body.snapshots)) throw new Error("课程图谱排序响应格式无效");
+  return body.snapshots as EducationSnapshotSummary[];
+}
+
+function courseGraphCreatedOrder(left: CourseGraphSummary, right: CourseGraphSummary) {
+  const leftTime = Date.parse(left.createdAt);
+  const rightTime = Date.parse(right.createdAt);
+  if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+  if (Number.isNaN(leftTime) !== Number.isNaN(rightTime)) return Number.isNaN(leftTime) ? 1 : -1;
+  return left.id.localeCompare(right.id);
+}
+
+function courseGraphOrder(left: CourseGraphSummary, right: CourseGraphSummary) {
+  const leftOrder = typeof left.courseOrder === "number" && Number.isInteger(left.courseOrder) && left.courseOrder >= 0 ? left.courseOrder : null;
+  const rightOrder = typeof right.courseOrder === "number" && Number.isInteger(right.courseOrder) && right.courseOrder >= 0 ? right.courseOrder : null;
+  if (leftOrder !== null && rightOrder !== null && leftOrder !== rightOrder) return leftOrder - rightOrder;
+  if (leftOrder !== null && rightOrder === null) return -1;
+  if (leftOrder === null && rightOrder !== null) return 1;
+  return courseGraphCreatedOrder(left, right);
+}
+
 export function groupCourseGraphs(snapshots: EducationSnapshotSummary[]): CourseGraphSummary[] {
   const groups = new Map<string, CourseGraphSummary>();
   snapshots.forEach(snapshot => {
@@ -541,11 +634,14 @@ export function groupCourseGraphs(snapshots: EducationSnapshotSummary[]): Course
       || (!Number.isNaN(snapshotTime) && snapshotTime < currentTime)
       || (snapshot.createdAt === current.createdAt && snapshot.id < current.id);
     const boundAssignmentCount = (current.boundAssignmentCount ?? 0) + (snapshot.boundAssignmentCount ?? 0);
+    const courseOrder = [current.courseOrder, snapshot.courseOrder]
+      .filter((value): value is number => typeof value === "number" && Number.isInteger(value) && value >= 0)
+      .sort((left, right) => left - right)[0];
     groups.set(key, snapshotIsEarlier
-      ? { ...snapshot, boundAssignmentCount, snapshotIds }
-      : { ...current, boundAssignmentCount, snapshotIds });
+      ? { ...snapshot, courseOrder, boundAssignmentCount, snapshotIds }
+      : { ...current, courseOrder, boundAssignmentCount, snapshotIds });
   });
-  return [...groups.values()];
+  return [...groups.values()].sort(courseGraphOrder);
 }
 
 function GraphImportFileField({
@@ -632,6 +728,8 @@ export function educationErrorMessage(cause: unknown) {
     case "direct question order must be unique": return "题目顺序不能重复。";
     case "direct question order must start at 1": return "题目顺序必须从 1 开始且连续。";
     case "direct question nodeId must be unique": return "题目节点标识不能重复。";
+    case "invalid_course_graph_order": return "课程图谱顺序无效，请刷新图谱列表后重试。";
+    case "course_graph_order_conflict": return "课程图谱列表已发生变化，请重新调整顺序。";
     case "direct assignments edit questions through direct-questions": return "直接作业题目请在题目编辑区保存。";
     case "assignment_incomplete": return "请先完成所有非免考节点的全部题目，再提交整份作业。";
     case "assignment_closed": return "该作业已关闭提交。";
@@ -640,6 +738,7 @@ export function educationErrorMessage(cause: unknown) {
     case "grading_score_invalid": return "教师分数必须在 0 到本题满分之间。";
     case "grading_incomplete": return "仍有题目尚未完成教师评分，暂时不能定稿或发布。";
     case "grading_finalized": return "该作业已定稿，不能再修改或重新评价。";
+    case "grading_no_submissions": return "暂无需要进行 AI 评价的学生提交。";
     case "grades_released": return "成绩已经发布。";
     case "education_ai_unconfigured": return "课程 AI 尚未配置，请联系教师或管理员。";
     case "education_ai_limit_reached": return "今天的课程 AI 使用次数已达上限。";
@@ -920,7 +1019,7 @@ export async function completeEducationAssessmentAttempt(
   attemptId: string,
   answers: Record<string, string>,
 ) {
-  return educationRequest<{ attempt: AssessmentAttempt; path: LearningPath }>(
+  return educationRequest<{ attempt: AssessmentAttempt; path: LearningPath; reward?: EducationRewardReceipt | null }>(
     token,
     `/api/v2/edu/assessment-attempts/${encodeURIComponent(attemptId)}/complete`,
     { method: "POST", body: JSON.stringify({ answers }) },
@@ -943,12 +1042,11 @@ export async function updateEducationAssessmentQuestion(
 }
 
 export async function submitEducationAssignment(token: string, assignmentId: string) {
-  const body = await educationRequest<{ submission: EducationSubmissionSummary }>(
+  return educationRequest<{ submission: EducationSubmissionSummary; reward?: EducationRewardReceipt | null }>(
     token,
     `/api/v2/edu/assignments/${encodeURIComponent(assignmentId)}/submissions`,
     { method: "POST" },
   );
-  return body.submission;
 }
 
 export async function loadEducationGradingOverview(token: string, assignmentId: string) {
@@ -1006,6 +1104,14 @@ export async function evaluateEducationSubmission(token: string, submissionId: s
     { method: "POST" },
   );
   return body.submission;
+}
+
+export async function evaluateAllEducationSubmissions(token: string, assignmentId: string) {
+  return educationRequest<BulkEducationEvaluationResult>(
+    token,
+    `/api/v2/edu/assignments/${encodeURIComponent(assignmentId)}/submissions/evaluate`,
+    { method: "POST" },
+  );
 }
 
 export async function saveEducationSubmissionGrade(
@@ -1355,6 +1461,10 @@ export function EducationHub({
   const [selectedClassId, setSelectedClassId] = useState<string | null>(null);
   const [assignments, setAssignments] = useState<EducationAssignment[]>([]);
   const [courseGraphs, setCourseGraphs] = useState<CourseGraphSummary[]>([]);
+  const [gameSummary, setGameSummary] = useState<EducationGameSummary | null>(null);
+  const [gameSummaryLoading, setGameSummaryLoading] = useState(false);
+  const [gameSummaryError, setGameSummaryError] = useState("");
+  const [adventureDialogOpen, setAdventureDialogOpen] = useState(false);
   const [selectedSnapshotId, setSelectedSnapshotId] = useState(initialCourseGraphId || "");
   const [selectedSnapshot, setSelectedSnapshot] = useState<EducationSnapshot | null>(null);
   const [assignmentCreateOpen, setAssignmentCreateOpen] = useState(educationRole === "teacher" && Boolean(targetNode && initialCourseGraphId));
@@ -1394,14 +1504,29 @@ export function EducationHub({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [managementDialog, setManagementDialog] = useState<ClassManagementDialog>(null);
   const [settingsError, setSettingsError] = useState("");
+  const [gameExperienceDraft, setGameExperienceDraft] = useState<EducationStudentExperience>("classic");
+  const [weeklyXpGoalDraft, setWeeklyXpGoalDraft] = useState("60");
   const [members, setMembers] = useState<EducationClassMember[]>([]);
   const [membersLoading, setMembersLoading] = useState(false);
+  const [teacherGameManagementLoading, setTeacherGameManagementLoading] = useState(false);
+  const [teacherGemAwards, setTeacherGemAwards] = useState<EducationTeacherGemAward[]>([]);
+  const [teacherShopItems, setTeacherShopItems] = useState<EducationShopItem[]>([]);
+  const [teacherRedemptions, setTeacherRedemptions] = useState<EducationTeacherRedemption[]>([]);
+  const [gemRecipientId, setGemRecipientId] = useState("");
+  const [gemAmount, setGemAmount] = useState("20");
+  const [gemReason, setGemReason] = useState("");
+  const [shopTitle, setShopTitle] = useState("");
+  const [shopDescription, setShopDescription] = useState("");
+  const [shopGemPrice, setShopGemPrice] = useState("100");
+  const [shopStock, setShopStock] = useState("");
   const [success, setSuccess] = useState("");
   const initialNoticeTimeoutRef = useRef<number | null>(null);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [editingAssignment, setEditingAssignment] = useState<EducationAssignment | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const [editDueAt, setEditDueAt] = useState("");
+  const [editGrowthChallengeLevel, setEditGrowthChallengeLevel] = useState("");
+  const [editGrowthChallengeTouched, setEditGrowthChallengeTouched] = useState(false);
   const [editError, setEditError] = useState("");
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -1412,15 +1537,35 @@ export function EducationHub({
   const [importPhase, setImportPhase] = useState("");
   const [deletingCourseGraph, setDeletingCourseGraph] = useState<CourseGraphSummary | null>(null);
   const [deleteCourseGraphError, setDeleteCourseGraphError] = useState("");
+  const [courseGraphOrderOpen, setCourseGraphOrderOpen] = useState(false);
+  const [courseGraphOrderDraft, setCourseGraphOrderDraft] = useState<CourseGraphSummary[]>([]);
+  const [courseGraphOrderBase, setCourseGraphOrderBase] = useState<string[]>([]);
+  const [courseGraphOrderError, setCourseGraphOrderError] = useState("");
+  const [draggingCourseGraphId, setDraggingCourseGraphId] = useState<string | null>(null);
 
   const selectedClass = classes.find(item => item.id === selectedClassId) ?? null;
   const studentProfileRequired = educationRole === "student" && selectedClass?.profileComplete === false;
   const activeStudentCount = Math.max(0, (selectedClass?.memberCount ?? 1) - 1);
+  const isStudentClass = selectedClass?.role === "student";
+  const adventureModeResolving = Boolean(isStudentClass && selectedClass?.profileComplete !== false && gameSummaryLoading);
+  const showAdventureMap = Boolean(isStudentClass && selectedClass?.profileComplete !== false && gameSummary?.enabled && gameSummary.settings.studentExperience === "map");
   const courseGraphById = new Map(courseGraphs.flatMap(graph => graph.snapshotIds.map(snapshotId => [snapshotId, graph] as const)));
+  const loadCourseGraphSnapshot = useCallback((snapshotId: string) => loadEducationSnapshot(token, snapshotId), [token]);
+  const refreshEducationGameSummary = useCallback(async () => {
+    if (!selectedClassId) return;
+    const next = await loadEducationGameSummary(token, selectedClassId);
+    setGameSummary(next);
+  }, [selectedClassId, token]);
+  const runEducationGameAction = useCallback(async (path: string, init?: RequestInit) => {
+    if (!selectedClassId) throw new Error("未选择班级");
+    const result = await educationRequest<unknown>(token, `/api/v2/edu/classes/${encodeURIComponent(selectedClassId)}${path}`, init);
+    await refreshEducationGameSummary();
+    return result;
+  }, [refreshEducationGameSummary, selectedClassId, token]);
   const assignmentNodes = selectedSnapshot?.nodes ?? [];
   const educationModalOpen = Boolean(
     assignmentCreateOpen || studentContextSummaryLoading || studentContextSummary || studentContextSummaryError || gradingSubmission
-      || createOpen || settingsOpen || managementDialog || editingAssignment || deleteConfirm || importOpen || deletingCourseGraph,
+      || createOpen || settingsOpen || managementDialog || editingAssignment || deleteConfirm || importOpen || deletingCourseGraph || courseGraphOrderOpen || adventureDialogOpen,
   );
   const selectedAssignmentTarget = assignmentNodes.find(node => node.id === targetId) ?? null;
   const assignmentSourceLabel = selectedSnapshot?.filename || courseGraphById.get(selectedSnapshotId)?.filename || "正在加载课程图谱…";
@@ -1448,15 +1593,30 @@ export function EducationHub({
       setAssignments([]);
       setCourseGraphs([]);
       setSelectedSnapshotId("");
+      setGameSummary(null);
+      setGameSummaryError("");
+      setGameSummaryLoading(false);
       return;
     }
     if (educationRole === "student" && selectedClass?.profileComplete === false) {
       setAssignments([]);
       setCourseGraphs([]);
+      setGameSummary(null);
+      setGameSummaryError("");
+      setGameSummaryLoading(false);
       return;
     }
+    let cancelled = false;
     setError("");
     setCourseGraphsLoading(true);
+    setGameSummaryLoading(true);
+    setGameSummaryError("");
+    const gamePromise = loadEducationGameSummary(token, selectedClassId).catch(cause => {
+      const status = (cause as { status?: number }).status;
+      if (status === 401 || status === 403) throw cause;
+      if (!cancelled) setGameSummaryError(educationErrorMessage(cause));
+      return null;
+    });
     Promise.all([
       educationRequest<{ assignments: EducationAssignment[] }>(
         token,
@@ -1466,11 +1626,21 @@ export function EducationHub({
         token,
         `/api/v2/edu/classes/${encodeURIComponent(selectedClassId)}/snapshots`,
       ),
-    ]).then(([assignmentBody, snapshotBody]) => {
-      const groupedSnapshots = groupCourseGraphs(snapshotBody.snapshots);
+      gamePromise,
+    ]).then(([assignmentBody, snapshotBody, summary]) => {
+      if (cancelled) return;
       setAssignments(assignmentBody.assignments);
-      setCourseGraphs(groupedSnapshots);
-    }).catch(cause => setError(educationErrorMessage(cause))).finally(() => setCourseGraphsLoading(false));
+      setCourseGraphs(groupCourseGraphs(snapshotBody.snapshots));
+      setGameSummary(summary);
+    }).catch(cause => {
+      if (!cancelled) setError(educationErrorMessage(cause));
+    }).finally(() => {
+      if (!cancelled) {
+        setCourseGraphsLoading(false);
+        setGameSummaryLoading(false);
+      }
+    });
+    return () => { cancelled = true; };
   }, [educationRole, selectedClass?.profileComplete, selectedClassId, token]);
 
   useEffect(() => {
@@ -1537,16 +1707,36 @@ export function EducationHub({
   }, []);
 
   useEffect(() => {
-    if (!settingsOpen || managementDialog !== "members" || educationRole !== "teacher" || !selectedClass) return;
+    if (!settingsOpen || (managementDialog !== "members" && managementDialog !== "gems") || educationRole !== "teacher" || !selectedClass) return;
     setRenameTitle(selectedClass.title);
     setDissolveTitle("");
     setMembersLoading(true);
-    educationRequest<{ members: EducationClassMember[] }>(
+    const membersPromise = educationRequest<{ members: EducationClassMember[] }>(
       token,
       `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/members`,
-    ).then(body => setMembers(body.members))
+    ).then(body => {
+      setMembers(body.members);
+      setGemRecipientId(current => current || String(body.members.find(member => member.status === "active")?.userId || ""));
+    });
+    const awardsPromise = managementDialog === "gems"
+      ? educationRequest<{ awards: EducationTeacherGemAward[] }>(token, `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/gems/grants`).then(body => setTeacherGemAwards(body.awards))
+      : Promise.resolve();
+    Promise.all([membersPromise, awardsPromise])
       .catch(cause => setSettingsError(educationErrorMessage(cause)))
       .finally(() => setMembersLoading(false));
+  }, [settingsOpen, managementDialog, educationRole, selectedClass, token]);
+
+  useEffect(() => {
+    if (!settingsOpen || managementDialog !== "shop" || educationRole !== "teacher" || !selectedClass) return;
+    setTeacherGameManagementLoading(true);
+    Promise.all([
+      educationRequest<{ items: EducationShopItem[] }>(token, `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/shop?includeInactive=1`),
+      educationRequest<{ redemptions: EducationTeacherRedemption[] }>(token, `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/shop/redemptions/manage`),
+    ]).then(([shop, redemptions]) => {
+      setTeacherShopItems(shop.items);
+      setTeacherRedemptions(redemptions.redemptions);
+    }).catch(cause => setSettingsError(educationErrorMessage(cause)))
+      .finally(() => setTeacherGameManagementLoading(false));
   }, [settingsOpen, managementDialog, educationRole, selectedClass, token]);
 
   const openCreateClass = () => {
@@ -1564,6 +1754,8 @@ export function EducationHub({
     setStudentNumber(selectedClass?.studentNumber || "");
     setJoinStudentName(selectedClass?.studentName || "");
     setJoinStudentNumber(selectedClass?.studentNumber || "");
+    setGameExperienceDraft(gameSummary?.settings.studentExperience || "classic");
+    setWeeklyXpGoalDraft(String(gameSummary?.settings.weeklyXpGoal || 60));
     setManagementDialog(null);
     setSettingsOpen(true);
   };
@@ -1680,6 +1872,30 @@ export function EducationHub({
     finally { setBusy(""); }
   };
 
+  const saveEducationGameSettings = async () => {
+    if (!selectedClass || selectedClass.role !== "teacher" || !gameSummary) return;
+    const weeklyXpGoal = Number(weeklyXpGoalDraft);
+    if (!Number.isInteger(weeklyXpGoal) || weeklyXpGoal < 10 || weeklyXpGoal > 500) {
+      setSettingsError("每周目标 XP 必须是 10 至 500 的整数。");
+      return;
+    }
+    setBusy("game-settings"); setSettingsError("");
+    try {
+      const settings = await updateEducationGameSettings(token, selectedClass.id, {
+        studentExperience: gameExperienceDraft,
+        weeklyXpGoal,
+      });
+      setGameSummary(current => current ? { ...current, settings } : current);
+      setManagementDialog(null);
+      setSuccess("学生学习界面设置已更新");
+      window.setTimeout(() => setSuccess(""), 2400);
+    } catch (cause) {
+      setSettingsError(educationErrorMessage(cause));
+    } finally {
+      setBusy("");
+    }
+  };
+
   const renameClass = async () => {
     if (!selectedClass || !renameTitle.trim()) return;
     setBusy("rename"); setSettingsError("");
@@ -1727,6 +1943,77 @@ export function EducationHub({
     finally { setBusy(""); }
   };
 
+  const grantCourseGems = async () => {
+    if (!selectedClass) return;
+    const userId = Number(gemRecipientId);
+    const amount = Number(gemAmount);
+    if (!Number.isInteger(userId) || !Number.isInteger(amount) || amount < 1 || amount > 500 || !gemReason.trim()) {
+      setSettingsError("请选择有效学生，填写 1 至 500 的宝石数量和奖励原因。");
+      return;
+    }
+    setBusy("gem-grant"); setSettingsError("");
+    try {
+      await educationRequest(token, `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/gems/grants`, {
+        method: "POST",
+        body: JSON.stringify({ userId, amount, reason: gemReason.trim() }),
+      });
+      const awards = await educationRequest<{ awards: EducationTeacherGemAward[] }>(token, `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/gems/grants`);
+      setTeacherGemAwards(awards.awards);
+      setGemReason("");
+      setSuccess("宝石已发放；仅当前课程钱包和累计宝石榜会更新。");
+      window.setTimeout(() => setSuccess(""), 2400);
+    } catch (cause) { setSettingsError(educationErrorMessage(cause)); }
+    finally { setBusy(""); }
+  };
+
+  const createCourseShopItem = async () => {
+    if (!selectedClass) return;
+    const gemPrice = Number(shopGemPrice);
+    const stock = shopStock.trim() === "" ? null : Number(shopStock);
+    if (!shopTitle.trim() || !shopDescription.trim() || !Number.isInteger(gemPrice) || gemPrice < 1 || !Number.isInteger(stock ?? 0) || (stock ?? 0) < 0) {
+      setSettingsError("请填写奖励名称、说明、有效宝石价格和非负库存（留空为不限库存）。");
+      return;
+    }
+    setBusy("shop-create"); setSettingsError("");
+    try {
+      const body = await educationRequest<{ item: EducationShopItem }>(token, `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/shop/items`, {
+        method: "POST",
+        body: JSON.stringify({ title: shopTitle.trim(), description: shopDescription.trim(), gemPrice, stock, active: true }),
+      });
+      setTeacherShopItems(items => [...items, body.item]);
+      setShopTitle(""); setShopDescription(""); setShopGemPrice("100"); setShopStock("");
+      setSuccess("课程奖励已加入宝石小店。");
+      window.setTimeout(() => setSuccess(""), 2400);
+    } catch (cause) { setSettingsError(educationErrorMessage(cause)); }
+    finally { setBusy(""); }
+  };
+
+  const toggleCourseShopItem = async (item: EducationShopItem) => {
+    if (!selectedClass || item.kind !== "custom") return;
+    setBusy(`shop-toggle-${item.id}`); setSettingsError("");
+    try {
+      const body = await educationRequest<{ item: EducationShopItem }>(token, `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/shop/items/${encodeURIComponent(item.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: item.title, description: item.description, gemPrice: item.gemPrice, stock: item.stock, active: !item.active }),
+      });
+      setTeacherShopItems(items => items.map(current => current.id === body.item.id ? body.item : current));
+    } catch (cause) { setSettingsError(educationErrorMessage(cause)); }
+    finally { setBusy(""); }
+  };
+
+  const resolveCourseRedemption = async (redemption: EducationTeacherRedemption, action: "fulfill" | "cancel") => {
+    if (!selectedClass) return;
+    setBusy(`shop-${action}-${redemption.id}`); setSettingsError("");
+    try {
+      const body = await educationRequest<{ redemption: EducationTeacherRedemption }>(token, `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/shop/redemptions/${encodeURIComponent(redemption.id)}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ action }),
+      });
+      setTeacherRedemptions(items => items.map(current => current.id === body.redemption.id ? body.redemption : current));
+    } catch (cause) { setSettingsError(educationErrorMessage(cause)); }
+    finally { setBusy(""); }
+  };
+
   const dissolveClass = async () => {
     if (!selectedClass || dissolveTitle !== selectedClass.title) return;
     if (!window.confirm(`确定解散“${selectedClass.title}”吗？解散后班级将立即停止使用。`)) return;
@@ -1740,6 +2027,93 @@ export function EducationHub({
       window.setTimeout(() => setSuccess(""), 2400);
     } catch (cause) { setSettingsError(educationErrorMessage(cause)); }
     finally { setBusy(""); }
+  };
+
+  const courseGraphOrderDirty = courseGraphOrderDraft.map(graph => graph.id).join("|") !== courseGraphOrderBase.join("|");
+
+  const openCourseGraphOrder = () => {
+    if (!selectedClass || selectedClass.role !== "teacher" || courseGraphs.length < 2) return;
+    setCourseGraphOrderDraft(courseGraphs);
+    setCourseGraphOrderBase(courseGraphs.map(graph => graph.id));
+    setCourseGraphOrderError("");
+    setDraggingCourseGraphId(null);
+    setCourseGraphOrderOpen(true);
+  };
+
+  const closeCourseGraphOrder = () => {
+    if (busy === "course-graph-order") return;
+    if (courseGraphOrderDirty && !window.confirm("尚未保存课程章节顺序，确定放弃本次调整吗？")) return;
+    setCourseGraphOrderOpen(false);
+    setCourseGraphOrderDraft([]);
+    setCourseGraphOrderBase([]);
+    setCourseGraphOrderError("");
+    setDraggingCourseGraphId(null);
+  };
+
+  const moveCourseGraphOrder = (graphId: string, direction: -1 | 1) => {
+    setCourseGraphOrderDraft(items => {
+      const currentIndex = items.findIndex(graph => graph.id === graphId);
+      const nextIndex = currentIndex + direction;
+      if (currentIndex < 0 || nextIndex < 0 || nextIndex >= items.length) return items;
+      const next = [...items];
+      [next[currentIndex], next[nextIndex]] = [next[nextIndex], next[currentIndex]];
+      return next;
+    });
+  };
+
+  const placeCourseGraphOrder = (sourceId: string, targetId: string) => {
+    if (sourceId === targetId) return;
+    setCourseGraphOrderDraft(items => {
+      const from = items.findIndex(graph => graph.id === sourceId);
+      const to = items.findIndex(graph => graph.id === targetId);
+      if (from < 0 || to < 0) return items;
+      const next = [...items];
+      const [moving] = next.splice(from, 1);
+      next.splice(to, 0, moving);
+      return next;
+    });
+  };
+
+  const saveCourseGraphOrder = async () => {
+    if (!selectedClass || selectedClass.role !== "teacher") return;
+    setBusy("course-graph-order");
+    setCourseGraphOrderError("");
+    try {
+      const snapshots = await updateEducationCourseGraphOrder(
+        token,
+        selectedClass.id,
+        courseGraphOrderDraft.map(graph => graph.id),
+        courseGraphOrderBase,
+      );
+      setCourseGraphs(groupCourseGraphs(snapshots));
+      setCourseGraphOrderOpen(false);
+      setCourseGraphOrderDraft([]);
+      setCourseGraphOrderBase([]);
+      setDraggingCourseGraphId(null);
+      setSuccess("课程章节顺序已更新");
+      window.setTimeout(() => setSuccess(""), 2400);
+    } catch (cause) {
+      const failure = cause as { code?: string };
+      if (failure.code === "course_graph_order_conflict") {
+        try {
+          const body = await educationRequest<{ snapshots: EducationSnapshotSummary[] }>(
+            token,
+            `/api/v2/edu/classes/${encodeURIComponent(selectedClass.id)}/snapshots`,
+          );
+          const refreshed = groupCourseGraphs(body.snapshots);
+          setCourseGraphs(refreshed);
+          setCourseGraphOrderDraft(refreshed);
+          setCourseGraphOrderBase(refreshed.map(graph => graph.id));
+          setCourseGraphOrderError("课程图谱列表已发生变化，已重新加载，请再次调整后保存。");
+        } catch (reloadCause) {
+          setCourseGraphOrderError(educationErrorMessage(reloadCause));
+        }
+      } else {
+        setCourseGraphOrderError(educationErrorMessage(cause));
+      }
+    } finally {
+      setBusy("");
+    }
   };
 
   const openGraphImport = () => {
@@ -2018,6 +2392,8 @@ export function EducationHub({
     setEditingAssignment(assignment);
     setEditTitle(assignment.title);
     setEditDueAt(toDatetimeLocal(assignment.dueAt));
+    setEditGrowthChallengeLevel(assignment.growthChallenge?.requiredLevel ? String(assignment.growthChallenge.requiredLevel) : "");
+    setEditGrowthChallengeTouched(false);
     setEditError("");
     setDeleteConfirm(false);
   };
@@ -2026,6 +2402,8 @@ export function EducationHub({
     setEditingAssignment(null);
     setEditTitle("");
     setEditDueAt("");
+    setEditGrowthChallengeLevel("");
+    setEditGrowthChallengeTouched(false);
     setEditError("");
     setDeleteConfirm(false);
   };
@@ -2044,7 +2422,21 @@ export function EducationHub({
     setBusy("assignment-update"); setEditError("");
     try {
       const assignment = await updatePublishedEducationAssignment(token, editingAssignment.id, { title, dueAt });
-      setAssignments(items => items.map(item => item.id === assignment.id ? { ...item, ...assignment } : item));
+      let growthChallenge = assignment.growthChallenge;
+      if (editingAssignment.assignmentType === "direct" && editGrowthChallengeTouched) {
+        if (editGrowthChallengeLevel) {
+          const challenge = await educationRequest<{ challenge: NonNullable<EducationAssignment["growthChallenge"]> }>(
+            token,
+            `/api/v2/edu/assignments/${encodeURIComponent(editingAssignment.id)}/growth-challenge`,
+            { method: "PUT", body: JSON.stringify({ requiredLevel: Number(editGrowthChallengeLevel), requiredStageKey: null, requiredStageMilestone: null }) },
+          );
+          growthChallenge = challenge.challenge;
+        } else {
+          await educationRequest(token, `/api/v2/edu/assignments/${encodeURIComponent(editingAssignment.id)}/growth-challenge`, { method: "DELETE" });
+          growthChallenge = { isGrowthChallenge: false, locked: false };
+        }
+      }
+      setAssignments(items => items.map(item => item.id === assignment.id ? { ...item, ...assignment, growthChallenge } : item));
       closeAssignmentEditor();
       setSuccess("任务信息已更新");
       window.setTimeout(() => setSuccess(""), 2400);
@@ -2110,7 +2502,7 @@ export function EducationHub({
           <div className="edu-sidebar-title"><School size={15} />我的班级</div>
           <div className="edu-class-list">
             {classes.map(item => (
-              <button key={item.id} className={`edu-class-item ${selectedClassId === item.id ? "active" : ""}`} onClick={() => { setSelectedClassId(item.id); setSuccess(""); setOverview(null); setOverviewAssignmentId(null); closeStudentContextSummary(); }}>
+              <button key={item.id} className={`edu-class-item ${selectedClassId === item.id ? "active" : ""}`} onClick={() => { setSelectedClassId(item.id); setGameSummary(null); setGameSummaryError(""); setSuccess(""); setOverview(null); setOverviewAssignmentId(null); closeStudentContextSummary(); }}>
                 <span>{item.title}</span><small>{item.assignmentCount ?? 0} 个作业</small>
               </button>
             ))}
@@ -2121,19 +2513,39 @@ export function EducationHub({
         <main className="edu-main">
           {error && <div className="edu-error">{error}</div>}
           {success && <div className="edu-success"><Check size={15} />{success}</div>}
+          {gameSummaryError && isStudentClass && <div className="edu-notice"><Route size={15} />探索地图暂不可用，已显示经典作业列表。{gameSummaryError}</div>}
           {!selectedClass && <div className="edu-empty"><GraduationCap size={34} /><strong>{targetNode ? `已选择学习目标：${nodeTitle(targetNode, targetNode.id)}` : "选择一个班级开始"}</strong><span>{targetNode ? "创建或选择你担任教师的班级，即可生成学习路径。" : educationRole === "teacher" ? "教师可以从当前图谱发布学习路径。" : "学生可以查看已发布作业并开始学习。"}</span><button className="edu-button secondary" onClick={educationRole === "teacher" ? openCreateClass : openClassSettings}>{educationRole === "teacher" ? <><Plus size={14} />创建班级</> : <><Settings size={14} />打开班级设置</>}</button></div>}
 
           {selectedClass && (
             <>
               <section className="edu-class-head">
-                <div><span className="edu-kicker">{selectedClass.role === "teacher" ? "教师视图" : "学生视图"}</span><h1>{selectedClass.title}</h1></div>
+                <div className="edu-class-title"><span className="edu-kicker">{selectedClass.role === "teacher" ? "教师视图" : "学生视图"}</span><h1>{selectedClass.title}</h1></div>
+                {showAdventureMap && gameSummary && <EducationGameHeaderTools key={selectedClass.id} summary={gameSummary} onGameAction={runEducationGameAction} />}
               </section>
 
-              <section className="edu-section edu-course-graphs-section">
+              {adventureModeResolving ? (
+          <section className="edu-adventure-loading" aria-live="polite"><Loader2 className="edu-spin" size={18} /><div><strong>正在准备探索地图…</strong><small>正在同步课程任务与学习进度</small></div></section>
+        ) : showAdventureMap ? (
+          <EducationAdventureMap
+            key={selectedClass.id}
+            assignments={assignments}
+            courseGraphs={courseGraphs}
+            summary={gameSummary!}
+            formatDate={formatDate}
+            onOpenAssignment={onOpenAssignment}
+            onOpenCourseGraph={onOpenCourseGraph}
+            loadCourseGraphSnapshot={loadCourseGraphSnapshot}
+            onGameAction={runEducationGameAction}
+            onDialogOpenChange={setAdventureDialogOpen}
+          />
+        ) : (
+          <>
+        <section className="edu-section edu-course-graphs-section">
                 <div className="edu-section-heading-row">
                   <div className="edu-section-title"><GitBranch size={17} /><strong>课程图谱</strong><span>{courseGraphs.length}</span></div>
                   {selectedClass.role === "teacher" && (
                     <div className="edu-course-graph-actions">
+                      <button className="edu-button ghost" disabled={courseGraphs.length < 2} onClick={openCourseGraphOrder}><GripVertical size={14} />调整顺序</button>
                       <button className="edu-button ghost" onClick={onOpenCreate}><GitBranch size={14} />自主建图</button>
                       <button className="edu-button ghost edu-import-open" onClick={openGraphImport}><Upload size={14} />导入图谱</button>
                     </div>
@@ -2198,6 +2610,8 @@ export function EducationHub({
                   </div>
                 </section>
               )}
+          </>
+        )}
 
               {overview && gradingOverview && <section className="edu-card edu-grading-overview-card">
                 <div className="edu-card-title edu-grading-overview-title"><Users size={18} /><div><strong>作业批改</strong><small>AI 评价由教师发起，最终分数需逐题确认后统一发布</small></div><button className="edu-button primary" disabled={!gradingOverview.canPublish || busy === "grades-publish"} onClick={() => void releaseGrades()}>{busy === "grades-publish" ? <Loader2 className="edu-spin" size={14} /> : <Send size={14} />}发布成绩</button></div>
@@ -2319,6 +2733,43 @@ export function EducationHub({
           </section>
         </div>
       )}
+      {courseGraphOrderOpen && (
+        <div className="edu-modal-backdrop" onClick={closeCourseGraphOrder}>
+          <section className="edu-settings-modal edu-course-order-modal" role="dialog" aria-modal="true" aria-labelledby="edu-course-order-title" onClick={event => event.stopPropagation()}>
+            <div className="edu-settings-head">
+              <div><span className="edu-kicker">课程图谱</span><h2 id="edu-course-order-title">调整章节顺序</h2></div>
+              <button className="edu-icon-button" disabled={busy === "course-graph-order"} onClick={closeCourseGraphOrder} aria-label="关闭"><X size={17} /></button>
+            </div>
+            <p className="edu-settings-copy">拖拽课程章节，或使用上移、下移按钮调整学生探索地图的展示顺序。保存后会统一更新章节编号。</p>
+            <ol className="edu-course-order-list" aria-label="课程章节排序列表">
+              {courseGraphOrderDraft.map((graph, index) => (
+                <li
+                  className={draggingCourseGraphId === graph.id ? "dragging" : ""}
+                  key={graph.id}
+                  draggable={busy !== "course-graph-order"}
+                  onDragStart={event => { setDraggingCourseGraphId(graph.id); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", graph.id); }}
+                  onDragEnd={() => setDraggingCourseGraphId(null)}
+                  onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }}
+                  onDrop={event => { event.preventDefault(); placeCourseGraphOrder(event.dataTransfer.getData("text/plain") || draggingCourseGraphId || "", graph.id); setDraggingCourseGraphId(null); }}
+                >
+                  <span className="edu-course-order-grip" aria-hidden="true"><GripVertical size={17} /></span>
+                  <span className="edu-course-order-index">第 {index + 1} 章</span>
+                  <span className="edu-course-order-copy"><strong>{graph.filename}</strong><small>{graph.nodeCount} 个节点 · {graph.edgeCount} 条关系</small></span>
+                  <span className="edu-course-order-actions">
+                    <button type="button" className="edu-icon-button" disabled={index === 0 || busy === "course-graph-order"} onClick={() => moveCourseGraphOrder(graph.id, -1)} aria-label={`将 ${graph.filename} 上移`}><ArrowUp size={15} /></button>
+                    <button type="button" className="edu-icon-button" disabled={index === courseGraphOrderDraft.length - 1 || busy === "course-graph-order"} onClick={() => moveCourseGraphOrder(graph.id, 1)} aria-label={`将 ${graph.filename} 下移`}><ArrowDown size={15} /></button>
+                  </span>
+                </li>
+              ))}
+            </ol>
+            {courseGraphOrderError && <div className="edu-modal-error">{courseGraphOrderError}</div>}
+            <div className="edu-settings-actions">
+              <button type="button" className="edu-button ghost" disabled={busy === "course-graph-order"} onClick={closeCourseGraphOrder}>取消</button>
+              <button type="button" className="edu-button primary" disabled={!courseGraphOrderDirty || busy === "course-graph-order"} onClick={() => void saveCourseGraphOrder()}>{busy === "course-graph-order" ? <><Loader2 className="edu-spin" size={15} />正在保存…</> : <><Save size={15} />保存顺序</>}</button>
+            </div>
+          </section>
+        </div>
+      )}
       {importOpen && (
         <div className="edu-modal-backdrop" onClick={closeGraphImport}>
           <section className="edu-settings-modal edu-import-modal" role="dialog" aria-modal="true" aria-labelledby="edu-import-title" onClick={event => event.stopPropagation()}>
@@ -2351,6 +2802,9 @@ export function EducationHub({
                 <div className="edu-settings-menu-list">
                   <button className="edu-settings-menu-item" onClick={() => { setSettingsError(""); setManagementDialog("rename"); }}><span className="edu-settings-menu-icon"><Pencil size={16} /></span><span><strong>修改班级名称</strong><small>{selectedClass?.title}</small></span><ChevronRight size={17} /></button>
                   <button className="edu-settings-menu-item" onClick={() => { setSettingsError(""); setManagementDialog("members"); }}><span className="edu-settings-menu-icon"><Users size={17} /></span><span><strong>查看学生</strong><small>{activeStudentCount} 位学生已加入</small></span><ChevronRight size={17} /></button>
+                  {gameSummary && <button className="edu-settings-menu-item" onClick={() => { setSettingsError(""); setManagementDialog("gems"); }}><span className="edu-settings-menu-icon"><Gem size={17} /></span><span><strong>奖励宝石</strong><small>对本课程有效学生发放 1–500 宝石</small></span><ChevronRight size={17} /></button>}
+                  {gameSummary && <button className="edu-settings-menu-item" onClick={() => { setSettingsError(""); setManagementDialog("shop"); }}><span className="edu-settings-menu-icon"><ShoppingBag size={17} /></span><span><strong>宝石小店</strong><small>管理课程奖励和待履约兑换</small></span><ChevronRight size={17} /></button>}
+                  {gameSummary && <button className="edu-settings-menu-item" onClick={() => { setSettingsError(""); setGameExperienceDraft(gameSummary.settings.studentExperience); setWeeklyXpGoalDraft(String(gameSummary.settings.weeklyXpGoal)); setManagementDialog("experience"); }}><span className="edu-settings-menu-icon"><Route size={17} /></span><span><strong>学生学习界面</strong><small>{gameSummary.settings.studentExperience === "map" ? "探索地图" : "经典作业列表"}</small></span><ChevronRight size={17} /></button>}
                   <button className="edu-settings-menu-item danger" onClick={() => { setSettingsError(""); setDissolveTitle(""); setManagementDialog("dissolve"); }}><span className="edu-settings-menu-icon"><Settings size={16} /></span><span><strong>解散班级</strong><small>停止邀请码和班级资源使用</small></span><ChevronRight size={17} /></button>
                 </div>
                 {settingsError && <div className="edu-modal-error">{settingsError}</div>}
@@ -2402,6 +2856,49 @@ export function EducationHub({
                 {settingsError && <div className="edu-modal-error">{settingsError}</div>}
               </>
             )}
+            {managementDialog === "gems" && (
+              <>
+                <div className="edu-secondary-title"><span className="edu-settings-menu-icon"><Gem size={18} /></span><div><span className="edu-kicker">课程内货币</span><h2 id="edu-secondary-title">奖励学生宝石</h2></div></div>
+                <p className="edu-settings-copy">宝石只写入当前课程的钱包和账本；奖励原因会保留给教师审计，不会出现在学生排行榜。</p>
+                {membersLoading ? <div className="edu-members-loading"><Loader2 className="edu-spin" size={15} />正在加载学生…</div> : <div className="edu-game-management-form">
+                  <label className="edu-settings-field"><span>学生</span><select value={gemRecipientId} onChange={event => setGemRecipientId(event.target.value)}><option value="">选择学生</option>{members.filter(member => member.status === "active").map(member => <option value={member.userId} key={member.userId}>{member.studentName || "资料待补全"}{member.studentNumber ? `（${member.studentNumber}）` : ""}</option>)}</select></label>
+                  <label className="edu-settings-field"><span>宝石数量</span><input type="number" min={1} max={500} value={gemAmount} onChange={event => setGemAmount(event.target.value)} /></label>
+                  <label className="edu-settings-field"><span>奖励原因</span><textarea value={gemReason} maxLength={500} onChange={event => setGemReason(event.target.value)} placeholder="例如：本次作业思路清晰、主动帮助同学" /></label>
+                  <button className="edu-button primary edu-settings-submit" disabled={busy === "gem-grant"} onClick={() => void grantCourseGems()}>{busy === "gem-grant" ? <><Loader2 className="edu-spin" size={15} />正在发放…</> : <><Gem size={15} />发放宝石</>}</button>
+                </div>}
+                <div className="edu-game-management-history"><strong>最近发放记录</strong>{teacherGemAwards.length ? <ul>{teacherGemAwards.slice(0, 12).map((award, index) => <li key={`${award.createdAt}-${index}`}><b>{award.studentName}</b><span>+{award.amount} 宝石</span><small>{award.reason}</small></li>)}</ul> : <p>尚无教师宝石奖励。</p>}</div>
+                {settingsError && <div className="edu-modal-error">{settingsError}</div>}
+              </>
+            )}
+            {managementDialog === "shop" && (
+              <>
+                <div className="edu-secondary-title"><span className="edu-settings-menu-icon"><ShoppingBag size={18} /></span><div><span className="edu-kicker">课程内兑换</span><h2 id="edu-secondary-title">宝石小店管理</h2></div></div>
+                <p className="edu-settings-copy">创建课程内虚拟或实物奖励。学生兑换自定义奖励后会进入待履约；取消会自动退款并恢复库存。</p>
+                <div className="edu-game-management-form edu-shop-management-form">
+                  <label className="edu-settings-field"><span>奖励名称</span><input value={shopTitle} maxLength={160} onChange={event => setShopTitle(event.target.value)} placeholder="例如：教师点评优先券" /></label>
+                  <label className="edu-settings-field"><span>奖励说明</span><textarea value={shopDescription} maxLength={2000} onChange={event => setShopDescription(event.target.value)} placeholder="说明兑换后的正向反馈或履约方式" /></label>
+                  <div className="edu-game-management-inline"><label className="edu-settings-field"><span>宝石价格</span><input type="number" min={1} value={shopGemPrice} onChange={event => setShopGemPrice(event.target.value)} /></label><label className="edu-settings-field"><span>库存（可选）</span><input type="number" min={0} value={shopStock} onChange={event => setShopStock(event.target.value)} placeholder="不限" /></label></div>
+                  <button className="edu-button primary edu-settings-submit" disabled={busy === "shop-create"} onClick={() => void createCourseShopItem()}>{busy === "shop-create" ? <><Loader2 className="edu-spin" size={15} />正在创建…</> : <><Plus size={15} />创建课程奖励</>}</button>
+                </div>
+                {teacherGameManagementLoading ? <div className="edu-members-loading"><Loader2 className="edu-spin" size={15} />正在加载小店…</div> : <><div className="edu-game-management-history"><strong>当前商品</strong>{teacherShopItems.length ? <ul>{teacherShopItems.map(item => <li key={item.id}><b>{item.title}</b><span>{item.gemPrice} 宝石 · {item.stock === null ? "不限库存" : `库存 ${item.stock}`}</span>{item.kind === "custom" && <button className="edu-button ghost" disabled={busy === `shop-toggle-${item.id}`} onClick={() => void toggleCourseShopItem(item)}>{item.active ? "停用" : "启用"}</button>}<small>{item.active ? "已启用" : "已停用"}</small></li>)}</ul> : <p>小店尚无商品。</p>}</div>
+                <div className="edu-game-management-history"><strong>待履约兑换</strong>{teacherRedemptions.length ? <ul>{teacherRedemptions.map(redemption => <li key={redemption.id}><b>{redemption.studentName}</b><span>{redemption.item.title || "课程奖励"} · {redemption.gemCost} 宝石</span>{redemption.status === "pending" ? <div><button className="edu-button secondary" disabled={busy === `shop-fulfill-${redemption.id}`} onClick={() => void resolveCourseRedemption(redemption, "fulfill")}>完成履约</button><button className="edu-button ghost" disabled={busy === `shop-cancel-${redemption.id}`} onClick={() => void resolveCourseRedemption(redemption, "cancel")}>取消并退款</button></div> : <small>{redemption.status === "fulfilled" ? "已完成" : "已取消并退款"}</small>}</li>)}</ul> : <p>当前没有兑换记录。</p>}</div></>}
+                {settingsError && <div className="edu-modal-error">{settingsError}</div>}
+              </>
+            )}
+            {managementDialog === "experience" && (
+              <>
+                <div className="edu-secondary-title"><span className="edu-settings-menu-icon"><Route size={17} /></span><div><span className="edu-kicker">学生体验</span><h2 id="edu-secondary-title">学生学习界面</h2></div></div>
+                <p className="edu-settings-copy">只改变学生进入班级后的任务组织方式，不影响教师批改、正式成绩和统计。</p>
+                <div className="edu-settings-choice-grid" role="radiogroup" aria-label="学生学习界面">
+                  <label className={gameExperienceDraft === "classic" ? "edu-settings-choice selected" : "edu-settings-choice"}><input type="radio" name="student-experience" value="classic" checked={gameExperienceDraft === "classic"} onChange={() => setGameExperienceDraft("classic")} /><span><strong>经典作业列表</strong><small>保持当前课程图谱和作业卡片布局</small></span></label>
+                  <label className={gameExperienceDraft === "map" ? "edu-settings-choice selected" : "edu-settings-choice"}><input type="radio" name="student-experience" value="map" checked={gameExperienceDraft === "map"} onChange={() => setGameExperienceDraft("map")} /><span><strong>探索地图</strong><small>用清晰的课程阶段、任务路径和学习摘要组织学生任务</small></span></label>
+                </div>
+                <label className="edu-settings-field"><span>每周目标 XP</span><input type="number" min={10} max={500} step={1} value={weeklyXpGoalDraft} onChange={event => setWeeklyXpGoalDraft(event.target.value)} /><small>请输入 10 至 500 的整数；XP 仍由服务端按真实学习行为发放。</small></label>
+                <div className="edu-settings-readonly"><span>班级时区</span><strong>{gameSummary?.settings.timezone || "—"}</strong><small>按班级时区计算每周学习目标，教师暂不可修改。</small></div>
+                {settingsError && <div className="edu-modal-error">{settingsError}</div>}
+                <button className="edu-button primary edu-settings-submit" disabled={!gameSummary || busy === "game-settings"} onClick={() => void saveEducationGameSettings()}>{busy === "game-settings" ? <><Loader2 className="edu-spin" size={15} />正在保存…</> : <><Save size={15} />保存学生界面设置</>}</button>
+              </>
+            )}
             {managementDialog === "dissolve" && (
               <>
                 <div className="edu-secondary-title danger"><span className="edu-settings-menu-icon"><Settings size={17} /></span><div><span className="edu-kicker">危险操作</span><h2 id="edu-secondary-title">解散班级</h2></div></div>
@@ -2424,6 +2921,7 @@ export function EducationHub({
             <p className="edu-settings-copy">修改已发布任务的名称和截止时间，学习路径与学生记录不会改变。</p>
             <label className="edu-settings-field"><span>任务名称</span><input autoFocus value={editTitle} maxLength={160} onChange={event => setEditTitle(event.target.value)} onKeyDown={event => { if (event.key === "Enter") void updatePublishedAssignment(); }} /></label>
             <label className="edu-settings-field edu-assignment-edit-due"><span>截止时间</span><input type="datetime-local" value={editDueAt} onChange={event => setEditDueAt(event.target.value)} /><small>留空表示不设置截止时间。</small></label>
+            {editingAssignment.assignmentType === "direct" && <label className="edu-settings-field"><span>成长挑战解锁</span><select value={editGrowthChallengeLevel} onChange={event => { setEditGrowthChallengeLevel(event.target.value); setEditGrowthChallengeTouched(true); }}><option value="">不设成长挑战</option>{[10, 20, 30, 40, 50].map(level => <option key={level} value={level}>等级 {level} 解锁</option>)}</select><small>{editingAssignment.growthChallenge?.requiredStageKey && !editGrowthChallengeTouched ? "当前任务使用阶段路线解锁；选择等级并保存后才会覆盖该规则。" : "未达等级的学生只能看到锁定预览，不能通过直接链接进入。"}</small></label>}
             {editError && <div className="edu-modal-error">{editError}</div>}
             <div className="edu-assignment-edit-actions">
               <button className="edu-button primary" disabled={!editTitle.trim() || busy === "assignment-update" || busy === "assignment-delete"} onClick={() => void updatePublishedAssignment()}>{busy === "assignment-update" ? <><Loader2 className="edu-spin" size={15} />正在保存…</> : "保存修改"}</button>

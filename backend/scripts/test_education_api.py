@@ -1,12 +1,13 @@
+import base64
 import io
 import json
 import os
-import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,8 +17,12 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 import api_v2
+import education_gamification
 import student_context
 from education_service import validate_direct_scoring_standard_result
+from integrations.neo4j_handler import get_graph_store, reset_graph_store
+from storage.database import reset_engine
+from scripts.migrate_storage import TARGET_TABLE_ORDER
 
 
 NODES = [
@@ -59,27 +64,42 @@ class EducationApiTests(unittest.TestCase):
     TEACHER_PASSWORD = "x2353877811"
 
     def setUp(self):
+        if os.environ.get("MATHWEAVER_INTEGRATION_TESTS") != "1":
+            self.skipTest("set MATHWEAVER_INTEGRATION_TESTS=1 for Docker MySQL/Neo4j tests")
+        database_url = os.environ.get("MATHWEAVER_TEST_DATABASE_URL", "").strip()
+        neo4j_uri = os.environ.get("MATHWEAVER_TEST_NEO4J_URI", "").strip()
+        neo4j_password_file = os.environ.get("MATHWEAVER_TEST_NEO4J_PASSWORD_FILE", "").strip()
+        if not database_url or not neo4j_uri or not neo4j_password_file:
+            self.skipTest("test MySQL/Neo4j credentials are not configured")
+
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         root = Path(self.temp_dir.name)
+        data_key_file = root / "data-key.txt"
+        data_key_file.write_text(
+            base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("="),
+            encoding="utf-8",
+        )
         self.previous = (
             api_v2._DATA_ROOT,
-            api_v2._DB_PATH,
             api_v2._SOURCE_PDF_ROOT,
             api_v2._EDUCATION_ROOT,
             api_v2._EDUCATION_SNAPSHOT_ROOT,
             api_v2._EDUCATION_ASSIGNMENT_SOURCE_ROOT,
         )
         api_v2._DATA_ROOT = root
-        api_v2._DB_PATH = root / "auth.db"
         api_v2._SOURCE_PDF_ROOT = root / "uploads" / "source_pdfs"
         api_v2._EDUCATION_ROOT = root / "education"
         api_v2._EDUCATION_SNAPSHOT_ROOT = root / "education" / "snapshots"
         api_v2._EDUCATION_ASSIGNMENT_SOURCE_ROOT = root / "education" / "assignment_sources"
-        api_v2.app.config.update(TESTING=True)
-        self.client = api_v2.app.test_client()
         self.env = patch.dict(
             os.environ,
             {
+                "DATABASE_URL": database_url,
+                "NEO4J_URI": neo4j_uri,
+                "NEO4J_USER": os.environ.get("MATHWEAVER_TEST_NEO4J_USER", "neo4j"),
+                "NEO4J_PASSWORD_FILE": neo4j_password_file,
+                "MATHWEAVER_DATA_KEY_FILE": str(data_key_file),
+                "MATHGRAPH_DATA_DIR": str(root),
                 "MATHWEAVER_EDU_ENABLED": "1",
                 "MATHWEAVER_EDU_AI_DAILY_LIMIT": "50",
                 "MATHWEAVER_EDU_LLM_API_URL": "",
@@ -93,16 +113,41 @@ class EducationApiTests(unittest.TestCase):
             clear=False,
         )
         self.env.start()
-        api_v2._init_db()
+        reset_engine()
+        reset_graph_store()
+        with api_v2.connect_database() as connection:
+            connection.execute("SET FOREIGN_KEY_CHECKS = 0")
+            for table in reversed((*TARGET_TABLE_ORDER, "education_course_graph_order", "graph_registry")):
+                connection.execute(f"DELETE FROM `{table}`")
+            connection.execute("SET FOREIGN_KEY_CHECKS = 1")
+        store = get_graph_store()
+        with store.driver.session(database=store.database) as session:
+            session.run("MATCH (n) DETACH DELETE n").consume()
+        api_v2._jobs.clear()
+        api_v2._job_runtimes.clear()
+        with api_v2.connect_database() as connection:
+            connection.execute(
+                "INSERT INTO users (email, password_hash, created_at, can_teach) VALUES (?, ?, ?, 1)",
+                (
+                    self.TEACHER_EMAIL,
+                    api_v2.generate_password_hash(self.TEACHER_PASSWORD),
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+        api_v2.app.config.update(TESTING=True)
+        self.client = api_v2.app.test_client()
         self.teacher = self._login(self.TEACHER_EMAIL, self.TEACHER_PASSWORD, "teacher")
         self.student = self._register("student@example.com")
         self.outsider = self._register("outside@example.com")
 
     def tearDown(self):
+        if not hasattr(self, "env"):
+            return
+        reset_graph_store()
+        reset_engine()
         self.env.stop()
         (
             api_v2._DATA_ROOT,
-            api_v2._DB_PATH,
             api_v2._SOURCE_PDF_ROOT,
             api_v2._EDUCATION_ROOT,
             api_v2._EDUCATION_SNAPSHOT_ROOT,
@@ -146,7 +191,7 @@ class EducationApiTests(unittest.TestCase):
 
     def test_education_llm_config_prefers_system_and_falls_back_to_active_user(self):
         self._save_llm_config(self.teacher)
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             teacher_id = connection.execute(
                 "SELECT id FROM users WHERE email = ?", (self.TEACHER_EMAIL,)
             ).fetchone()[0]
@@ -226,7 +271,7 @@ class EducationApiTests(unittest.TestCase):
                             scope="tests/config-redaction",
                         )
         self.assertNotIn("user-key", str(failure.exception))
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             stored_error = connection.execute(
                 "SELECT error FROM education_ai_tasks WHERE task_key = 'config-redaction-probe'"
             ).fetchone()[0]
@@ -337,7 +382,7 @@ class EducationApiTests(unittest.TestCase):
         )
         self.assertEqual(regenerated.status_code, 503, regenerated.get_json())
         self.assertEqual(regenerated.get_json()["code"], "education_ai_unconfigured")
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             teacher_id = connection.execute(
                 "SELECT id FROM users WHERE email = ?", (self.TEACHER_EMAIL,)
             ).fetchone()[0]
@@ -454,7 +499,7 @@ class EducationApiTests(unittest.TestCase):
             headers=self._headers(self.student),
         )
         self.assertEqual(exempt_mastery.status_code, 200, exempt_mastery.get_json())
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             source = connection.execute(
                 "SELECT mastery_source FROM education_node_progress WHERE assignment_id = ? AND node_id = 2",
                 (assignment["id"],),
@@ -659,12 +704,12 @@ class EducationApiTests(unittest.TestCase):
         )
         self.assertEqual(repeated.status_code, 200, repeated.get_json())
         self.assertEqual(repeated.get_json()["attempt"]["completedAt"], completed.get_json()["attempt"]["completedAt"])
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             progress = connection.execute(
                 "SELECT state, mastery_source FROM education_node_progress WHERE assignment_id = ? AND node_id = 1",
                 (assignment["id"],),
             ).fetchone()
-        self.assertEqual(progress, ("in_progress", "self"))
+        self.assertEqual(tuple(progress.values()), ("in_progress", "self"))
 
     def test_teacher_regeneration_is_copy_on_success_and_published_questions_are_frozen(self):
         _class_data, _snapshot, assignment = self._create_draft_assignment_with_assessments()
@@ -785,7 +830,7 @@ class EducationApiTests(unittest.TestCase):
         self.assertFalse(errors, errors)
         self.assertEqual(set(responses), {1, 2})
         self.assertEqual({status for status, _payload in responses.values()}, {200})
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             teacher_id = connection.execute(
                 "SELECT id FROM users WHERE email = ?", (self.TEACHER_EMAIL,)
             ).fetchone()[0]
@@ -963,65 +1008,34 @@ class EducationApiTests(unittest.TestCase):
         node = next(item for item in refreshed["assessments"] if item["nodeId"] == 1)
         self.assertNotIn(question["id"], [item["id"] for item in node["questions"]])
 
-    def test_progress_migration_preserves_existing_progress_and_legacy_diagnostics(self):
+    def test_progress_schema_is_alembic_managed_and_preserves_records(self):
         _class_data, _snapshot, assignment = self._create_published_assignment()
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             user_id = connection.execute(
-                "SELECT id FROM users WHERE email = 'student@example.com'",
+                "SELECT id FROM users WHERE email = 'student@example.com'"
             ).fetchone()[0]
             connection.execute(
-                "INSERT INTO education_diagnostics (id, assignment_id, user_id, node_id, question_json, answer, result, summary, created_at, updated_at) VALUES ('legacy-diagnostic', ?, ?, 1, '{}', 'old answer', 'mastered', 'old summary', 'old', 'old')",
-                (assignment["id"], user_id),
+                """INSERT INTO education_node_progress
+                     (assignment_id, user_id, node_id, state, mastery_source, diagnostic_summary, updated_at)
+                   VALUES (?, ?, 1, 'mastered', 'diagnostic', 'persisted progress', ?)""",
+                (assignment["id"], user_id, datetime.utcnow().isoformat()),
             )
-            connection.execute(
-                "DELETE FROM education_assessment_questions WHERE assignment_id = ?",
-                (assignment["id"],),
-            )
-            connection.execute(
-                "DELETE FROM education_assessment_nodes WHERE assignment_id = ?",
-                (assignment["id"],),
-            )
-            connection.execute("PRAGMA foreign_keys = OFF")
-            connection.execute("DROP TABLE education_node_progress")
-            connection.execute(
-                """CREATE TABLE education_node_progress (
-                    assignment_id TEXT NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    node_id INTEGER NOT NULL,
-                    state TEXT NOT NULL CHECK (state IN ('not_started', 'in_progress', 'mastered', 'needs_review')),
-                    mastery_source TEXT NOT NULL DEFAULT 'self' CHECK (mastery_source IN ('self', 'diagnostic', 'teacher')),
-                    diagnostic_summary TEXT,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (assignment_id, user_id, node_id)
-                )""",
-            )
-            connection.execute(
-                "INSERT INTO education_node_progress VALUES (?, ?, 1, 'mastered', 'diagnostic', 'legacy progress', 'old')",
-                (assignment["id"], user_id),
-            )
-            connection.commit()
-
-        api_v2._init_db()
-
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
-            schema = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'education_node_progress'",
-            ).fetchone()[0]
+        with api_v2.connect_database() as connection:
+            columns = {
+                row["column_name"]
+                for row in connection.execute(
+                    """SELECT column_name FROM information_schema.columns
+                         WHERE table_schema = DATABASE() AND table_name = 'education_node_progress'"""
+                ).fetchall()
+            }
             progress = connection.execute(
-                "SELECT state, mastery_source, diagnostic_summary FROM education_node_progress WHERE assignment_id = ? AND user_id = ? AND node_id = 1",
+                """SELECT state, mastery_source, diagnostic_summary
+                     FROM education_node_progress
+                    WHERE assignment_id = ? AND user_id = ? AND node_id = 1""",
                 (assignment["id"], user_id),
             ).fetchone()
-            diagnostic = connection.execute(
-                "SELECT answer, result FROM education_diagnostics WHERE id = 'legacy-diagnostic'",
-            ).fetchone()
-            assessment_rows = connection.execute(
-                "SELECT node_id, status FROM education_assessment_nodes WHERE assignment_id = ? ORDER BY node_id",
-                (assignment["id"],),
-            ).fetchall()
-        self.assertIn("'assessment'", schema)
-        self.assertEqual(progress, ("mastered", "diagnostic", "legacy progress"))
-        self.assertEqual(diagnostic, ("old answer", "mastered"))
-        self.assertEqual(assessment_rows, [(1, "exempt"), (2, "exempt"), (3, "exempt")])
+        self.assertTrue({"state", "mastery_source", "diagnostic_summary"}.issubset(columns))
+        self.assertEqual(tuple(progress.values()), ("mastered", "diagnostic", "persisted progress"))
 
     def test_path_payload_sends_only_structural_base_path(self):
         deterministic = {
@@ -1051,10 +1065,15 @@ class EducationApiTests(unittest.TestCase):
             "edges": [],
         }
 
-        payload = api_v2._education_path_payload(
-            {"nodes_json": json.dumps(NODES, ensure_ascii=False)},
-            deterministic,
-        )
+        with patch.object(
+            api_v2,
+            "_education_snapshot_graph",
+            return_value={"nodes": NODES, "edges": []},
+        ):
+            payload = api_v2._education_path_payload(
+                {"id": "path-payload-test"},
+                deterministic,
+            )
 
         self.assertEqual(
             payload["basePath"],
@@ -1105,7 +1124,7 @@ class EducationApiTests(unittest.TestCase):
         assignment_data = assignment.get_json()["assignment"]
         # Most API tests exercise education workflows unrelated to the separate
         # teacher review gate for generated assessment questions.
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute(
                 "UPDATE education_assessment_nodes SET status = 'exempt' WHERE assignment_id = ?",
                 (assignment_data["id"],),
@@ -1124,7 +1143,7 @@ class EducationApiTests(unittest.TestCase):
         )
         self.assertEqual(static_login.status_code, 200, static_login.get_json())
 
-        db = sqlite3.connect(str(api_v2._DB_PATH))
+        db = api_v2.connect_database()
         teacher_row = db.execute(
             "SELECT password_hash, can_teach FROM users WHERE email = ?",
             (self.TEACHER_EMAIL,),
@@ -1156,16 +1175,19 @@ class EducationApiTests(unittest.TestCase):
         self.assertEqual(teacher_register.status_code, 403)
         self.assertEqual(teacher_register.get_json()["code"], "teacher_registration_disabled")
 
-        with patch.object(api_v2, "TEACHER_ACCOUNTS", []):
-            api_v2._init_db()
-            revoked_existing = self.client.get(
-                "/api/v2/edu/classes",
-                headers=self._headers(self.teacher),
+        with api_v2.connect_database() as connection:
+            connection.execute(
+                "UPDATE users SET can_teach = 0 WHERE email = ?",
+                (self.TEACHER_EMAIL,),
             )
-            revoked = self.client.post(
-                "/api/v2/auth/login",
-                json={"email": self.TEACHER_EMAIL, "password": self.TEACHER_PASSWORD, "educationRole": "teacher"},
-            )
+        revoked_existing = self.client.get(
+            "/api/v2/edu/classes",
+            headers=self._headers(self.teacher),
+        )
+        revoked = self.client.post(
+            "/api/v2/auth/login",
+            json={"email": self.TEACHER_EMAIL, "password": self.TEACHER_PASSWORD, "educationRole": "teacher"},
+        )
         self.assertEqual(revoked_existing.status_code, 403)
         self.assertEqual(revoked.status_code, 401)
 
@@ -1183,13 +1205,14 @@ class EducationApiTests(unittest.TestCase):
         )
         self.assertEqual(student_create.status_code, 403)
 
-    def test_auth_defaults_and_migrates_legacy_sessions(self):
+    def test_auth_defaults_and_stores_only_session_hashes(self):
         default_login = self.client.post(
             "/api/v2/auth/login",
             json={"email": "student@example.com", "password": "secret12"},
         )
         self.assertEqual(default_login.status_code, 200, default_login.get_json())
         self.assertEqual(default_login.get_json()["educationRole"], "student")
+        plaintext = default_login.get_json()["token"]
 
         default_registration = self.client.post(
             "/api/v2/auth/register",
@@ -1198,34 +1221,19 @@ class EducationApiTests(unittest.TestCase):
         self.assertEqual(default_registration.status_code, 201, default_registration.get_json())
         self.assertEqual(default_registration.get_json()["educationRole"], "student")
 
-        db = sqlite3.connect(str(api_v2._DB_PATH))
-        db.execute(
-            "INSERT INTO sessions (token, user_id, education_role, created_at) "
-            "SELECT ?, id, NULL, ? FROM users WHERE email = ?",
-            ("legacy-student-token", "legacy", "student@example.com"),
-        )
-        db.execute(
-            "INSERT INTO sessions (token, user_id, education_role, created_at) "
-            "SELECT ?, id, NULL, ? FROM users WHERE email = ?",
-            ("legacy-teacher-token", "legacy", self.TEACHER_EMAIL),
-        )
-        db.commit()
-        db.close()
-
-        api_v2._init_db()
-
-        legacy_student_me = self.client.get(
-            "/api/v2/auth/me",
-            headers=self._headers("legacy-student-token"),
-        )
-        legacy_teacher_me = self.client.get(
-            "/api/v2/auth/me",
-            headers=self._headers("legacy-teacher-token"),
-        )
-        self.assertEqual(legacy_student_me.status_code, 200)
-        self.assertEqual(legacy_student_me.get_json()["educationRole"], "student")
-        self.assertEqual(legacy_teacher_me.status_code, 200)
-        self.assertEqual(legacy_teacher_me.get_json()["educationRole"], "teacher")
+        with api_v2.connect_database() as db:
+            columns = {
+                row["column_name"]
+                for row in db.execute(
+                    """SELECT column_name FROM information_schema.columns
+                         WHERE table_schema = DATABASE() AND table_name = 'sessions'"""
+                ).fetchall()
+            }
+            hashes = [row["token_hash"] for row in db.execute("SELECT token_hash FROM sessions").fetchall()]
+        self.assertIn("token_hash", columns)
+        self.assertNotIn("token", columns)
+        self.assertTrue(all(isinstance(value, bytes) and len(value) == 32 for value in hashes))
+        self.assertTrue(all(plaintext.encode("utf-8") not in value for value in hashes))
 
     def test_student_profile_is_required_unique_and_teacher_visible_without_email(self):
         created = self.client.post(
@@ -1302,7 +1310,7 @@ class EducationApiTests(unittest.TestCase):
 
     def test_legacy_student_profile_blocks_learning_until_completed(self):
         class_data, snapshot_data, assignment_data = self._create_published_assignment()
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute(
                 "UPDATE education_memberships SET student_name = NULL, student_number = NULL WHERE class_id = ? AND user_id = (SELECT id FROM users WHERE email = 'student@example.com')",
                 (class_data["id"],),
@@ -1447,7 +1455,7 @@ class EducationApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid_target.status_code, 400, invalid_target.get_json())
 
-        db = sqlite3.connect(str(api_v2._DB_PATH))
+        db = api_v2.connect_database()
         snapshots_before_drafts = db.execute(
             "SELECT COUNT(*) FROM education_snapshots WHERE class_id = ?",
             (class_data["id"],),
@@ -1468,7 +1476,7 @@ class EducationApiTests(unittest.TestCase):
         self.assertEqual(second_assignment.status_code, 201, second_assignment.get_json())
         self.assertEqual(first_assignment.get_json()["assignment"]["snapshotId"], snapshot["id"])
         self.assertEqual(second_assignment.get_json()["assignment"]["snapshotId"], snapshot["id"])
-        db = sqlite3.connect(str(api_v2._DB_PATH))
+        db = api_v2.connect_database()
         snapshots_after_drafts = db.execute(
             "SELECT COUNT(*) FROM education_snapshots WHERE class_id = ?",
             (class_data["id"],),
@@ -1479,20 +1487,27 @@ class EducationApiTests(unittest.TestCase):
     def test_teacher_deletes_same_source_snapshot_group_with_all_learning_records(self):
         class_data, snapshot_data, published_assignment = self._create_published_assignment()
         duplicate_snapshot_id = "duplicate-snapshot"
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute(
                 "UPDATE education_snapshots SET source_graph_id = ? WHERE id = ?",
                 ("shared-course-graph", snapshot_data["id"]),
             )
             connection.execute(
                 """INSERT INTO education_snapshots
-                     (id, class_id, source_graph_id, filename, nodes_json, edges_json,
-                      source_markdown, latex_macros_json, source_pdf_json, created_by, created_at)
-                   SELECT ?, class_id, source_graph_id, filename, nodes_json, edges_json,
-                          source_markdown, latex_macros_json, source_pdf_json, created_by, ?
+                     (id, class_id, source_graph_id, filename, node_count, edge_count,
+                      source_markdown, latex_macros_json, source_pdf_json, created_by, created_at, snapshot_type)
+                   SELECT ?, class_id, source_graph_id, filename, node_count, edge_count,
+                          source_markdown, latex_macros_json, source_pdf_json, created_by, ?, snapshot_type
                      FROM education_snapshots WHERE id = ?""",
                 (duplicate_snapshot_id, "2026-08-12T00:00:00", snapshot_data["id"]),
             )
+        source_graph = api_v2.load_stored_graph(snapshot_data["id"])
+        api_v2.persist_graph(
+            duplicate_snapshot_id,
+            "education_snapshot",
+            source_graph["nodes"],
+            source_graph["edges"],
+        )
 
         draft = self.client.post(
             f"/api/v2/edu/classes/{class_data['id']}/assignments",
@@ -1524,7 +1539,7 @@ class EducationApiTests(unittest.TestCase):
         )
         self.assertEqual(progress.status_code, 200, progress.get_json())
 
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             teacher_id = connection.execute("SELECT id FROM users WHERE email = ?", (self.TEACHER_EMAIL,)).fetchone()[0]
             student_id = connection.execute("SELECT id FROM users WHERE email = ?", ("student@example.com",)).fetchone()[0]
             connection.execute("UPDATE education_assignments SET status = 'archived' WHERE id = ?", (archived_id,))
@@ -1593,7 +1608,7 @@ class EducationApiTests(unittest.TestCase):
         self.assertEqual(deleted.get_json()["deletedAssignmentCount"], 3)
         self.assertEqual(deleted.get_json()["cleanupWarnings"], [])
 
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_snapshots WHERE source_graph_id = 'shared-course-graph'").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_snapshots WHERE id = ?", (other_snapshot_id,)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_assignments WHERE id IN (?, ?, ?)", (published_assignment["id"], draft_id, archived_id)).fetchone()[0], 0)
@@ -1646,22 +1661,19 @@ class EducationApiTests(unittest.TestCase):
         (source_dir / "source.tex").write_text("\\documentclass{article}", encoding="utf-8")
         (source_dir / "compile.log").write_text("ok", encoding="utf-8")
 
-        db = sqlite3.connect(str(api_v2._DB_PATH))
+        db = api_v2.connect_database()
         teacher_id = db.execute("SELECT id FROM users WHERE email = ?", (self.TEACHER_EMAIL,)).fetchone()[0]
         now = "2026-08-11T00:00:00"
         db.execute(
             """INSERT INTO history
-                 (id, user_id, filename, node_count, edge_count, nodes_json, edges_json,
-                  source_pdf_json, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'done', ?)""",
+                 (id, user_id, filename, node_count, edge_count, source_pdf_json, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'done', ?)""",
             (
                 job_id,
                 teacher_id,
                 "chapter.tex",
                 len(NODES),
                 len(EDGES),
-                json.dumps(NODES, ensure_ascii=False),
-                json.dumps(EDGES, ensure_ascii=False),
                 json.dumps({
                     "status": "ready",
                     "available": True,
@@ -1674,6 +1686,7 @@ class EducationApiTests(unittest.TestCase):
         )
         db.commit()
         db.close()
+        api_v2.persist_graph(job_id, "history", NODES, EDGES)
 
         snapshot = self.client.post(
             f"/api/v2/edu/classes/{class_data['id']}/snapshots",
@@ -1888,7 +1901,7 @@ class EducationApiTests(unittest.TestCase):
         teacher_classes = self.client.get("/api/v2/edu/classes", headers=self._headers(self.teacher))
         self.assertEqual(teacher_classes.status_code, 200)
         self.assertEqual(teacher_classes.get_json()["classes"][0]["assignmentCount"], 0)
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             status = connection.execute(
                 "SELECT status FROM education_assignments WHERE id = ?",
                 (assignment_data["id"],),
@@ -2026,7 +2039,7 @@ class EducationApiTests(unittest.TestCase):
             self.client.get("/api/v2/edu/classes", headers=self._headers(self.teacher)).get_json()["classes"],
             [],
         )
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             archived_at = connection.execute(
                 "SELECT archived_at FROM education_classes WHERE id = ?",
                 (class_data["id"],),
@@ -2046,12 +2059,21 @@ class EducationApiTests(unittest.TestCase):
         finally:
             NODES[0]["title_zh"] = "线性无关"
 
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
-            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
-        with api_v2.app.test_request_context("/"):
-            database = api_v2._get_db()
-            self.assertEqual(database.execute("PRAGMA foreign_keys").fetchone()[0], 1)
-            self.assertGreaterEqual(database.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+        health = api_v2.database_health()
+        self.assertTrue(health["ok"], health)
+        with api_v2.connect_database() as connection:
+            engine = connection.execute(
+                """SELECT engine FROM information_schema.tables
+                     WHERE table_schema = DATABASE() AND table_name = 'education_snapshots'"""
+            ).fetchone()[0]
+            forbidden = connection.execute(
+                """SELECT COUNT(*) FROM information_schema.columns
+                     WHERE table_schema = DATABASE()
+                       AND table_name = 'education_snapshots'
+                       AND column_name IN ('nodes_json', 'edges_json')"""
+            ).fetchone()[0]
+        self.assertEqual(engine, "InnoDB")
+        self.assertEqual(forbidden, 0)
 
     def test_student_proof_context_propagates_is_idempotent_and_can_be_corrected(self):
         _class_data, _snapshot_data, assignment = self._create_published_assignment()
@@ -2125,8 +2147,12 @@ class EducationApiTests(unittest.TestCase):
         self.assertEqual(related_context[0]["kind"], "understanding")
         self.assertEqual(prerequisite.get_json()["contextPreview"]["masteryState"], "unknown")
 
+        with api_v2.connect_database() as connection:
+            student_user_id = connection.execute(
+                "SELECT id FROM users WHERE email = ?", ("student@example.com",)
+            ).fetchone()[0]
         teacher_summary = self.client.get(
-            f"/api/v2/edu/assignments/{assignment['id']}/students/2/context-summary",
+            f"/api/v2/edu/assignments/{assignment['id']}/students/{student_user_id}/context-summary",
             headers=self._headers(self.teacher),
         )
         self.assertEqual(teacher_summary.status_code, 200, teacher_summary.get_json())
@@ -2145,7 +2171,7 @@ class EducationApiTests(unittest.TestCase):
             headers=self._headers(self.student),
         )
         self.assertEqual(after.get_json()["contextPreview"]["relatedRisks"], [])
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM learning_interactions").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM learning_evidence_feedback").fetchone()[0], 1)
 
@@ -2177,7 +2203,7 @@ class EducationApiTests(unittest.TestCase):
         self.assertEqual(response.get_json()["response"], "先检查这一步是否使用了定理条件。")
         self.assertEqual(response.get_json()["classificationStatus"], "pending")
         self.assertEqual(response.get_json()["stateChanges"], [])
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             event = connection.execute(
                 "SELECT id, user_proof, assistant_response, classification_status FROM learning_interactions"
             ).fetchone()
@@ -2194,9 +2220,7 @@ class EducationApiTests(unittest.TestCase):
             "severity": "medium",
             "relatedNodeIds": [1],
         }]
-        connection = sqlite3.connect(str(api_v2._DB_PATH))
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
+        connection = api_v2.connect_database()
         with patch.object(
             student_context,
             "run_structured_education_tasks",
@@ -2292,7 +2316,7 @@ class EducationApiTests(unittest.TestCase):
             responses[-1]["stateChanges"][1]["evidenceId"],
             [item["id"] for item in body["contextPreview"]["openGaps"]],
         )
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             interaction_rows = connection.execute(
                 "SELECT user_proof, context_snapshot_json FROM learning_interactions ORDER BY created_at"
             ).fetchall()
@@ -2389,7 +2413,7 @@ class EducationApiTests(unittest.TestCase):
         self.assertEqual(empty_export.status_code, 200, empty_export.get_json())
         self.assertEqual(empty_export.get_json()["interactions"], [])
         self.assertEqual(empty_export.get_json()["nodeModels"], [])
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM learning_interactions").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM learning_evidence").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM student_node_models").fetchone()[0], 0)
@@ -2419,7 +2443,7 @@ class EducationApiTests(unittest.TestCase):
         )
         self.assertEqual(second_assignment.status_code, 201, second_assignment.get_json())
         second_id = second_assignment.get_json()["assignment"]["id"]
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute(
                 "UPDATE education_assessment_nodes SET status = 'exempt' WHERE assignment_id = ?",
                 (second_id,),
@@ -2434,7 +2458,7 @@ class EducationApiTests(unittest.TestCase):
             headers=self._headers(self.student),
         )
         self.assertEqual(second.status_code, 200, second.get_json())
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             identity_count = connection.execute(
                 "SELECT COUNT(*) FROM education_node_identities WHERE class_id = ?",
                 (class_data["id"],),
@@ -2454,7 +2478,7 @@ class EducationApiTests(unittest.TestCase):
             headers=self._headers(self.student),
         )
         self.assertEqual(other.status_code, 200, other.get_json())
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             first_ids = {
                 row[0] for row in connection.execute(
                     "SELECT id FROM education_node_identities WHERE class_id = ?", (class_data["id"],)
@@ -2492,7 +2516,7 @@ class EducationApiTests(unittest.TestCase):
             legacy = self.client.post("/api/v2/proof-assist", json=legacy_payload)
         self.assertEqual(legacy.status_code, 200, legacy.get_json())
         self.assertEqual(legacy.get_json()["response"], "只给出单节点提示")
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM learning_interactions").fetchone()[0], 0)
 
     def test_published_historical_reference_can_be_supplemented_before_grading(self):
@@ -2508,7 +2532,7 @@ class EducationApiTests(unittest.TestCase):
             headers=self._headers(self.student),
         ).get_json()["submission"]
         question = assignment["assessments"][0]["questions"][0]
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             row = connection.execute(
                 "SELECT snapshot_json FROM education_assignment_submissions WHERE id = ?",
                 (submission["id"],),
@@ -2755,7 +2779,7 @@ class EducationApiTests(unittest.TestCase):
     def test_graph_assignment_still_requires_scoring_points(self):
         _class_data, _snapshot, assignment = self._create_draft_assignment_with_assessments()
         question = assignment["assessments"][0]["questions"][0]
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute(
                 "UPDATE education_assessment_questions SET expected_points_json = ? WHERE id = ?",
                 (json.dumps([], ensure_ascii=False), question["id"]),
@@ -2900,7 +2924,7 @@ class EducationApiTests(unittest.TestCase):
         self.assertEqual(assignments.status_code, 200, assignments.get_json())
         self.assertNotIn(assignment_id, [item["id"] for item in assignments.get_json()["assignments"]])
 
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_snapshots WHERE id = ?", (snapshot_id,)).fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_assignment_sources WHERE assignment_id = ?", (assignment_id,)).fetchone()[0], 0)
@@ -3036,7 +3060,7 @@ class EducationApiTests(unittest.TestCase):
         self.assertTrue(all(question["questions"][0]["expectedPoints"] == [] for question in inserted_assignment["assessments"]))
 
         first_question = inserted_assignment["assessments"][0]["questions"][0]
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute(
                 "UPDATE education_assessment_questions SET max_score = 10 WHERE id = ?",
                 (first_question["id"],),
@@ -3048,7 +3072,7 @@ class EducationApiTests(unittest.TestCase):
         )
         self.assertEqual(wrong_total.status_code, 409, wrong_total.get_json())
         self.assertEqual(wrong_total.get_json()["code"], "assessment_scoring_required")
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute(
                 "UPDATE education_assessment_questions SET max_score = ? WHERE id = ?",
                 (first_question["maxScore"], first_question["id"]),
@@ -3164,9 +3188,140 @@ class EducationApiTests(unittest.TestCase):
         )
         self.assertEqual(released.status_code, 200, released.get_json())
 
+    def test_bulk_ai_grading_uses_one_identity_bound_task_per_student(self):
+        created = self.client.post(
+            "/api/v2/edu/classes",
+            json={"title": "Bulk grading course"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        class_data = created.get_json()["class"]
+        second_student = self._register("bulk-second@example.com")
+        for token, name, number in (
+            (self.student, "Bulk first", "B001"),
+            (second_student, "Bulk second", "B002"),
+        ):
+            joined = self.client.post(
+                f"/api/v2/edu/classes/{class_data['inviteCode']}/join",
+                json={"inviteCode": class_data["inviteCode"], "studentName": name, "studentNumber": number},
+                headers=self._headers(token),
+            )
+            self.assertEqual(joined.status_code, 200, joined.get_json())
+
+        created_assignment = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/assignments/direct",
+            data={
+                "title": "Bulk direct grading",
+                "questions": json.dumps([
+                    {"order": 1, "question": "第一题", "referenceAnswer": "答案一", "maxScore": 50},
+                    {"order": 2, "question": "第二题", "referenceAnswer": "答案二", "maxScore": 50},
+                ], ensure_ascii=False),
+            },
+            content_type="multipart/form-data",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(created_assignment.status_code, 201, created_assignment.get_json())
+        assignment = created_assignment.get_json()["assignment"]
+        published = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+
+        submissions = []
+        for token, answer_prefix in ((self.student, "first-student"), (second_student, "second-student")):
+            for assessment in assignment["assessments"]:
+                started = self.client.post(
+                    f"/api/v2/edu/assignments/{assignment['id']}/assessments/{assessment['nodeId']}/attempts",
+                    headers=self._headers(token),
+                )
+                self.assertEqual(started.status_code, 201, started.get_json())
+                attempt = started.get_json()["attempt"]
+                completed = self.client.post(
+                    f"/api/v2/edu/assessment-attempts/{attempt['id']}/complete",
+                    json={"answers": {question["id"]: f"{answer_prefix}:{question['id']}" for question in attempt["questions"]}},
+                    headers=self._headers(token),
+                )
+                self.assertEqual(completed.status_code, 200, completed.get_json())
+            submitted = self.client.post(
+                f"/api/v2/edu/assignments/{assignment['id']}/submissions",
+                headers=self._headers(token),
+            )
+            self.assertEqual(submitted.status_code, 201, submitted.get_json())
+            submissions.append(submitted.get_json()["submission"])
+
+        expected_identity_by_submission = {
+            submissions[0]["id"]: (submissions[0]["userId"], "first-student"),
+            submissions[1]["id"]: (submissions[1]["userId"], "second-student"),
+        }
+
+        forbidden = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/submissions/evaluate",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(forbidden.status_code, 403, forbidden.get_json())
+
+        captured = {}
+        def fake_bulk_grading(**kwargs):
+            captured.update(kwargs)
+            output = {}
+            for task_key, task in reversed(list(kwargs["tasks"].items())):
+                answers = {question["studentAnswer"].split(":", 1)[0] for question in task["questions"]}
+                expected_user_id, expected_prefix = expected_identity_by_submission[task["submissionId"]]
+                self.assertEqual(task["studentUserId"], expected_user_id)
+                self.assertEqual(answers, {expected_prefix})
+                score = 11.0 if expected_prefix == "first-student" else 22.0
+                grades = [{
+                    "questionId": question["questionId"],
+                    "suggestedScore": score,
+                    "maxScore": question["maxScore"],
+                    "rationale": f"{answers.pop()} grading",
+                    "correctPoints": [],
+                    "issues": [],
+                    "studentFeedback": "feedback",
+                    "confidence": 0.8,
+                    "needsTeacherReview": False,
+                } for question in reversed(task["questions"])]
+                output[task_key] = {
+                    "submissionId": task["submissionId"],
+                    "studentUserId": task["studentUserId"],
+                    "grades": grades,
+                }
+            return output
+
+        with patch.object(api_v2, "_education_ai_tasks", side_effect=fake_bulk_grading) as runner:
+            evaluated = self.client.post(
+                f"/api/v2/edu/assignments/{assignment['id']}/submissions/evaluate",
+                headers=self._headers(self.teacher),
+            )
+        self.assertEqual(evaluated.status_code, 200, evaluated.get_json())
+        self.assertEqual(evaluated.get_json()["evaluatedCount"], 2)
+        self.assertEqual(evaluated.get_json()["failedCount"], 0)
+        runner.assert_called_once()
+        self.assertEqual(captured["task_kind"], "grade_submission")
+        self.assertEqual(len(captured["tasks"]), 2)
+        for task_key, task in captured["tasks"].items():
+            self.assertIn(task["submissionId"], task_key)
+            self.assertIn(str(task["studentUserId"]), task_key)
+
+        expected_totals = {
+            submissions[0]["id"]: 22.0,
+            submissions[1]["id"]: 44.0,
+        }
+        for submission_id, expected_total in expected_totals.items():
+            detail = self.client.get(
+                f"/api/v2/edu/submissions/{submission_id}",
+                headers=self._headers(self.teacher),
+            )
+            self.assertEqual(detail.status_code, 200, detail.get_json())
+            payload = detail.get_json()["submission"]
+            self.assertEqual(payload["aiStatus"], "ready")
+            self.assertEqual(payload["aiSuggestedTotal"], expected_total)
+            self.assertTrue(all(grade["aiSuggestedScore"] == expected_total / 2 for grade in payload["grades"]))
+
     def test_class_statistics_matrix_and_xlsx_export(self):
         class_data, _snapshot, assignment = self._create_draft_assignment_with_assessments()
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute("UPDATE education_assignments SET assignment_type = 'direct' WHERE id = ?", (assignment["id"],))
             connection.commit()
         published = self.client.post(
@@ -3219,7 +3374,7 @@ class EducationApiTests(unittest.TestCase):
             self.assertIn("A001", student_sheet)
             self.assertIn("待批改", student_sheet)
 
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute("UPDATE education_assignment_submissions SET status = 'review_draft' WHERE id = ?", (submission_id,))
             connection.commit()
         review_draft = self.client.get(
@@ -3229,7 +3384,7 @@ class EducationApiTests(unittest.TestCase):
         self.assertEqual(review_draft.status_code, 200, review_draft.get_json())
         self.assertEqual(review_draft.get_json()["students"][0]["assignments"][assignment["id"]]["status"], "review_draft")
 
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute(
                 "UPDATE education_assignment_submissions SET status = 'finalized', teacher_total = 85 WHERE id = ?",
                 (submission_id,),
@@ -3292,7 +3447,7 @@ class EducationApiTests(unittest.TestCase):
             assignment_sheet = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
             self.assertIn("Assessment task", assignment_sheet)
 
-        with sqlite3.connect(str(api_v2._DB_PATH)) as connection:
+        with api_v2.connect_database() as connection:
             connection.execute(
                 "UPDATE education_memberships SET removed_at = CURRENT_TIMESTAMP WHERE class_id = ? AND user_id = ?",
                 (class_data["id"], student_id),
@@ -3303,6 +3458,531 @@ class EducationApiTests(unittest.TestCase):
             headers=self._headers(self.teacher),
         )
         self.assertEqual(removed_student_export.status_code, 404, removed_student_export.get_json())
+
+
+    def test_game_settings_summary_and_permissions(self):
+        class_data, _snapshot, _assignment = self._create_published_assignment()
+
+        classic_student = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/game-summary",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(classic_student.status_code, 200, classic_student.get_json())
+        classic_payload = classic_student.get_json()
+        self.assertFalse(classic_payload["enabled"])
+        self.assertIsNone(classic_payload["profile"])
+        self.assertEqual(classic_payload["achievements"], [])
+        self.assertEqual(classic_payload["settings"]["studentExperience"], "classic")
+        self.assertEqual(classic_payload["settings"]["weeklyXpGoal"], 60)
+        self.assertEqual(classic_payload["settings"]["timezone"], "Asia/Shanghai")
+
+        teacher_view = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/game-summary",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(teacher_view.status_code, 200, teacher_view.get_json())
+        self.assertIsNone(teacher_view.get_json()["profile"])
+        self.assertEqual(teacher_view.get_json()["achievements"], [])
+
+        student_update = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+            json={"studentExperience": "map"},
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(student_update.status_code, 403, student_update.get_json())
+
+        invalid_goal = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+            json={"weeklyXpGoal": True},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(invalid_goal.status_code, 400, invalid_goal.get_json())
+        invalid_timezone = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+            json={"timezone": "UTC"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(invalid_timezone.status_code, 400, invalid_timezone.get_json())
+
+        teacher_update = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+            json={"studentExperience": "map", "weeklyXpGoal": 75},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(teacher_update.status_code, 200, teacher_update.get_json())
+        self.assertEqual(teacher_update.get_json()["settings"]["weeklyXpGoal"], 75)
+
+        mapped_student = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/game-summary",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(mapped_student.status_code, 200, mapped_student.get_json())
+        mapped_payload = mapped_student.get_json()
+        self.assertTrue(mapped_payload["enabled"])
+        self.assertEqual(mapped_payload["profile"]["level"], 1)
+        self.assertEqual(mapped_payload["profile"]["totalXp"], 0)
+        self.assertEqual(len(mapped_payload["achievements"]), 6)
+        self.assertTrue(all(not item["unlocked"] for item in mapped_payload["achievements"]))
+
+    def test_game_settings_fall_back_when_iana_timezone_data_is_missing(self):
+        class_data, _snapshot, _assignment = self._create_published_assignment()
+
+        with patch.object(
+            education_gamification,
+            "ZoneInfo",
+            side_effect=education_gamification.ZoneInfoNotFoundError("tzdata unavailable"),
+        ):
+            enabled = self.client.patch(
+                f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+                json={"studentExperience": "map"},
+                headers=self._headers(self.teacher),
+            )
+            self.assertEqual(enabled.status_code, 200, enabled.get_json())
+
+            summary = self.client.get(
+                f"/api/v2/edu/classes/{class_data['id']}/game-summary",
+                headers=self._headers(self.student),
+            )
+            self.assertEqual(summary.status_code, 200, summary.get_json())
+            self.assertTrue(summary.get_json()["enabled"])
+            self.assertEqual(summary.get_json()["settings"]["timezone"], "Asia/Shanghai")
+
+    def test_map_assessment_reward_is_idempotent_and_classic_is_silent(self):
+        class_data, _snapshot, assignment = self._create_draft_assignment_with_assessments()
+        enabled = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+            json={"studentExperience": "map"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(enabled.status_code, 200, enabled.get_json())
+        published = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+
+        started = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/assessments/1/attempts",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(started.status_code, 201, started.get_json())
+        attempt = started.get_json()["attempt"]
+        answers = {question["id"]: "学生答案" for question in attempt["questions"]}
+        completed = self.client.post(
+            f"/api/v2/edu/assessment-attempts/{attempt['id']}/complete",
+            json={"answers": answers},
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(completed.status_code, 200, completed.get_json())
+        self.assertEqual(completed.get_json()["reward"]["xpDelta"], 10)
+        self.assertEqual(completed.get_json()["reward"]["totalXp"], 10)
+        self.assertIn("first_step", [item["key"] for item in completed.get_json()["reward"]["unlockedAchievements"]])
+
+        repeated = self.client.post(
+            f"/api/v2/edu/assessment-attempts/{attempt['id']}/complete",
+            json={"answers": answers},
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.get_json())
+        self.assertEqual(repeated.get_json()["reward"]["xpDelta"], 0)
+        self.assertEqual(repeated.get_json()["reward"]["totalXp"], 10)
+
+        with api_v2.connect_database() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM education_game_events WHERE class_id = ?",
+                    (class_data["id"],),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_map_graph_submission_rewards_and_unlocks_route_achievements(self):
+        class_data, _snapshot, assignment = self._create_draft_assignment_with_assessments()
+        enabled = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+            json={"studentExperience": "map"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(enabled.status_code, 200, enabled.get_json())
+        published = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        due = self.client.patch(
+            f"/api/v2/edu/assignments/{assignment['id']}",
+            json={"dueAt": "2099-01-01T00:00:00Z"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(due.status_code, 200, due.get_json())
+
+        attempts = self._complete_all_assignment_assessments(assignment)
+        self.assertEqual(len(attempts), 3)
+        submitted = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/submissions",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(submitted.status_code, 201, submitted.get_json())
+        reward = submitted.get_json()["reward"]
+        self.assertEqual(reward["xpDelta"], 30)
+        self.assertEqual(reward["totalXp"], 60)
+        self.assertEqual(
+            {item["key"] for item in reward["unlockedAchievements"]},
+            {"pathfinder", "on_time", "full_route"},
+        )
+
+        repeated = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/submissions",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.get_json())
+        self.assertEqual(repeated.get_json()["reward"]["xpDelta"], 0)
+        self.assertEqual(repeated.get_json()["reward"]["totalXp"], 60)
+
+        with api_v2.connect_database() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM education_game_events WHERE class_id = ?",
+                    (class_data["id"],),
+                ).fetchone()[0],
+                5,
+            )
+
+    def test_direct_submission_unlocks_challenge_achievement(self):
+        created = self.client.post(
+            "/api/v2/edu/classes",
+            json={"title": "Direct game course"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        class_data = created.get_json()["class"]
+        joined = self.client.post(
+            f"/api/v2/edu/classes/{class_data['inviteCode']}/join",
+            json={"inviteCode": class_data["inviteCode"], "studentName": "Game student", "studentNumber": "G001"},
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(joined.status_code, 200, joined.get_json())
+        direct = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/assignments/direct",
+            data={
+                "title": "Direct game challenge",
+                "questions": json.dumps([
+                    {"order": 1, "question": "第一题", "referenceAnswer": "答案1", "maxScore": 50},
+                    {"order": 2, "question": "第二题", "referenceAnswer": "答案2", "maxScore": 50},
+                ], ensure_ascii=False),
+            },
+            content_type="multipart/form-data",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(direct.status_code, 201, direct.get_json())
+        assignment = direct.get_json()["assignment"]
+        enabled = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+            json={"studentExperience": "map"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(enabled.status_code, 200, enabled.get_json())
+        published = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+
+        self._complete_all_assignment_assessments(assignment)
+        submitted = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/submissions",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(submitted.status_code, 201, submitted.get_json())
+        reward = submitted.get_json()["reward"]
+        self.assertEqual(reward["xpDelta"], 20)
+        self.assertEqual(reward["totalXp"], 40)
+        keys = {item["key"] for item in reward["unlockedAchievements"]}
+        self.assertIn("challenge_clear", keys)
+        self.assertNotIn("full_route", keys)
+
+    def test_classic_history_backfills_once_when_map_is_enabled(self):
+        class_data, _snapshot, assignment = self._create_draft_assignment_with_assessments()
+        published = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/publish",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(published.status_code, 200, published.get_json())
+        due = self.client.patch(
+            f"/api/v2/edu/assignments/{assignment['id']}",
+            json={"dueAt": "2099-01-01T00:00:00Z"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(due.status_code, 200, due.get_json())
+        self._complete_all_assignment_assessments(assignment)
+        submitted = self.client.post(
+            f"/api/v2/edu/assignments/{assignment['id']}/submissions",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(submitted.status_code, 201, submitted.get_json())
+        self.assertIsNone(submitted.get_json()["reward"])
+        cleared_due = self.client.patch(
+            f"/api/v2/edu/assignments/{assignment['id']}",
+            json={"dueAt": None},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(cleared_due.status_code, 200, cleared_due.get_json())
+
+        with api_v2.connect_database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_game_events").fetchone()[0], 0)
+
+        enabled = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+            json={"studentExperience": "map"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(enabled.status_code, 200, enabled.get_json())
+        summary = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/game-summary",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(summary.status_code, 200, summary.get_json())
+        self.assertEqual(summary.get_json()["profile"]["totalXp"], 60)
+        self.assertIn("pathfinder", [item["key"] for item in summary.get_json()["achievements"] if item["unlocked"]])
+
+        repeated = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/game-settings",
+            json={"studentExperience": "map"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.get_json())
+        with api_v2.connect_database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM education_game_events").fetchone()[0], 5)
+
+    def test_game_profile_uses_class_timezone_and_three_week_streak(self):
+        class_data, _snapshot, assignment = self._create_published_assignment()
+        with api_v2.connect_database() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE email = ?", ("student@example.com",)
+            ).fetchone()[0]
+            events = []
+            event_index = 0
+            for week_start in ("2026-08-17T16:00:00Z", "2026-08-24T16:00:00Z", "2026-08-31T16:00:00Z"):
+                base = datetime.fromisoformat(week_start.replace("Z", "+00:00"))
+                for offset in range(6):
+                    occurred = (base.replace(minute=offset)).isoformat().replace("+00:00", "Z")
+                    events.append((
+                        f"profile-event-{event_index}",
+                        class_data["id"],
+                        user_id,
+                        assignment["id"],
+                        "assessment_complete",
+                        f"profile-event-key-{event_index}",
+                        10,
+                        occurred,
+                        "{}",
+                        occurred,
+                    ))
+                    event_index += 1
+            connection.executemany(
+                """INSERT INTO education_game_events
+                     (id, class_id, user_id, assignment_id, event_type, event_key,
+                      xp_delta, occurred_at, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                events,
+            )
+            connection.commit()
+
+        profile_db = api_v2.connect_database()
+        profile = education_gamification.build_game_profile(
+            profile_db,
+            class_id=class_data["id"],
+            user_id=user_id,
+            weekly_goal=60,
+            timezone_name="Asia/Shanghai",
+            now_utc=datetime(2026, 9, 1, 12, tzinfo=timezone.utc),
+        )
+        self.assertEqual(profile["totalXp"], 180)
+        self.assertEqual(profile["level"], 2)
+        self.assertEqual(profile["levelXp"], 80)
+        self.assertEqual(profile["weeklyXp"], 60)
+        self.assertEqual(profile["activeDaysThisWeek"], 1)
+        self.assertEqual(profile["consecutiveGoalWeeks"], 3)
+        profile_db.close()
+
+    def test_course_graph_order_is_class_scoped_and_new_graphs_append(self):
+        class_data, first_snapshot, _assignment = self._create_published_assignment()
+        second = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            json={"filename": "chapter-two.tex", "nodes": NODES, "edges": EDGES, "sourceGraphId": "chapter-two"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(second.status_code, 201, second.get_json())
+        second_id = second.get_json()["snapshot"]["id"]
+
+        initial = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(initial.status_code, 200, initial.get_json())
+        initial_snapshots = initial.get_json()["snapshots"]
+        initial_ids = [item["id"] for item in initial_snapshots]
+        self.assertEqual(initial_ids, [first_snapshot["id"], second_id])
+        self.assertEqual([item["courseOrder"] for item in initial_snapshots], [0, 1])
+
+        reordered = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/course-graph-order",
+            json={"graphIds": [second_id, first_snapshot["id"]], "knownGraphIds": initial_ids},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(reordered.status_code, 200, reordered.get_json())
+        self.assertEqual([item["id"] for item in reordered.get_json()["snapshots"]], [second_id, first_snapshot["id"]])
+        self.assertEqual([item["courseOrder"] for item in reordered.get_json()["snapshots"]], [0, 1])
+
+        student_view = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            headers=self._headers(self.student),
+        )
+        self.assertEqual(student_view.status_code, 200, student_view.get_json())
+        self.assertEqual([item["id"] for item in student_view.get_json()["snapshots"]], [second_id, first_snapshot["id"]])
+
+        third = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            json={"filename": "chapter-three.tex", "nodes": NODES, "edges": EDGES, "sourceGraphId": "chapter-three"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(third.status_code, 201, third.get_json())
+        third_id = third.get_json()["snapshot"]["id"]
+        appended = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual([item["id"] for item in appended.get_json()["snapshots"]], [second_id, first_snapshot["id"], third_id])
+        self.assertEqual([item["courseOrder"] for item in appended.get_json()["snapshots"]], [0, 1, 2])
+
+    def test_course_graph_order_rejects_invalid_access_and_detects_a_stale_collection(self):
+        class_data, first_snapshot, _assignment = self._create_published_assignment()
+        second = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            json={"filename": "chapter-two.tex", "nodes": NODES, "edges": EDGES},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(second.status_code, 201, second.get_json())
+        second_id = second.get_json()["snapshot"]["id"]
+        ids = [first_snapshot["id"], second_id]
+        endpoint = f"/api/v2/edu/classes/{class_data['id']}/course-graph-order"
+
+        student = self.client.patch(endpoint, json={"graphIds": ids}, headers=self._headers(self.student))
+        self.assertEqual(student.status_code, 403, student.get_json())
+        outsider = self.client.patch(endpoint, json={"graphIds": ids}, headers=self._headers(self.outsider))
+        self.assertEqual(outsider.status_code, 404, outsider.get_json())
+        missing = self.client.patch(endpoint, json={"graphIds": [first_snapshot["id"]]}, headers=self._headers(self.teacher))
+        self.assertEqual(missing.status_code, 400, missing.get_json())
+
+        with api_v2.connect_database() as connection:
+            teacher_id = connection.execute(
+                "SELECT id FROM users WHERE email = ?", (self.TEACHER_EMAIL,)
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO education_snapshots
+                     (id, class_id, snapshot_type, source_graph_id, filename, node_count, edge_count,
+                      source_markdown, latex_macros_json, source_pdf_json, created_by, created_at)
+                   VALUES (?, ?, 'direct', NULL, ?, 1, 0, '', '{}', NULL, ?, ?)""",
+                ("direct-order-test", class_data["id"], "direct-order-test", teacher_id, datetime.utcnow().isoformat()),
+            )
+        invalid = self.client.patch(
+            endpoint,
+            json={"graphIds": [first_snapshot["id"], "direct-order-test"]},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(invalid.status_code, 400, invalid.get_json())
+
+        third = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            json={"filename": "chapter-three.tex", "nodes": NODES, "edges": EDGES},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(third.status_code, 201, third.get_json())
+        current_ids = [first_snapshot["id"], second_id, third.get_json()["snapshot"]["id"]]
+        stale = self.client.patch(
+            endpoint,
+            json={"graphIds": current_ids, "knownGraphIds": ids},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(stale.status_code, 409, stale.get_json())
+        self.assertEqual(stale.get_json()["code"], "course_graph_order_conflict")
+
+    def test_course_graph_order_groups_source_graph_revisions_and_cleans_up_after_delete(self):
+        class_data, first_snapshot, _assignment = self._create_published_assignment()
+        second = self.client.post(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            json={"filename": "same-source.tex", "nodes": NODES, "edges": EDGES, "sourceGraphId": "chapter-source"},
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(second.status_code, 201, second.get_json())
+        source_snapshot_id = second.get_json()["snapshot"]["id"]
+        with api_v2.connect_database() as connection:
+            teacher_id = connection.execute(
+                "SELECT id FROM users WHERE email = ?", (self.TEACHER_EMAIL,)
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO education_snapshots
+                     (id, class_id, snapshot_type, source_graph_id, filename, node_count, edge_count,
+                      source_markdown, latex_macros_json, source_pdf_json, created_by, created_at)
+                   VALUES (?, ?, 'graph', ?, ?, 3, 2, '', '{}', NULL, ?, ?)""",
+                ("older-source-revision", class_data["id"], "chapter-source", "same-source-old.tex", teacher_id, "2026-01-01T00:00:00"),
+            )
+        api_v2.persist_graph("older-source-revision", "education_snapshot", NODES, EDGES)
+        listed = self.client.get(
+            f"/api/v2/edu/classes/{class_data['id']}/snapshots",
+            headers=self._headers(self.teacher),
+        )
+        listed_snapshots = listed.get_json()["snapshots"]
+        source_rows = [item for item in listed_snapshots if item.get("sourceGraphId") == "chapter-source"]
+        self.assertEqual(len(source_rows), 2)
+        self.assertEqual({item["courseOrder"] for item in source_rows}, {1})
+
+        reordered = self.client.patch(
+            f"/api/v2/edu/classes/{class_data['id']}/course-graph-order",
+            json={
+                "graphIds": ["older-source-revision", first_snapshot["id"]],
+                "knownGraphIds": [first_snapshot["id"], "older-source-revision"],
+            },
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(reordered.status_code, 200, reordered.get_json())
+        refreshed_source_rows = [item for item in reordered.get_json()["snapshots"] if item.get("sourceGraphId") == "chapter-source"]
+        self.assertEqual({item["courseOrder"] for item in refreshed_source_rows}, {0})
+
+        deleted = self.client.delete(
+            f"/api/v2/edu/snapshots/{source_snapshot_id}",
+            headers=self._headers(self.teacher),
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.get_json())
+        with api_v2.connect_database() as connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM education_course_graph_order WHERE class_id = ? AND graph_key = ?",
+                (class_data["id"], "source:chapter-source"),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 0)
+
+    def test_alembic_class_schema_has_game_defaults(self):
+        with api_v2.connect_database() as connection:
+            columns = {
+                row["column_name"]: row["column_default"]
+                for row in connection.execute(
+                    """SELECT column_name, column_default
+                         FROM information_schema.columns
+                        WHERE table_schema = DATABASE() AND table_name = 'education_classes'"""
+                ).fetchall()
+            }
+            tables = {
+                row["table_name"]
+                for row in connection.execute(
+                    """SELECT table_name FROM information_schema.tables
+                         WHERE table_schema = DATABASE()
+                           AND table_name IN ('education_game_events', 'education_student_achievements', 'education_course_graph_order')"""
+                ).fetchall()
+            }
+        self.assertEqual(columns["student_experience"], "classic")
+        self.assertEqual(int(columns["weekly_xp_goal"]), 60)
+        self.assertEqual(columns["timezone"], "Asia/Shanghai")
+        self.assertEqual(tables, {"education_game_events", "education_student_achievements", "education_course_graph_order"})
 
 
 if __name__ == "__main__":

@@ -17,11 +17,24 @@ from pathlib import Path
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
+
+
+def _load_desktop_storage_environment() -> Path | None:
+    """Load the host-local database configuration without bundling secrets."""
+    data_dir = os.environ.get("MATHGRAPH_DATA_DIR", "").strip()
+    if not data_dir:
+        return None
+    env_path = Path(data_dir).expanduser() / "storage.env"
+    if not env_path.is_file():
+        return None
+    load_dotenv(env_path, override=False)
+    return env_path
 
 
 def _resource_path(*parts: str) -> Path:
@@ -34,15 +47,22 @@ if not FRONTEND_DIR.exists():
     FRONTEND_DIR = PROJECT_ROOT / "build" / "client"
 
 os.environ.setdefault("AI4MATH_DESKTOP", "1")
+_load_desktop_storage_environment()
 
 from api_v2 import (  # noqa: E402
     app as flask_app,
+    reconcile_interrupted_history,
 )
 from ocr_runtime import CHUNK_SIZE, IMAGE_MAX_BYTES, PDF_MAX_BYTES, OcrError, get_ocr_manager, shutdown_ocr_runtime  # noqa: E402
 
 app = FastAPI(title="MathGraph Desktop")
 
 _PARENT_EXIT_GRACE_SECONDS = 5.0
+
+
+@app.on_event("startup")
+def initialize_runtime_storage() -> None:
+    reconcile_interrupted_history()
 
 
 def _wait_for_windows_process_exit(pid: int) -> None:

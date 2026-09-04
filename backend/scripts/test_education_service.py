@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ from education_service import (
     ASSESSMENT_CORRECTION_PROMPT,
     ASSESSMENT_QUESTION_KINDS,
     ASSESSMENT_SINGLE_CORRECTION_PROMPT,
+    GRADE_SUBMISSION_PROMPT,
     PATH_CORRECTION_PROMPT,
     PATH_DATA_TEMPLATE,
     PATH_PROMPT,
@@ -23,6 +25,7 @@ from education_service import (
     merge_ai_path,
     run_structured_education_tasks,
     validate_assessment_result,
+    validate_grade_submission_result,
     validate_single_assessment_result,
     validate_path_result,
     validate_proof_context_rebuild_result,
@@ -348,6 +351,46 @@ class EducationServiceTests(unittest.TestCase):
                 )
         self.assertEqual(runner.call_args.kwargs["num_threads"], 2)
         self.assertEqual(set(runner.call_args.kwargs["index_dict"]), {"one", "two"})
+
+    def test_grade_submission_batch_uses_one_multiprocessor_task_per_student(self):
+        context = SimpleNamespace(
+            llm=Mock(), parser=SimpleNamespace(parse_dict=Mock()), num_threads=8,
+            llm_engine="api", claude_command="claude", claude_model=None,
+            claude_agent=None, claude_batch_size=2, claude_timeout_seconds=30,
+            claude_max_retries=1,
+        )
+        task_one = "submission:submission-a:user:11"
+        task_two = "submission:submission-b:user:22"
+        tasks = {
+            task_one: {"submissionId": "submission-a", "studentUserId": 11, "questions": [{"questionId": "q1"}]},
+            task_two: {"submissionId": "submission-b", "studentUserId": 22, "questions": [{"questionId": "q1"}]},
+        }
+        grade = {
+            "questionId": "q1", "suggestedScore": 8, "maxScore": 10,
+            "rationale": "评分依据", "correctPoints": [], "issues": [],
+            "studentFeedback": "继续努力", "confidence": 0.8, "needsTeacherReview": False,
+        }
+        results = {
+            task_two: {"submissionId": "submission-b", "studentUserId": 22, "grades": [grade]},
+            task_one: {"submissionId": "submission-a", "studentUserId": 11, "grades": [grade]},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("education_service.run_multiprocess_task", return_value=results) as runner:
+                actual = run_structured_education_tasks(
+                    context=context,
+                    tasks=tasks,
+                    task_kind="grade_submission",
+                    checkpoint_dir=Path(temp_dir) / "checkpoint",
+                )
+        self.assertEqual(actual, results)
+        self.assertEqual(runner.call_args.kwargs["num_threads"], 2)
+        self.assertEqual(set(runner.call_args.kwargs["index_dict"]), {task_one, task_two})
+        self.assertEqual(runner.call_args.kwargs["stage_name"], "education_grade_submission")
+        self.assertIs(runner.call_args.kwargs["prompt_template"], GRADE_SUBMISSION_PROMPT)
+        first_payload = json.loads(runner.call_args.kwargs["index_dict"][task_one]["payload"])
+        self.assertEqual((first_payload["submissionId"], first_payload["studentUserId"]), ("submission-a", 11))
+        self.assertTrue(validate_grade_submission_result(results[task_one]))
+        self.assertFalse(validate_grade_submission_result({**results[task_one], "grades": [grade, grade]}))
 
     def test_pending_proof_context_rebuild_uses_structured_batch_validation(self):
         context = SimpleNamespace(

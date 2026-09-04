@@ -1,16 +1,29 @@
 import { describe, expect, it } from "vitest";
 import {
   buildDirectImageMarkdown,
+  directQuestionEditorKey,
   findDirectQuestionImageDeletionRange,
   insertDirectTextAtSelection,
   isDirectInlineImageDataUrl,
   serializeDirectQuestionContentSegments,
+  shouldSyncDirectQuestionEditorInput,
   splitDirectQuestionContent,
 } from "./direct-question-content";
 
 const IMAGE = "data:image/png;base64,AAECAw==";
 
 describe("direct question inline images", () => {
+  it("uses a distinct editor instance for every question field", () => {
+    expect(directQuestionEditorKey("question-1", "question")).not.toBe(directQuestionEditorKey("question-2", "question"));
+    expect(directQuestionEditorKey("question-1", "question")).not.toBe(directQuestionEditorKey("question-1", "referenceAnswer"));
+  });
+
+  it("does not sync controlled content while an IME composition is active", () => {
+    expect(shouldSyncDirectQuestionEditorInput(true, false)).toBe(false);
+    expect(shouldSyncDirectQuestionEditorInput(false, true)).toBe(false);
+    expect(shouldSyncDirectQuestionEditorInput(false, false)).toBe(true);
+  });
+
   it("builds a safe markdown image from a data URL", () => {
     expect(buildDirectImageMarkdown("题目[1].png", IMAGE)).toBe(`![题目 1 .png](${IMAGE})`);
     expect(isDirectInlineImageDataUrl(IMAGE)).toBe(true);

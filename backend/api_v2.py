@@ -29,13 +29,14 @@ import time
 import traceback
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, g, has_app_context, jsonify, request, send_file
 from flask_cors import CORS
-from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from werkzeug.security import check_password_hash, generate_password_hash
 
 _BACKEND = Path(__file__).parent
 sys.path.insert(0, str(_BACKEND))
@@ -57,7 +58,6 @@ from matrix_flow.runner import MatrixFlowRunner
 from matrix_flow.grading import analyze_matrix_answer
 from pipeline.stages.build_relations.stage import get_embedding
 from tex_macros import extract_latex_macros, merge_latex_macros
-from education_teacher_accounts import TEACHER_ACCOUNTS
 from JoinAgent import SimpleLLM
 from education_service import (
     ASSESSMENT_QUESTION_KINDS,
@@ -69,7 +69,20 @@ from education_service import (
     run_structured_education_tasks,
     validate_direct_scoring_standard_result,
 )
-from student_context import context_preview, run_structured_proof_assist
+import education_gamification as education_game
+from student_context import (
+    build_student_context_overview,
+    build_student_context_packet,
+    build_teacher_context_summary,
+    context_preview,
+    delete_student_context,
+    export_student_context,
+    load_idempotent_result,
+    run_structured_proof_assist,
+    save_interaction_result,
+    store_interaction_with_evidence,
+    update_evidence_status,
+)
 from ocr_runtime import (
     CHUNK_SIZE,
     IMAGE_MAX_BYTES,
@@ -77,42 +90,28 @@ from ocr_runtime import (
     OcrError,
     get_ocr_manager,
 )
-from services.auth_service import (
-    AuthService,
-    DuplicateEmailError,
-    InvalidCredentialsError,
-    PasswordPolicyError,
+from storage.database import (
+    DatabaseConfigurationError,
+    IntegrityError,
+    close_request_database,
+    connect_database,
+    database_health,
+    get_database,
 )
-from services.education_access_service import (
-    EducationAccessError,
-    EducationAccessService,
+from storage.graph_service import (
+    GraphUnavailableError,
+    complete_graph_delete,
+    load_graph as load_stored_graph,
+    persist_graph,
+    prepare_graph_delete,
 )
-from storage.auth_repository import AuthRepository
-from storage.assessment_repository import AssessmentRepository
-from storage.database import get_engine
-from storage.education_repository import (
-    ClassRoleConflictError,
-    EducationRepository,
-    MembershipRemovedError,
-    StudentNumberConflictError,
-)
-from storage.learning_repository import JobSnapshot, LearningRepository
-from storage.student_context_repository import StudentContextRepository
+from integrations.neo4j_handler import GraphStoreError, get_graph_store
+from storage.secrets import decrypt_secret, encrypt_secret, session_token_hash
 
 app = Flask(__name__)
 CORS(app)
 
-_auth_repository = AuthRepository()
-_auth_service = AuthService(_auth_repository)
-_learning_repository = LearningRepository()
-_education_repository = EducationRepository()
-_education_access_service = EducationAccessService(_education_repository)
-_assessment_repository = AssessmentRepository()
-_student_context_repository = StudentContextRepository()
-_teacher_sync_lock = threading.Lock()
-_teacher_sync_engine_id: int | None = None
-
-# ── Persistent storage paths ────────────────────────────────────────────────
+# ── MySQL business storage / Neo4j graph storage ─────────────────────────────
 
 _DATA_ROOT = Path(os.environ.get("MATHGRAPH_DATA_DIR", str(Path(__file__).parent))).expanduser()
 _DATA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -152,664 +151,68 @@ def _stored_source_pdf_meta(meta: dict | None) -> dict | None:
 
 
 def _get_db():
-    if "db" not in g:
-        g.db = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")
-        g.db.execute("PRAGMA busy_timeout = 5000")
-    return g.db
+    return get_database()
 
 
 @app.teardown_appcontext
 def _close_db(exc=None):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
+    close_request_database(exc)
 
 
-def _init_db():
-    with sqlite3.connect(str(_DB_PATH)) as conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 5000")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                email         TEXT    UNIQUE NOT NULL,
-                password_hash TEXT    NOT NULL,
-                can_teach     INTEGER NOT NULL DEFAULT 0,
-                created_at    TEXT    NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                token      TEXT    PRIMARY KEY,
-                user_id    INTEGER NOT NULL,
-                education_role TEXT CHECK (education_role IN ('teacher', 'student')),
-                created_at TEXT    NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS history (
-                id          TEXT    PRIMARY KEY,
-                user_id     INTEGER NOT NULL,
-                filename    TEXT    NOT NULL,
-                node_count  INTEGER NOT NULL DEFAULT 0,
-                edge_count  INTEGER NOT NULL DEFAULT 0,
-                nodes_json  TEXT    NOT NULL,
-                edges_json  TEXT    NOT NULL,
-                source_markdown TEXT,
-                latex_macros TEXT,
-                source_pdf_json TEXT,
-                status      TEXT    NOT NULL DEFAULT 'done',
-                stage       TEXT,
-                stage_label TEXT,
-                stage_index INTEGER NOT NULL DEFAULT 0,
-                total_stages INTEGER NOT NULL DEFAULT 0,
-                stages_done_json TEXT NOT NULL DEFAULT '[]',
-                source_format TEXT NOT NULL DEFAULT 'markdown',
-                source_origin TEXT NOT NULL DEFAULT 'markdown',
-                experimental_logic_ir INTEGER NOT NULL DEFAULT 0,
-                updated_at  TEXT,
-                created_at  TEXT    NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS user_settings (
-                user_id       INTEGER PRIMARY KEY,
-                llm_api_url   TEXT NOT NULL DEFAULT '',
-                llm_model     TEXT NOT NULL DEFAULT '',
-                llm_api_key   TEXT NOT NULL DEFAULT '',
-                updated_at    TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS proof_workspaces (
-                user_id          INTEGER NOT NULL,
-                graph_id         TEXT    NOT NULL,
-                node_id          INTEGER NOT NULL,
-                user_proof       TEXT    NOT NULL DEFAULT '',
-                versions_json    TEXT    NOT NULL DEFAULT '[]',
-                ai_messages_json TEXT    NOT NULL DEFAULT '[]',
-                imports_json     TEXT    NOT NULL DEFAULT '[]',
-                updated_at       TEXT    NOT NULL,
-                PRIMARY KEY (user_id, graph_id, node_id)
-            );
-            CREATE TABLE IF NOT EXISTS education_classes (
-                id            TEXT PRIMARY KEY,
-                owner_user_id INTEGER NOT NULL,
-                title         TEXT NOT NULL,
-                invite_code   TEXT UNIQUE NOT NULL,
-                archived_at   TEXT,
-                created_at    TEXT NOT NULL,
-                FOREIGN KEY (owner_user_id) REFERENCES users(id)
-            );
-            CREATE TABLE IF NOT EXISTS education_memberships (
-                class_id       TEXT NOT NULL,
-                user_id        INTEGER NOT NULL,
-                role           TEXT NOT NULL CHECK (role IN ('teacher', 'student')),
-                student_name   TEXT,
-                student_number TEXT,
-                joined_at      TEXT NOT NULL,
-                removed_at     TEXT,
-                PRIMARY KEY (class_id, user_id),
-                FOREIGN KEY (class_id) REFERENCES education_classes(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS education_snapshots (
-                id                TEXT PRIMARY KEY,
-                class_id          TEXT NOT NULL,
-                snapshot_type     TEXT NOT NULL DEFAULT 'graph' CHECK (snapshot_type IN ('graph', 'direct')),
-                source_graph_id   TEXT,
-                filename          TEXT NOT NULL,
-                nodes_json        TEXT NOT NULL,
-                edges_json        TEXT NOT NULL,
-                source_markdown   TEXT,
-                latex_macros_json TEXT,
-                source_pdf_json   TEXT,
-                created_by        INTEGER NOT NULL,
-                created_at        TEXT NOT NULL,
-                FOREIGN KEY (class_id) REFERENCES education_classes(id) ON DELETE CASCADE,
-                FOREIGN KEY (created_by) REFERENCES users(id)
-            );
-            CREATE TABLE IF NOT EXISTS education_assignments (
-                id             TEXT PRIMARY KEY,
-                class_id       TEXT NOT NULL,
-                assignment_type TEXT NOT NULL DEFAULT 'graph' CHECK (assignment_type IN ('graph', 'direct')),
-                direct_structure_version INTEGER NOT NULL DEFAULT 0,
-                snapshot_id    TEXT NOT NULL,
-                title          TEXT NOT NULL,
-                target_node_id INTEGER NOT NULL,
-                due_at         TEXT,
-                status         TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'archived')),
-                base_path_json TEXT NOT NULL,
-                summary        TEXT NOT NULL DEFAULT '',
-                version        INTEGER NOT NULL DEFAULT 1,
-                published_at   TEXT,
-                created_by     INTEGER NOT NULL,
-                created_at     TEXT NOT NULL,
-                updated_at     TEXT NOT NULL,
-                grades_published_at TEXT,
-                FOREIGN KEY (class_id) REFERENCES education_classes(id) ON DELETE CASCADE,
-                FOREIGN KEY (snapshot_id) REFERENCES education_snapshots(id),
-                FOREIGN KEY (created_by) REFERENCES users(id)
-            );
-            CREATE TABLE IF NOT EXISTS education_assignment_sources (
-                assignment_id  TEXT PRIMARY KEY,
-                filename       TEXT NOT NULL,
-                mime_type      TEXT NOT NULL DEFAULT 'application/octet-stream',
-                source_origin  TEXT NOT NULL DEFAULT 'document',
-                storage_name   TEXT,
-                source_text    TEXT NOT NULL DEFAULT '',
-                created_at     TEXT NOT NULL,
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS education_student_paths (
-                assignment_id TEXT NOT NULL,
-                user_id       INTEGER NOT NULL,
-                path_json     TEXT NOT NULL,
-                updated_at    TEXT NOT NULL,
-                PRIMARY KEY (assignment_id, user_id),
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS education_node_progress (
-                assignment_id     TEXT NOT NULL,
-                user_id           INTEGER NOT NULL,
-                node_id           INTEGER NOT NULL,
-                state             TEXT NOT NULL CHECK (state IN ('not_started', 'in_progress', 'mastered', 'needs_review')),
-                mastery_source    TEXT NOT NULL DEFAULT 'self' CHECK (mastery_source IN ('self', 'diagnostic', 'assessment', 'teacher')),
-                diagnostic_summary TEXT,
-                updated_at        TEXT NOT NULL,
-                PRIMARY KEY (assignment_id, user_id, node_id),
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS education_diagnostics (
-                id             TEXT PRIMARY KEY,
-                assignment_id  TEXT NOT NULL,
-                user_id        INTEGER NOT NULL,
-                node_id        INTEGER NOT NULL,
-                question_json  TEXT NOT NULL,
-                answer         TEXT,
-                result         TEXT,
-                summary        TEXT,
-                created_at     TEXT NOT NULL,
-                updated_at     TEXT NOT NULL,
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS education_assessment_nodes (
-                assignment_id TEXT NOT NULL,
-                node_id       INTEGER NOT NULL,
-                status        TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'failed', 'exempt')),
-                last_error    TEXT,
-                updated_at    TEXT NOT NULL,
-                PRIMARY KEY (assignment_id, node_id),
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS education_assessment_questions (
-                id                   TEXT PRIMARY KEY,
-                assignment_id        TEXT NOT NULL,
-                node_id              INTEGER NOT NULL,
-                kind                 TEXT NOT NULL,
-                question             TEXT NOT NULL,
-                focus                TEXT NOT NULL,
-                expected_points_json TEXT NOT NULL,
-                reference_answer    TEXT NOT NULL DEFAULT '',
-                max_score           REAL NOT NULL DEFAULT 0,
-                sort_order           INTEGER NOT NULL,
-                created_at           TEXT NOT NULL,
-                updated_at           TEXT NOT NULL,
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE,
-                UNIQUE (assignment_id, node_id, sort_order)
-            );
-            CREATE TABLE IF NOT EXISTS education_assessment_attempts (
-                id             TEXT PRIMARY KEY,
-                assignment_id  TEXT NOT NULL,
-                user_id        INTEGER NOT NULL,
-                node_id        INTEGER NOT NULL,
-                status         TEXT NOT NULL CHECK (status IN ('draft', 'completed')),
-                answers_json   TEXT NOT NULL DEFAULT '{}',
-                started_at     TEXT NOT NULL,
-                updated_at     TEXT NOT NULL,
-                completed_at   TEXT,
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                UNIQUE (assignment_id, user_id, node_id)
-            );
-            CREATE TABLE IF NOT EXISTS education_assignment_submissions (
-                id                 TEXT PRIMARY KEY,
-                assignment_id      TEXT NOT NULL,
-                user_id            INTEGER NOT NULL,
-                status             TEXT NOT NULL CHECK (status IN ('submitted', 'review_draft', 'finalized', 'released')),
-                ai_status          TEXT NOT NULL DEFAULT 'not_started' CHECK (ai_status IN ('not_started', 'running', 'ready', 'failed')),
-                snapshot_json      TEXT NOT NULL,
-                ai_suggested_total REAL,
-                teacher_total      REAL,
-                teacher_summary    TEXT NOT NULL DEFAULT '',
-                ai_error           TEXT,
-                submitted_at       TEXT NOT NULL,
-                updated_at         TEXT NOT NULL,
-                finalized_at       TEXT,
-                released_at        TEXT,
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                UNIQUE (assignment_id, user_id)
-            );
-            CREATE TABLE IF NOT EXISTS education_submission_question_grades (
-                submission_id       TEXT NOT NULL,
-                question_id         TEXT NOT NULL,
-                node_id             INTEGER NOT NULL,
-                max_score           REAL NOT NULL,
-                student_answer      TEXT NOT NULL,
-                reference_answer    TEXT NOT NULL,
-                expected_points_json TEXT NOT NULL,
-                matrix_report_json  TEXT NOT NULL DEFAULT '{}',
-                ai_result_json      TEXT NOT NULL DEFAULT '{}',
-                ai_suggested_score  REAL,
-                teacher_score       REAL,
-                teacher_feedback    TEXT NOT NULL DEFAULT '',
-                updated_at          TEXT NOT NULL,
-                PRIMARY KEY (submission_id, question_id),
-                FOREIGN KEY (submission_id) REFERENCES education_assignment_submissions(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS education_ai_usage (
-                user_id       INTEGER NOT NULL,
-                usage_day     TEXT NOT NULL,
-                request_count INTEGER NOT NULL DEFAULT 0,
-                updated_at    TEXT NOT NULL,
-                PRIMARY KEY (user_id, usage_day),
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS education_ai_tasks (
-                id         TEXT PRIMARY KEY,
-                task_key   TEXT NOT NULL,
-                user_id    INTEGER NOT NULL,
-                task_kind  TEXT NOT NULL,
-                scope      TEXT NOT NULL,
-                status     TEXT NOT NULL CHECK (status IN ('running', 'done', 'failed')),
-                error      TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS education_node_identities (
-                id         TEXT PRIMARY KEY,
-                class_id   TEXT NOT NULL,
-                global_id  TEXT NOT NULL,
-                title      TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (class_id) REFERENCES education_classes(id) ON DELETE CASCADE,
-                UNIQUE (class_id, global_id)
-            );
-            CREATE TABLE IF NOT EXISTS education_node_occurrences (
-                snapshot_id       TEXT NOT NULL,
-                node_id           INTEGER NOT NULL,
-                canonical_node_id TEXT NOT NULL,
-                global_id         TEXT NOT NULL,
-                PRIMARY KEY (snapshot_id, node_id),
-                FOREIGN KEY (snapshot_id) REFERENCES education_snapshots(id) ON DELETE CASCADE,
-                FOREIGN KEY (canonical_node_id) REFERENCES education_node_identities(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS learning_interactions (
-                id                    TEXT PRIMARY KEY,
-                client_interaction_id TEXT NOT NULL,
-                user_id               INTEGER NOT NULL,
-                class_id              TEXT NOT NULL,
-                assignment_id         TEXT NOT NULL,
-                snapshot_id           TEXT NOT NULL,
-                canonical_node_id     TEXT NOT NULL,
-                node_id               INTEGER NOT NULL,
-                action                TEXT NOT NULL,
-                user_proof            TEXT NOT NULL,
-                assistant_response    TEXT NOT NULL,
-                context_version       INTEGER NOT NULL,
-                context_snapshot_json TEXT NOT NULL,
-                classification_status TEXT NOT NULL CHECK (classification_status IN ('classified', 'pending')),
-                token_estimate        INTEGER NOT NULL DEFAULT 0,
-                result_json           TEXT NOT NULL DEFAULT '{}',
-                created_at            TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY (class_id) REFERENCES education_classes(id) ON DELETE CASCADE,
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE,
-                FOREIGN KEY (snapshot_id) REFERENCES education_snapshots(id) ON DELETE CASCADE,
-                FOREIGN KEY (canonical_node_id) REFERENCES education_node_identities(id) ON DELETE CASCADE,
-                UNIQUE (user_id, assignment_id, client_interaction_id)
-            );
-            CREATE TABLE IF NOT EXISTS learning_evidence (
-                id                    TEXT PRIMARY KEY,
-                interaction_id        TEXT NOT NULL,
-                user_id               INTEGER NOT NULL,
-                class_id              TEXT NOT NULL,
-                canonical_node_id     TEXT NOT NULL,
-                kind                  TEXT NOT NULL CHECK (kind IN ('goal', 'understanding', 'misconception', 'gap', 'used_node', 'hint', 'unresolved_question', 'strategy')),
-                claim                 TEXT NOT NULL,
-                status                TEXT NOT NULL CHECK (status IN ('open', 'confirmed', 'resolved', 'retracted')),
-                source_type           TEXT NOT NULL,
-                confidence            REAL NOT NULL,
-                severity              TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high')),
-                evidence_excerpt      TEXT NOT NULL DEFAULT '',
-                created_at            TEXT NOT NULL,
-                updated_at            TEXT NOT NULL,
-                FOREIGN KEY (interaction_id) REFERENCES learning_interactions(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY (class_id) REFERENCES education_classes(id) ON DELETE CASCADE,
-                FOREIGN KEY (canonical_node_id) REFERENCES education_node_identities(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS learning_evidence_nodes (
-                evidence_id        TEXT NOT NULL,
-                canonical_node_id  TEXT NOT NULL,
-                relation_role      TEXT NOT NULL CHECK (relation_role IN ('direct', 'prerequisite_risk', 'successor_risk', 'related')),
-                relation_path_json TEXT NOT NULL DEFAULT '{}',
-                weight             REAL NOT NULL,
-                PRIMARY KEY (evidence_id, canonical_node_id),
-                FOREIGN KEY (evidence_id) REFERENCES learning_evidence(id) ON DELETE CASCADE,
-                FOREIGN KEY (canonical_node_id) REFERENCES education_node_identities(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS learning_evidence_feedback (
-                id              TEXT PRIMARY KEY,
-                evidence_id     TEXT NOT NULL,
-                user_id         INTEGER NOT NULL,
-                action          TEXT NOT NULL,
-                previous_status TEXT NOT NULL,
-                new_status      TEXT NOT NULL,
-                note            TEXT NOT NULL DEFAULT '',
-                created_at      TEXT NOT NULL,
-                FOREIGN KEY (evidence_id) REFERENCES learning_evidence(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS student_node_models (
-                class_id            TEXT NOT NULL,
-                user_id             INTEGER NOT NULL,
-                canonical_node_id   TEXT NOT NULL,
-                mastery_state       TEXT NOT NULL CHECK (mastery_state IN ('unknown', 'learning', 'mastered', 'needs_review')),
-                direct_summary_json TEXT NOT NULL DEFAULT '{}',
-                risk_summary_json   TEXT NOT NULL DEFAULT '{}',
-                open_evidence_count INTEGER NOT NULL DEFAULT 0,
-                version             INTEGER NOT NULL DEFAULT 1,
-                updated_at          TEXT NOT NULL,
-                PRIMARY KEY (class_id, user_id, canonical_node_id),
-                FOREIGN KEY (class_id) REFERENCES education_classes(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY (canonical_node_id) REFERENCES education_node_identities(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS learning_context_summaries (
-                class_id         TEXT NOT NULL,
-                user_id          INTEGER NOT NULL,
-                scope_type       TEXT NOT NULL CHECK (scope_type IN ('node', 'course')),
-                scope_id         TEXT NOT NULL,
-                summary_json     TEXT NOT NULL,
-                source_watermark TEXT NOT NULL,
-                schema_version   INTEGER NOT NULL,
-                prompt_version   TEXT NOT NULL,
-                token_count      INTEGER NOT NULL DEFAULT 0,
-                updated_at       TEXT NOT NULL,
-                PRIMARY KEY (class_id, user_id, scope_type, scope_id),
-                FOREIGN KEY (class_id) REFERENCES education_classes(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_edu_members_user ON education_memberships(user_id);
-            CREATE INDEX IF NOT EXISTS idx_edu_snapshots_class ON education_snapshots(class_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_edu_assignments_class ON education_assignments(class_id, updated_at);
-            CREATE INDEX IF NOT EXISTS idx_edu_progress_assignment ON education_node_progress(assignment_id, user_id);
-            CREATE INDEX IF NOT EXISTS idx_edu_diagnostics_assignment ON education_diagnostics(assignment_id, user_id, node_id);
-            CREATE INDEX IF NOT EXISTS idx_edu_assessment_questions_assignment ON education_assessment_questions(assignment_id, node_id, sort_order);
-            CREATE INDEX IF NOT EXISTS idx_edu_assessment_attempts_assignment ON education_assessment_attempts(assignment_id, user_id, node_id);
-            CREATE INDEX IF NOT EXISTS idx_edu_submissions_assignment ON education_assignment_submissions(assignment_id, status, user_id);
-            CREATE INDEX IF NOT EXISTS idx_edu_submission_grades_submission ON education_submission_question_grades(submission_id, node_id);
-            CREATE INDEX IF NOT EXISTS idx_edu_ai_tasks_user ON education_ai_tasks(user_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_edu_node_occurrences_identity ON education_node_occurrences(canonical_node_id);
-            CREATE INDEX IF NOT EXISTS idx_learning_interactions_course ON learning_interactions(class_id, user_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_learning_interactions_node ON learning_interactions(class_id, user_id, canonical_node_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_learning_evidence_course ON learning_evidence(class_id, user_id, status, updated_at);
-            CREATE INDEX IF NOT EXISTS idx_learning_evidence_nodes_node ON learning_evidence_nodes(canonical_node_id, relation_role, weight);
-            CREATE INDEX IF NOT EXISTS idx_student_node_models_course ON student_node_models(class_id, user_id, updated_at);
-        """)
-        # Migrate: add llm_configs_json column if not present
-        try:
-            conn.execute("ALTER TABLE user_settings ADD COLUMN llm_configs_json TEXT NOT NULL DEFAULT ''")
-            conn.commit()
-        except Exception:
-            pass  # column already exists
-        try:
-            conn.execute("ALTER TABLE history ADD COLUMN source_markdown TEXT")
-            conn.commit()
-        except Exception:
-            pass  # column already exists
-        try:
-            conn.execute("ALTER TABLE history ADD COLUMN latex_macros TEXT")
-            conn.commit()
-        except Exception:
-            pass  # column already exists
-        try:
-            conn.execute("ALTER TABLE history ADD COLUMN source_pdf_json TEXT")
-            conn.commit()
-        except Exception:
-            pass  # column already exists
-        history_migrations = (
-            "ALTER TABLE history ADD COLUMN status TEXT NOT NULL DEFAULT 'done'",
-            "ALTER TABLE history ADD COLUMN stage TEXT",
-            "ALTER TABLE history ADD COLUMN stage_label TEXT",
-            "ALTER TABLE history ADD COLUMN stage_index INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE history ADD COLUMN total_stages INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE history ADD COLUMN stages_done_json TEXT NOT NULL DEFAULT '[]'",
-            "ALTER TABLE history ADD COLUMN source_format TEXT NOT NULL DEFAULT 'markdown'",
-            "ALTER TABLE history ADD COLUMN source_origin TEXT NOT NULL DEFAULT 'markdown'",
-            "ALTER TABLE history ADD COLUMN experimental_logic_ir INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE history ADD COLUMN updated_at TEXT",
-        )
-        for migration in history_migrations:
-            try:
-                conn.execute(migration)
-                conn.commit()
-            except Exception:
-                pass  # column already exists
-        conn.execute(
-            "UPDATE history SET status = 'paused' WHERE status = 'running'"
-        )
-        conn.execute(
-            "UPDATE history SET updated_at = created_at WHERE updated_at IS NULL"
-        )
-        for row_id, raw_meta in conn.execute(
-            "SELECT id, source_pdf_json FROM history WHERE source_pdf_json IS NOT NULL"
-        ).fetchall():
-            try:
-                stored_meta = _stored_source_pdf_meta(json.loads(raw_meta))
-            except (TypeError, json.JSONDecodeError):
-                stored_meta = None
-            conn.execute(
-                "UPDATE history SET source_pdf_json = ? WHERE id = ?",
-                (
-                    json.dumps(stored_meta, ensure_ascii=False) if stored_meta else None,
-                    row_id,
-                ),
-            )
-        conn.commit()
-        try:
-            conn.execute("ALTER TABLE proof_workspaces ADD COLUMN imports_json TEXT NOT NULL DEFAULT '[]'")
-            conn.commit()
-        except Exception:
-            pass  # column already exists
-        for migration in (
-            "ALTER TABLE users ADD COLUMN can_teach INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE sessions ADD COLUMN education_role TEXT",
-            "ALTER TABLE education_memberships ADD COLUMN removed_at TEXT",
-            "ALTER TABLE education_memberships ADD COLUMN student_name TEXT",
-            "ALTER TABLE education_memberships ADD COLUMN student_number TEXT",
-        ):
-            try:
-                conn.execute(migration)
-                conn.commit()
-            except Exception:
-                pass  # column already exists
-        for migration in (
-            "ALTER TABLE education_snapshots ADD COLUMN snapshot_type TEXT NOT NULL DEFAULT 'graph'",
-            "ALTER TABLE education_assignments ADD COLUMN assignment_type TEXT NOT NULL DEFAULT 'graph'",
-            "ALTER TABLE education_assignments ADD COLUMN direct_structure_version INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE education_assignments ADD COLUMN grades_published_at TEXT",
-            "ALTER TABLE education_assessment_questions ADD COLUMN reference_answer TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE education_assessment_questions ADD COLUMN max_score REAL NOT NULL DEFAULT 0",
-        ):
-            try:
-                conn.execute(migration)
-                conn.commit()
-            except Exception:
-                pass
-        # Direct assignments were added after the original education schema.
-        # Keep this explicit so an existing database receives the source
-        # metadata table even though CREATE TABLE IF NOT EXISTS above only
-        # applies to fresh databases.
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS education_assignment_sources (
-                assignment_id  TEXT PRIMARY KEY,
-                filename       TEXT NOT NULL,
-                mime_type      TEXT NOT NULL DEFAULT 'application/octet-stream',
-                source_origin  TEXT NOT NULL DEFAULT 'document',
-                storage_name   TEXT,
-                source_text    TEXT NOT NULL DEFAULT '',
-                created_at     TEXT NOT NULL,
-                FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE
-            )"""
-        )
-        conn.commit()
-        for assignment_id, in conn.execute(
-            "SELECT DISTINCT assignment_id FROM education_assessment_questions"
-        ).fetchall():
-            rows = conn.execute(
-                "SELECT id FROM education_assessment_questions WHERE assignment_id = ? ORDER BY node_id, sort_order",
-                (assignment_id,),
-            ).fetchall()
-            if not rows:
-                continue
-            existing_total = sum(float(row[0] or 0) for row in conn.execute(
-                "SELECT max_score FROM education_assessment_questions WHERE assignment_id = ?",
-                (assignment_id,),
-            ).fetchall())
-            if existing_total > 0:
-                continue
-            base = round(100.0 / len(rows), 1)
-            scores = [base for _ in rows]
-            scores[-1] = round(100.0 - sum(scores[:-1]), 1)
-            conn.executemany(
-                "UPDATE education_assessment_questions SET max_score = ? WHERE id = ?",
-                [(scores[index], row[0]) for index, row in enumerate(rows)],
-            )
-        conn.commit()
-        progress_schema = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'education_node_progress'"
-        ).fetchone()
-        if progress_schema and "'assessment'" not in str(progress_schema[0] or ""):
-            conn.commit()
-            conn.execute("PRAGMA foreign_keys = OFF")
-            try:
-                conn.executescript(
-                    """
-                    BEGIN;
-                    DROP TABLE IF EXISTS education_node_progress_v2;
-                    CREATE TABLE education_node_progress_v2 (
-                        assignment_id      TEXT NOT NULL,
-                        user_id            INTEGER NOT NULL,
-                        node_id            INTEGER NOT NULL,
-                        state              TEXT NOT NULL CHECK (state IN ('not_started', 'in_progress', 'mastered', 'needs_review')),
-                        mastery_source     TEXT NOT NULL DEFAULT 'self' CHECK (mastery_source IN ('self', 'diagnostic', 'assessment', 'teacher')),
-                        diagnostic_summary TEXT,
-                        updated_at         TEXT NOT NULL,
-                        PRIMARY KEY (assignment_id, user_id, node_id),
-                        FOREIGN KEY (assignment_id) REFERENCES education_assignments(id) ON DELETE CASCADE,
-                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                    );
-                    INSERT INTO education_node_progress_v2
-                        (assignment_id, user_id, node_id, state, mastery_source, diagnostic_summary, updated_at)
-                    SELECT assignment_id, user_id, node_id, state, mastery_source, diagnostic_summary, updated_at
-                      FROM education_node_progress;
-                    DROP TABLE education_node_progress;
-                    ALTER TABLE education_node_progress_v2 RENAME TO education_node_progress;
-                    CREATE INDEX IF NOT EXISTS idx_edu_progress_assignment
-                        ON education_node_progress(assignment_id, user_id);
-                    COMMIT;
-                    """
-                )
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.execute("PRAGMA foreign_keys = ON")
-        # Assignments created before reviewed assessments existed have no node
-        # rows. Preserve already-published learning behavior by treating those
-        # frozen nodes as explicitly exempt; legacy drafts still require review.
-        for assignment_id, assignment_status, raw_path in conn.execute(
-            "SELECT id, status, base_path_json FROM education_assignments WHERE status IN ('draft', 'published')"
-        ).fetchall():
-            try:
-                path = json.loads(raw_path or "{}")
-            except (TypeError, json.JSONDecodeError):
-                path = {}
-            node_ids = []
-            for step in path.get("steps") or []:
-                if not isinstance(step, dict):
-                    continue
-                try:
-                    node_id = int(step.get("nodeId"))
-                except (TypeError, ValueError):
-                    continue
-                if node_id not in node_ids:
-                    node_ids.append(node_id)
-            assessment_status = "exempt" if assignment_status == "published" else "pending"
-            now = datetime.utcnow().isoformat()
-            conn.executemany(
-                """INSERT OR IGNORE INTO education_assessment_nodes
-                     (assignment_id, node_id, status, updated_at) VALUES (?, ?, ?, ?)""",
-                [(assignment_id, node_id, assessment_status, now) for node_id in node_ids],
-            )
-        conn.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_edu_members_class_student_number
-               ON education_memberships(class_id, student_number COLLATE NOCASE)
-               WHERE student_number IS NOT NULL"""
-        )
-        _sync_teacher_accounts(conn)
-        conn.execute(
-            """
-            UPDATE sessions
-               SET education_role = CASE
-                   WHEN EXISTS (
-                       SELECT 1 FROM users teacher_user
-                        WHERE teacher_user.id = sessions.user_id
-                          AND teacher_user.can_teach = 1
-                   ) THEN 'teacher'
-                   ELSE 'student'
-               END
-             WHERE education_role IS NULL
-            """
-        )
-        conn.commit()
-
-def _configured_teacher_accounts() -> list[dict[str, str]]:
-    accounts: dict[str, dict[str, str]] = {}
-    for item in TEACHER_ACCOUNTS:
-        email = str(item.get("email") or "").strip().lower()
-        password_hash = str(item.get("password_hash") or "")
-        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not password_hash:
-            raise RuntimeError("backend teacher account allowlist is invalid")
-        if email in accounts:
-            raise RuntimeError("backend teacher account emails must be unique")
-        accounts[email] = {"email": email, "password_hash": password_hash}
-    return list(accounts.values())
+@app.errorhandler(GraphUnavailableError)
+def _handle_graph_unavailable(exc):
+    code = "graph_pending" if exc.status in {"pending", "deleting"} else "graph_unavailable"
+    return jsonify({
+        "error": code,
+        "code": code,
+        "graphId": exc.graph_id,
+        "status": exc.status,
+    }), 503
 
 
-def _ensure_teacher_accounts() -> None:
-    """每个已配置引擎只同步一次白名单，测试重建引擎后也会重新执行。"""
-    global _teacher_sync_engine_id
+@app.errorhandler(GraphStoreError)
+def _handle_graph_store_error(exc):
+    app.logger.error("Neo4j graph store unavailable: %s", exc)
+    return jsonify({"error": "graph_unavailable", "code": "graph_unavailable"}), 503
 
-    engine_id = id(get_engine())
-    if _teacher_sync_engine_id == engine_id:
+
+@app.errorhandler(DatabaseConfigurationError)
+@app.errorhandler(SQLAlchemyError)
+def _handle_database_unavailable(exc):
+    app.logger.error("MySQL unavailable: %s", exc)
+    return jsonify({"error": "database_unavailable", "code": "database_unavailable"}), 503
+
+
+def _load_api_graph(graph_id: str) -> dict:
+    cache = getattr(g, "graph_payload_cache", None)
+    if cache is None:
+        cache = {}
+        g.graph_payload_cache = cache
+    if graph_id not in cache:
+        cache[graph_id] = load_stored_graph(graph_id)
+    return cache[graph_id]
+
+
+def _invalidate_api_graph(graph_id: str) -> None:
+    if not has_app_context():
         return
-    with _teacher_sync_lock:
-        if _teacher_sync_engine_id == engine_id:
-            return
-        _auth_repository.sync_teacher_accounts(_configured_teacher_accounts())
-        _teacher_sync_engine_id = engine_id
+    cache = getattr(g, "graph_payload_cache", None)
+    if isinstance(cache, dict):
+        cache.pop(graph_id, None)
 
 
 def _current_user():
-    """返回 Bearer 会话对应的不可变用户快照。"""
+    """Return user row if request carries a valid Bearer token, else None."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
-    _ensure_teacher_accounts()
-    return _auth_service.authenticate(auth[7:])
+    token = auth[7:]
+    db = _get_db()
+    row = db.execute(
+        "SELECT u.*, s.education_role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
+        (session_token_hash(token),),
+    ).fetchone()
+    return row
 
 
 def _public_source_pdf_meta(meta: dict | None) -> dict | None:
@@ -834,11 +237,15 @@ def _pending_source_pdf_meta(job_id: str) -> dict:
 
 def _update_history_source_pdf(job_id: str, meta: dict) -> None:
     try:
-        job = _jobs.get(job_id)
-        owner_id = int(job["_user_id"]) if job and job.get("_user_id") is not None else None
-        _learning_repository.update_source_pdf(job_id, meta, owner_id)
+        with connect_database() as conn:
+            conn.execute(
+                "UPDATE history SET source_pdf_json = ? WHERE id = ?",
+                (
+                    json.dumps(_stored_source_pdf_meta(meta), ensure_ascii=False),
+                    job_id,
+                ),
+            )
     except Exception:
-        # PDF 编译在后台线程结束，失败不应覆盖任务本身的最终状态。
         pass
 
 
@@ -848,20 +255,20 @@ def _source_pdf_dir(job_id: str) -> Path:
 
 def _read_source_pdf_meta(row_or_job) -> dict | None:
     if isinstance(row_or_job, dict):
-        raw = row_or_job.get("source_pdf")
-        meta = copy.deepcopy(raw) if isinstance(raw, dict) else None
-        row_id = row_or_job.get("id") or row_or_job.get("job_id")
+        return row_or_job.get("source_pdf")
+    raw = row_or_job["source_pdf_json"] if row_or_job and "source_pdf_json" in row_or_job.keys() else None
+    if not raw:
+        return None
+    if isinstance(raw, dict):
+        meta = dict(raw)
     else:
-        raw = row_or_job["source_pdf_json"] if row_or_job and "source_pdf_json" in row_or_job.keys() else None
-        if not raw:
-            return None
         try:
             meta = json.loads(raw)
         except Exception:
             return None
-        row_id = row_or_job["id"] if "id" in row_or_job.keys() else None
     if not isinstance(meta, dict):
         return None
+    row_id = row_or_job["id"] if "id" in row_or_job.keys() else None
     if row_id:
         source_dir = _source_pdf_dir(str(row_id))
         for name_key, path_key in (
@@ -875,11 +282,36 @@ def _read_source_pdf_meta(row_or_job) -> dict | None:
     return meta
 
 
+def reconcile_interrupted_history() -> int:
+    """Mark persisted workers as paused after a backend restart.
+
+    Runtime process state is intentionally not durable. A row left as running
+    therefore cannot still have a live worker in this process and must become
+    resumable (subject to its stage cache still being valid).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with connect_database() as conn:
+        rows = conn.execute(
+            "SELECT id, source_pdf_json FROM history WHERE status = 'running' FOR UPDATE"
+        ).fetchall()
+        for row in rows:
+            source_pdf = _stored_source_pdf_meta(_read_source_pdf_meta(row))
+            conn.execute(
+                """UPDATE history
+                      SET status = 'paused', source_pdf_json = ?, updated_at = ?
+                    WHERE id = ? AND status = 'running'""",
+                (
+                    json.dumps(source_pdf, ensure_ascii=False) if source_pdf else None,
+                    now,
+                    row["id"],
+                ),
+            )
+    return len(rows)
+
+
 def _json_list(value):
     if not value:
         return []
-    if isinstance(value, list):
-        return value
     try:
         parsed = json.loads(value)
         return parsed if isinstance(parsed, list) else []
@@ -898,10 +330,42 @@ def _complete_llm_config(config):
     return None
 
 
+def _decrypt_user_setting(row, user_id: int, field: str) -> str:
+    value = row[field]
+    if not value:
+        return ""
+    suffix = "configs" if field == "llm_configs_ciphertext" else "api-key"
+    return decrypt_secret(value, aad=f"user-settings:{user_id}:{suffix}")
+
+
 def _active_user_llm_config(user):
     if not user:
         return None
-    return _learning_repository.get_active_llm_config(int(user["id"]))
+    db = _get_db()
+    row = db.execute(
+        """SELECT llm_api_url, llm_model, llm_api_key_ciphertext, llm_configs_ciphertext
+             FROM user_settings WHERE user_id = ?""",
+        (user["id"],),
+    ).fetchone()
+    if not row:
+        return None
+    configs_json = _decrypt_user_setting(row, int(user["id"]), "llm_configs_ciphertext")
+    if configs_json:
+        try:
+            data = json.loads(configs_json)
+            configs = data.get("configs") or []
+            active_index = int(data.get("active_index") or 0)
+            active = configs[active_index] if configs and 0 <= active_index < len(configs) else (configs[0] if configs else {})
+            config = _complete_llm_config(active)
+            if config:
+                return config
+        except Exception:
+            pass
+    return _complete_llm_config({
+        "api_url": row["llm_api_url"],
+        "model_name": row["llm_model"],
+        "api_key": _decrypt_user_setting(row, int(user["id"]), "llm_api_key_ciphertext"),
+    })
 
 
 # ── Auth endpoints ────────────────────────────────────────────────────────────
@@ -920,18 +384,29 @@ def auth_register():
         return jsonify({"error": "invalid education role"}), 400
     if not email or not password:
         return jsonify({"error": "email and password required"}), 400
-    _ensure_teacher_accounts()
-    try:
-        result = _auth_service.register_student(email, password)
-    except PasswordPolicyError:
+    if len(password) < 6:
         return jsonify({"error": "password must be at least 6 characters"}), 400
-    except DuplicateEmailError:
+    db = _get_db()
+    try:
+        db.execute(
+            "INSERT INTO users (email, password_hash, can_teach, created_at) VALUES (?, ?, 0, ?)",
+            (email, generate_password_hash(password), datetime.utcnow().isoformat()),
+        )
+        db.commit()
+    except IntegrityError:
         return jsonify({"error": "email already registered"}), 409
+    user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    token = secrets.token_hex(32)
+    db.execute(
+        "INSERT INTO sessions (token_hash, user_id, education_role, created_at) VALUES (?, ?, ?, ?)",
+        (session_token_hash(token), user["id"], education_role, datetime.utcnow().isoformat()),
+    )
+    db.commit()
     return jsonify({
-        "token": result.token,
-        "email": result.user.email,
-        "educationRole": result.education_role,
-        "canTeach": result.user.can_teach,
+        "token": token,
+        "email": user["email"],
+        "educationRole": education_role,
+        "canTeach": bool(user["can_teach"]),
     }), 201
 
 
@@ -943,20 +418,27 @@ def auth_login():
     education_role = body.get("educationRole")
     if education_role is None:
         education_role = "student"
-    if education_role not in ("teacher", "student"):
+    if education_role not in (None, "teacher", "student"):
         return jsonify({"error": "invalid education role"}), 400
-    _ensure_teacher_accounts()
-    try:
-        result = _auth_service.login(email, password, education_role)
-    except InvalidCredentialsError:
+    db = _get_db()
+    user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    if not user or not check_password_hash(user["password_hash"], password):
         if education_role == "teacher":
             return jsonify({"error": "教师账号或密码错误", "code": "teacher_login_failed"}), 401
         return jsonify({"error": "invalid email or password"}), 401
+    if education_role == "teacher" and not bool(user["can_teach"]):
+        return jsonify({"error": "教师账号或密码错误", "code": "teacher_login_failed"}), 401
+    token = secrets.token_hex(32)
+    db.execute(
+        "INSERT INTO sessions (token_hash, user_id, education_role, created_at) VALUES (?, ?, ?, ?)",
+        (session_token_hash(token), user["id"], education_role, datetime.utcnow().isoformat()),
+    )
+    db.commit()
     return jsonify({
-        "token": result.token,
-        "email": result.user.email,
-        "educationRole": result.education_role,
-        "canTeach": result.user.can_teach,
+        "token": token,
+        "email": user["email"],
+        "educationRole": education_role,
+        "canTeach": bool(user["can_teach"]),
     })
 
 
@@ -964,7 +446,9 @@ def auth_login():
 def auth_logout():
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        _auth_service.logout(auth[7:])
+        db = _get_db()
+        db.execute("DELETE FROM sessions WHERE token_hash = ?", (session_token_hash(auth[7:]),))
+        db.commit()
     return jsonify({"ok": True})
 
 
@@ -974,10 +458,10 @@ def auth_me():
     if not user:
         return jsonify({"error": "not authenticated"}), 401
     return jsonify({
-        "email": user.email,
-        "id": user.id,
-        "educationRole": user.education_role,
-        "canTeach": user.can_teach,
+        "email": user["email"],
+        "id": user["id"],
+        "educationRole": user["education_role"],
+        "canTeach": bool(user["can_teach"]),
     })
 
 
@@ -988,7 +472,30 @@ def settings_get():
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    return jsonify(_learning_repository.get_settings(int(user["id"])))
+    row = _get_db().execute(
+        """SELECT llm_api_url, llm_model, llm_api_key_ciphertext, llm_configs_ciphertext
+             FROM user_settings WHERE user_id = ?""",
+        (user["id"],),
+    ).fetchone()
+    if not row:
+        return jsonify({"configs": [], "active_index": 0})
+    configs_json = _decrypt_user_setting(row, int(user["id"]), "llm_configs_ciphertext")
+    if configs_json:
+        try:
+            data = json.loads(configs_json)
+            if isinstance(data, dict):
+                return jsonify(data)
+        except Exception:
+            pass
+    if row["llm_api_url"]:
+        legacy = [{
+            "name": "默认配置",
+            "api_url": row["llm_api_url"],
+            "model_name": row["llm_model"],
+            "api_key": _decrypt_user_setting(row, int(user["id"]), "llm_api_key_ciphertext"),
+        }]
+        return jsonify({"configs": legacy, "active_index": 0})
+    return jsonify({"configs": [], "active_index": 0})
 
 
 @app.route("/api/v2/settings", methods=["PUT"])
@@ -998,15 +505,40 @@ def settings_put():
         return jsonify({"error": "not authenticated"}), 401
     body = request.get_json(silent=True) or {}
     configs = body.get("configs", [])
-    if not isinstance(configs, list):
-        return jsonify({"error": "configs must be a list"}), 400
-    try:
-        active_index = int(body.get("active_index", 0))
-        _learning_repository.upsert_settings(
-            int(user["id"]), configs, active_index
-        )
-    except (TypeError, ValueError):
-        return jsonify({"error": "invalid settings payload"}), 400
+    active_index = int(body.get("active_index", 0))
+    data_json = json.dumps({"configs": configs, "active_index": active_index}, ensure_ascii=False)
+    active = configs[active_index] if configs and 0 <= active_index < len(configs) else {}
+    user_id = int(user["id"])
+    encrypted_key = encrypt_secret(
+        str(active.get("api_key") or ""),
+        aad=f"user-settings:{user_id}:api-key",
+    )
+    encrypted_configs = encrypt_secret(
+        data_json,
+        aad=f"user-settings:{user_id}:configs",
+    )
+    db = _get_db()
+    db.execute(
+        """INSERT INTO user_settings
+             (user_id, llm_api_url, llm_model, llm_api_key_ciphertext,
+              llm_configs_ciphertext, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             llm_api_url = VALUES(llm_api_url),
+             llm_model = VALUES(llm_model),
+             llm_api_key_ciphertext = VALUES(llm_api_key_ciphertext),
+             llm_configs_ciphertext = VALUES(llm_configs_ciphertext),
+             updated_at = VALUES(updated_at)""",
+        (
+            user_id,
+            active.get("api_url", ""),
+            active.get("model_name", ""),
+            encrypted_key,
+            encrypted_configs,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    db.commit()
     return jsonify({"ok": True})
 
 
@@ -1374,7 +906,7 @@ def validate_llm_config():
 # ── History endpoints ─────────────────────────────────────────────────────────
 
 def _job_storage_root() -> Path:
-    root = Path(_DB_PATH).resolve().parent / "jobs"
+    root = _DATA_ROOT.resolve() / "jobs"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -1385,10 +917,10 @@ def _persistent_job_dir(job_id: str) -> Path:
 
 
 def _history_resume_available(row) -> bool:
-    status = row.get("status") or "done"
+    status = row["status"] if "status" in row.keys() else "done"
     if status not in {"paused", "error"}:
         return False
-    source_markdown = row.get("source_markdown")
+    source_markdown = row["source_markdown"] if "source_markdown" in row.keys() else None
     if not source_markdown:
         return False
     manifest_path = _persistent_job_dir(row["id"]) / "_stage_cache" / "manifest.json"
@@ -1402,22 +934,30 @@ def _history_resume_available(row) -> bool:
 
 
 def _history_item_payload(row):
-    status = row.get("status") or "done"
+    status = row["status"] if "status" in row.keys() else "done"
     return {
         "id": row["id"],
         "filename": row["filename"],
         "node_count": row["node_count"],
         "edge_count": row["edge_count"],
         "status": status or "done",
-        "stage": row.get("stage"),
-        "stage_label": row.get("stage_label"),
-        "stage_index": int(row.get("stage_index") or 0),
-        "total_stages": int(row.get("total_stages") or 0),
-        "experimental_logic_ir": bool(row.get("experimental_logic_ir")),
-        "stages_done": list(row.get("stages_done") or []),
+        "stage": row["stage"] if "stage" in row.keys() else None,
+        "stage_label": row["stage_label"] if "stage_label" in row.keys() else None,
+        "stage_index": int(row["stage_index"] or 0) if "stage_index" in row.keys() else 0,
+        "total_stages": int(row["total_stages"] or 0) if "total_stages" in row.keys() else 0,
+        "experimental_logic_ir": bool(
+            row["experimental_logic_ir"]
+            if "experimental_logic_ir" in row.keys()
+            else False
+        ),
+        "stages_done": _json_list(
+            row["stages_done_json"] if "stages_done_json" in row.keys() else "[]"
+        ),
         "resume_available": _history_resume_available(row),
         "updated_at": (
-            row.get("updated_at") or row.get("created_at")
+            row["updated_at"]
+            if "updated_at" in row.keys() and row["updated_at"]
+            else row["created_at"]
         ),
         "created_at": row["created_at"],
     }
@@ -1432,43 +972,66 @@ def _upsert_job_history(job: dict, status: str, user_id: int | None = None) -> b
     result = result if isinstance(result, dict) else {}
     nodes = result.get("nodes") if isinstance(result.get("nodes"), list) else []
     edges = result.get("edges") if isinstance(result.get("edges"), list) else []
-    created_at = job.get("created_at")
-    if isinstance(created_at, str):
-        try:
-            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-        except ValueError:
-            created_at = None
-    if not isinstance(created_at, datetime):
-        created_at = datetime.utcnow()
+    now = datetime.utcnow().isoformat()
+    source_pdf = job.get("source_pdf")
+    values = {
+        "filename": job.get("filename") or "input.md",
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "source_markdown": job.get("source_markdown"),
+        "latex_macros": json.dumps(
+            job.get("latex_macros") or result.get("latex_macros") or {},
+            ensure_ascii=False,
+        ),
+        "source_pdf_json": (
+            json.dumps(_stored_source_pdf_meta(source_pdf), ensure_ascii=False)
+            if source_pdf
+            else None
+        ),
+        "status": status,
+        "stage": job.get("stage"),
+        "stage_label": job.get("stage_label"),
+        "stage_index": int(job.get("stage_index") or 0),
+        "total_stages": int(job.get("total_stages") or len(stage_defs)),
+        "stages_done_json": json.dumps(job.get("stages_done") or [], ensure_ascii=False),
+        "source_format": job.get("source_format") or "markdown",
+        "source_origin": job.get("source_origin") or "markdown",
+        "experimental_logic_ir": int(bool(job.get("_experimental_logic_ir"))),
+        "updated_at": now,
+    }
     try:
-        saved = _learning_repository.upsert_job_progress(
-            int(owner_id),
-            JobSnapshot(
-                job_id=job["job_id"],
-                filename=job.get("filename") or "input.md",
-                status=status,
-                nodes=nodes,
-                edges=edges,
-                source_markdown=job.get("source_markdown"),
-                latex_macros=job.get("latex_macros") or result.get("latex_macros") or {},
-                source_pdf=job.get("source_pdf"),
-                stage=job.get("stage"),
-                stage_label=job.get("stage_label"),
-                stage_index=int(job.get("stage_index") or 0),
-                total_stages=int(job.get("total_stages") or len(stage_defs)),
-                stages_done=list(job.get("stages_done") or []),
-                source_format=job.get("source_format") or "markdown",
-                source_origin=job.get("source_origin") or "markdown",
-                experimental_logic_ir=bool(job.get("_experimental_logic_ir")),
-                created_at=created_at,
-            ),
-        )
-        if not saved:
-            return False
+        with connect_database() as conn:
+            existing = conn.execute(
+                "SELECT user_id FROM history WHERE id = ? FOR UPDATE",
+                (job["job_id"],),
+            ).fetchone()
+            if existing and int(existing[0]) != int(owner_id):
+                return False
+            if existing:
+                assignments = ", ".join(f"{key} = ?" for key in values)
+                conn.execute(
+                    f"UPDATE history SET {assignments} WHERE id = ? AND user_id = ?",
+                    (*values.values(), job["job_id"], owner_id),
+                )
+            else:
+                columns = ["id", "user_id", *values.keys(), "created_at"]
+                placeholders = ", ".join("?" for _ in columns)
+                conn.execute(
+                    f"INSERT INTO history ({', '.join(columns)}) VALUES ({placeholders})",
+                    (
+                        job["job_id"],
+                        owner_id,
+                        *values.values(),
+                        job.get("created_at") or now,
+                    ),
+                )
+        persist_graph(job["job_id"], "history", nodes, edges)
+        _invalidate_api_graph(job["job_id"])
         job["_user_id"] = int(owner_id)
         job["_history_persisted"] = True
         return True
-    except Exception:
+    except Exception as exc:
+        app.logger.error("Unable to persist history %s: %s", job.get("job_id"), exc)
         return False
 
 
@@ -1485,7 +1048,17 @@ def history_list():
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    rows = _learning_repository.list_history(int(user["id"]), limit=50)
+    db = _get_db()
+    rows = db.execute(
+        """SELECT id, filename, node_count, edge_count, status, stage, stage_label,
+                  stage_index, total_stages, stages_done_json, source_markdown,
+                  experimental_logic_ir, updated_at, created_at
+           FROM history
+           WHERE user_id = ?
+           ORDER BY created_at DESC
+           LIMIT 50""",
+        (user["id"],),
+    ).fetchall()
     return jsonify([_history_item_payload(row) for row in rows])
 
 
@@ -1509,13 +1082,17 @@ def history_get(hist_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    row = _learning_repository.get_owned_history(int(user["id"]), hist_id)
+    db = _get_db()
+    row = db.execute(
+        "SELECT * FROM history WHERE id = ? AND user_id = ?", (hist_id, user["id"])
+    ).fetchone()
     if not row:
         return jsonify({"error": "not found"}), 404
-    status = row.get("status") or "done"
+    status = row["status"] if "status" in row.keys() else "done"
     if status != "done":
         return jsonify({"error": "history item is not complete", "status": status}), 409
-    nodes = copy.deepcopy(row["nodes"])
+    graph = _load_api_graph(hist_id)
+    nodes = graph["nodes"]
     # Backfill node_index_in_doc for old records that lack it (use node id as proxy)
     for n in nodes:
         if "node_index_in_doc" not in n or n["node_index_in_doc"] is None:
@@ -1533,8 +1110,8 @@ def history_get(hist_id):
         "edge_count": row["edge_count"],
         "created_at": row["created_at"],
         "nodes": nodes,
-        "edges": row["edges"],
-        "latex_macros": row["latex_macros"],
+        "edges": graph["edges"],
+        "latex_macros": json.loads(row["latex_macros"] or "{}"),
         "source_pdf": _public_source_pdf_meta(_read_source_pdf_meta(row)),
     })
 
@@ -1566,10 +1143,13 @@ def history_resume(hist_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    row = _learning_repository.get_owned_history(int(user["id"]), hist_id)
+    row = _get_db().execute(
+        "SELECT * FROM history WHERE id = ? AND user_id = ?",
+        (hist_id, user["id"]),
+    ).fetchone()
     if not row:
         return jsonify({"error": "not found"}), 404
-    status = row.get("status") or "done"
+    status = row["status"] if "status" in row.keys() else "done"
     if status not in {"paused", "error"}:
         return jsonify({
             "error": "Only a paused or failed history task can be resumed",
@@ -1582,8 +1162,8 @@ def history_resume(hist_id):
         return jsonify({"error": "Complete LLM and embedding configuration is required"}), 400
 
     artifact_dir = _persistent_job_dir(hist_id)
-    source_format = row.get("source_format") or "markdown"
-    source_origin = row.get("source_origin") or "markdown"
+    source_format = row["source_format"] or "markdown"
+    source_origin = row["source_origin"] if "source_origin" in row.keys() else "markdown"
     source_path = artifact_dir / _safe_upload_filename(row["filename"], source_format)
     if not source_path.is_file():
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1597,10 +1177,18 @@ def history_resume(hist_id):
         if job and job.get("status") == "running":
             return jsonify({"error": "Pipeline worker is already running"}), 409
         if job is None:
-            latex_macros = copy.deepcopy(row.get("latex_macros") or {})
-            partial_nodes = copy.deepcopy(row.get("nodes") or [])
-            partial_edges = copy.deepcopy(row.get("edges") or [])
-            experimental_logic_ir = bool(row.get("experimental_logic_ir"))
+            try:
+                latex_macros = json.loads(row["latex_macros"] or "{}")
+            except json.JSONDecodeError:
+                latex_macros = {}
+            graph = _load_api_graph(hist_id)
+            partial_nodes = graph["nodes"]
+            partial_edges = graph["edges"]
+            experimental_logic_ir = bool(
+                row["experimental_logic_ir"]
+                if "experimental_logic_ir" in row.keys()
+                else False
+            )
             stage_defs = _pipeline_stage_defs(experimental_logic_ir)
             job = {
                 "job_id": hist_id,
@@ -1610,7 +1198,7 @@ def history_resume(hist_id):
                 "stage_label": row["stage_label"],
                 "stage_index": int(row["stage_index"] or 0),
                 "total_stages": int(row["total_stages"] or len(stage_defs)),
-                "stages_done": list(row.get("stages_done") or []),
+                "stages_done": _json_list(row["stages_done_json"] or "[]"),
                 "result": None,
                 "partial": {"nodes": partial_nodes, "edges": partial_edges},
                 "error": None,
@@ -1654,7 +1242,10 @@ def history_markdown(hist_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    row = _learning_repository.get_owned_history(int(user["id"]), hist_id)
+    db = _get_db()
+    row = db.execute(
+        "SELECT filename, source_markdown FROM history WHERE id = ? AND user_id = ?", (hist_id, user["id"])
+    ).fetchone()
     if not row:
         return jsonify({"error": "not found"}), 404
     if row["source_markdown"]:
@@ -1679,7 +1270,11 @@ def history_delete(hist_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    row = _learning_repository.get_owned_history(int(user["id"]), hist_id)
+    db = _get_db()
+    row = db.execute(
+        "SELECT status FROM history WHERE id = ? AND user_id = ?",
+        (hist_id, user["id"]),
+    ).fetchone()
     if not row:
         return jsonify({"error": "not found"}), 404
     with _jobs_lock:
@@ -1702,14 +1297,31 @@ def history_delete(hist_id):
 
 # ── Proof workspace endpoints ────────────────────────────────────────────────
 
+def _workspace_row_to_dict(row):
+    return {
+        "nodeId": row["node_id"],
+        "userProof": row["user_proof"] or "",
+        "versions": _json_list(row["versions_json"]),
+        "aiMessages": _json_list(row["ai_messages_json"]),
+        "imports": _json_list(row["imports_json"]),
+        "updatedAt": row["updated_at"],
+    }
+
 
 @app.route("/api/v2/proof-workspaces/<graph_id>", methods=["GET"])
 def proof_workspace_list(graph_id):
     user = _current_user()
     if not user:
         return jsonify({"error": "not authenticated"}), 401
-    rows = _learning_repository.list_proof_workspaces(int(user["id"]), graph_id)
-    return jsonify({"workspaces": rows})
+    db = _get_db()
+    rows = db.execute(
+        """SELECT node_id, user_proof, versions_json, ai_messages_json, imports_json, updated_at
+           FROM proof_workspaces
+           WHERE user_id = ? AND graph_id = ?
+           ORDER BY node_id ASC""",
+        (user["id"], graph_id),
+    ).fetchall()
+    return jsonify({"workspaces": [_workspace_row_to_dict(row) for row in rows]})
 
 
 @app.route("/api/v2/proof-workspaces/<graph_id>/<int:node_id>", methods=["PUT"])
@@ -1718,18 +1330,41 @@ def proof_workspace_save(graph_id, node_id):
     if not user:
         return jsonify({"error": "not authenticated"}), 401
     body = request.get_json(silent=True) or {}
-    payload = {
-        "userProof": body.get("userProof") or "",
-        "versions": body.get("versions") if isinstance(body.get("versions"), list) else [],
-        "aiMessages": body.get("aiMessages") if isinstance(body.get("aiMessages"), list) else [],
-        "imports": body.get("imports") if isinstance(body.get("imports"), list) else [],
-    }
-    workspace = _learning_repository.upsert_proof_workspace(
-        int(user["id"]), graph_id, node_id, payload
+    user_proof = body.get("userProof") or ""
+    versions = body.get("versions") if isinstance(body.get("versions"), list) else []
+    ai_messages = body.get("aiMessages") if isinstance(body.get("aiMessages"), list) else []
+    imports = body.get("imports") if isinstance(body.get("imports"), list) else []
+    now = datetime.utcnow().isoformat()
+    db = _get_db()
+    db.execute(
+        """INSERT INTO proof_workspaces
+              (user_id, graph_id, node_id, user_proof, versions_json, ai_messages_json, imports_json, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+              user_proof       = VALUES(user_proof),
+              versions_json    = VALUES(versions_json),
+              ai_messages_json = VALUES(ai_messages_json),
+              imports_json     = VALUES(imports_json),
+              updated_at       = VALUES(updated_at)""",
+        (
+            user["id"], graph_id, node_id, user_proof,
+            json.dumps(versions, ensure_ascii=False),
+            json.dumps(ai_messages, ensure_ascii=False),
+            json.dumps(imports, ensure_ascii=False),
+            now,
+        ),
     )
+    db.commit()
     return jsonify({
         "ok": True,
-        "workspace": workspace,
+        "workspace": {
+            "nodeId": node_id,
+            "userProof": user_proof,
+            "versions": versions,
+            "aiMessages": ai_messages,
+            "imports": imports,
+            "updatedAt": now,
+        },
     })
 
 
@@ -1764,7 +1399,8 @@ def _education_llm_config(user_id: int | None = None) -> dict | None:
     })
     config = dedicated or generic
     if config is None and user_id is not None:
-        config = _learning_repository.get_active_llm_config(int(user_id))
+        user = _get_db().execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        config = _active_user_llm_config(user)
     if config is None:
         return None
     return {
@@ -1847,38 +1483,48 @@ def _education_student_profile(body: dict) -> tuple[str | None, str | None, tupl
 
 
 def _education_membership(class_id: str, user_id: int):
-    return _education_repository.get_membership(class_id, user_id)
+    return _get_db().execute(
+        """SELECT m.role, m.student_name, m.student_number, c.* FROM education_memberships m
+           JOIN education_classes c ON c.id = m.class_id
+           WHERE m.class_id = ? AND m.user_id = ? AND m.removed_at IS NULL
+             AND c.archived_at IS NULL""",
+        (class_id, user_id),
+    ).fetchone()
 
 
 def _education_require_membership(class_id: str, user, allowed_roles=None, *, require_student_profile=True):
-    try:
-        membership = _education_access_service.membership(
-            class_id,
-            user_id=int(user["id"]),
-            selected_role=user["education_role"],
-            allowed_roles=set(allowed_roles) if allowed_roles else None,
-            require_student_profile=require_student_profile,
-        )
-        return membership, None
-    except EducationAccessError as exc:
-        payload = {"error": exc.message}
-        if exc.code:
-            payload["code"] = exc.code
-        if exc.code == "student_profile_required":
-            payload["classId"] = class_id
-        return None, (jsonify(payload), exc.status)
+    membership = _education_membership(class_id, int(user["id"]))
+    if not membership:
+        return None, (jsonify({"error": "class not found"}), 404)
+    if membership["role"] != user["education_role"]:
+        return None, (jsonify({"error": "class is not available in the selected education role", "code": "education_role_forbidden"}), 403)
+    if allowed_roles and membership["role"] not in allowed_roles:
+        return None, (jsonify({"error": "forbidden"}), 403)
+    if require_student_profile and membership["role"] == "student" and (
+        not membership["student_name"] or not membership["student_number"]
+    ):
+        return None, (jsonify({
+            "error": "student profile is incomplete",
+            "code": "student_profile_required",
+            "classId": class_id,
+        }), 409)
+    return membership, None
 
 
 def _education_json(raw, default):
-    if not raw:
-        return default
     if isinstance(raw, type(default)):
         return raw
+    if not raw:
+        return default
     try:
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return default
     return value if isinstance(value, type(default)) else default
+
+
+def _education_snapshot_graph(snapshot) -> dict:
+    return _load_api_graph(str(snapshot["id"]))
 
 
 def _education_node_title(node: dict) -> str:
@@ -1911,28 +1557,29 @@ def _education_snapshot_pdf_meta(row) -> dict | None:
 
 
 def _education_public_snapshot(row, include_graph=False, *, include_source=True) -> dict:
-    nodes = _education_json(row["nodes_json"], [])
-    edges = _education_json(row["edges_json"], [])
     payload = {
         "id": row["id"],
         "classId": row["class_id"],
         "snapshotType": row["snapshot_type"] if "snapshot_type" in row.keys() else "graph",
         "sourceGraphId": row["source_graph_id"],
         "filename": row["filename"],
-        "nodeCount": len(nodes),
-        "edgeCount": len(edges),
+        "nodeCount": int(row["node_count"] or 0),
+        "edgeCount": int(row["edge_count"] or 0),
         "createdAt": row["created_at"],
     }
     if "bound_assignment_count" in row.keys():
         payload["boundAssignmentCount"] = int(row["bound_assignment_count"] or 0)
+    if "course_order" in row.keys() and row["course_order"] is not None:
+        payload["courseOrder"] = int(row["course_order"])
     if include_graph:
-        # Snapshots are immutable teaching records.  Apply the same safe,
+        graph = _education_snapshot_graph(row)
+        # Snapshots are immutable teaching records. Apply the same safe,
         # response-only compatibility projection used for normal history.
-        nodes = _legacy_display_nodes(nodes, row["source_markdown"] or "")
+        nodes = _legacy_display_nodes(graph["nodes"], row["source_markdown"] or "")
         meta = _education_snapshot_pdf_meta(row)
         payload.update({
             "nodes": nodes,
-            "edges": edges,
+            "edges": graph["edges"],
             "sourceMarkdown": row["source_markdown"] or "" if include_source else "",
             "latexMacros": _education_json(row["latex_macros_json"], {}) if include_source else {},
             "sourcePdf": ({
@@ -1947,14 +1594,79 @@ def _education_public_snapshot(row, include_graph=False, *, include_source=True)
     return payload
 
 
+def _education_course_graph_key(snapshot) -> str:
+    source_graph_id = str(snapshot["source_graph_id"] or "").strip()
+    return f"source:{source_graph_id}" if source_graph_id else f"snapshot:{snapshot['id']}"
+
+
+def _education_course_graph_groups(rows) -> dict[str, dict]:
+    groups: dict[str, dict] = {}
+    for row in rows:
+        key = _education_course_graph_key(row)
+        current = groups.get(key)
+        if current is None:
+            groups[key] = {"canonical": row, "rows": [row]}
+            continue
+        current["rows"].append(row)
+        canonical = current["canonical"]
+        if (str(row["created_at"] or ""), str(row["id"])) < (str(canonical["created_at"] or ""), str(canonical["id"])):
+            current["canonical"] = row
+    return groups
+
+
+def _education_course_graph_snapshot_rows(db, class_id: str):
+    return db.execute(
+        """SELECT s.*,
+                  (SELECT COUNT(*) FROM education_assignments a WHERE a.snapshot_id = s.id)
+                    AS bound_assignment_count,
+                  o.sort_order AS course_order
+             FROM education_snapshots s
+        LEFT JOIN education_course_graph_order o
+               ON o.class_id = s.class_id
+              AND o.graph_key = CASE
+                    WHEN s.source_graph_id IS NOT NULL AND TRIM(s.source_graph_id) != ''
+                      THEN CONCAT('source:', s.source_graph_id)
+                    ELSE CONCAT('snapshot:', s.id)
+                  END
+            WHERE s.class_id = ? AND COALESCE(s.snapshot_type, 'graph') = 'graph'
+            ORDER BY CASE WHEN o.sort_order IS NULL THEN 1 ELSE 0 END ASC,
+                     o.sort_order ASC, s.created_at ASC, s.id ASC""",
+        (class_id,),
+    ).fetchall()
+
+
 def _education_public_assessments(assignment_id: str, *, role: str | None, user_id: int | None = None) -> list[dict]:
-    node_rows = _education_repository.list_assessments(
-        assignment_id, role=role, user_id=user_id
-    )
+    db = _get_db()
+    node_rows = db.execute(
+        """SELECT assignment_id, node_id, status, last_error, updated_at
+             FROM education_assessment_nodes
+            WHERE assignment_id = ? ORDER BY node_id""",
+        (assignment_id,),
+    ).fetchall()
+    question_rows = db.execute(
+        """SELECT * FROM education_assessment_questions
+            WHERE assignment_id = ? ORDER BY node_id, sort_order""",
+        (assignment_id,),
+    ).fetchall()
+    questions_by_node: dict[int, list] = defaultdict(list)
+    for question in question_rows:
+        questions_by_node[int(question["node_id"])].append(question)
+    attempts_by_node = {}
+    if role == "student" and user_id is not None:
+        attempts_by_node = {
+            int(attempt["node_id"]): attempt
+            for attempt in db.execute(
+                """SELECT node_id, status, updated_at, completed_at
+                     FROM education_assessment_attempts
+                    WHERE assignment_id = ? AND user_id = ?""",
+                (assignment_id, user_id),
+            ).fetchall()
+        }
+
     assessments = []
     for node_row in node_rows:
         node_id = int(node_row["node_id"])
-        questions = node_row.get("questions") or []
+        questions = questions_by_node.get(node_id, [])
         payload = {
             "nodeId": node_id,
             "status": node_row["status"],
@@ -1983,15 +1695,40 @@ def _education_public_assessments(assignment_id: str, *, role: str | None, user_
                 for question in questions
             ]
         elif role == "student":
-            attempt = node_row.get("attempt")
+            attempt = attempts_by_node.get(node_id)
             payload["attemptStatus"] = attempt["status"] if attempt else "not_started"
             payload["attemptUpdatedAt"] = attempt["updated_at"] if attempt else None
         assessments.append(payload)
     return assessments
 
 
+def _education_utc_timestamp(value):
+    if not value:
+        return value
+    timestamp = str(value)
+    if timestamp.endswith("Z") or re.search(r"[+-]\d{2}:\d{2}$", timestamp):
+        return timestamp
+    return f"{timestamp}Z"
+
+
 def _education_public_submission_summary(assignment_id: str, user_id: int) -> dict | None:
-    return _education_repository.get_submission_summary(assignment_id, user_id)
+    row = _get_db().execute(
+        "SELECT * FROM education_assignment_submissions WHERE assignment_id = ? AND user_id = ?",
+        (assignment_id, user_id),
+    ).fetchone()
+    if not row:
+        return None
+    payload = {
+        "id": row["id"],
+        "status": row["status"],
+        "submittedAt": row["submitted_at"],
+        "updatedAt": row["updated_at"],
+        "releasedAt": row["released_at"],
+    }
+    if row["status"] == "released":
+        payload["teacherTotal"] = float(row["teacher_total"] or 0)
+        payload["teacherSummary"] = row["teacher_summary"] or ""
+    return payload
 
 
 def _education_public_assignment(row, *, snapshot=None, path=None, role=None, user_id=None) -> dict:
@@ -2004,7 +1741,7 @@ def _education_public_assignment(row, *, snapshot=None, path=None, role=None, us
         "snapshotId": row["snapshot_id"],
         "title": row["title"],
         "targetNodeId": row["target_node_id"],
-        "dueAt": row["due_at"],
+        "dueAt": _education_utc_timestamp(row["due_at"]),
         "status": row["status"],
         "summary": row["summary"],
         "version": row["version"],
@@ -2017,6 +1754,13 @@ def _education_public_assignment(row, *, snapshot=None, path=None, role=None, us
             row["id"], role=role, user_id=int(user_id) if user_id is not None else None
         ),
     }
+    if payload["assignmentType"] == "direct":
+        payload["growthChallenge"] = education_game.challenge_access_payload(
+            _get_db(),
+            class_id=row["class_id"],
+            assignment_id=row["id"],
+            user_id=int(user_id) if role == "student" and user_id is not None else None,
+        )
     if role == "student" and user_id is not None:
         payload["submission"] = _education_public_submission_summary(row["id"], int(user_id))
     if snapshot is not None:
@@ -2042,7 +1786,50 @@ def _education_public_assignment(row, *, snapshot=None, path=None, role=None, us
 
 
 def _education_progress_map(assignment_id: str, user_id: int) -> dict[int, dict]:
-    return _education_repository.get_progress_map(assignment_id, user_id)
+    rows = _get_db().execute(
+        """SELECT node_id, state, mastery_source, diagnostic_summary, updated_at
+           FROM education_node_progress WHERE assignment_id = ? AND user_id = ?""",
+        (assignment_id, user_id),
+    ).fetchall()
+    return {
+        int(row["node_id"]): {
+            "state": row["state"],
+            "masterySource": row["mastery_source"],
+            "diagnosticSummary": row["diagnostic_summary"],
+            "updatedAt": row["updated_at"],
+        }
+        for row in rows
+    }
+
+
+def _education_consume_ai_quota(user_id: int) -> tuple[bool, int]:
+    limit = _education_daily_limit()
+    if limit <= 0:
+        return False, 0
+    today = datetime.utcnow().date().isoformat()
+    now = datetime.utcnow().isoformat()
+    db = _get_db()
+    row = db.execute(
+        "SELECT request_count FROM education_ai_usage WHERE user_id = ? AND usage_day = ? FOR UPDATE",
+        (user_id, today),
+    ).fetchone()
+    count = int(row["request_count"] or 0) if row else 0
+    if count >= limit:
+        db.rollback()
+        return False, 0
+    count += 1
+    if row:
+        db.execute(
+            "UPDATE education_ai_usage SET request_count = ?, updated_at = ? WHERE user_id = ? AND usage_day = ?",
+            (count, now, user_id, today),
+        )
+    else:
+        db.execute(
+            "INSERT INTO education_ai_usage (user_id, usage_day, request_count, updated_at) VALUES (?, ?, ?, ?)",
+            (user_id, today, count, now),
+        )
+    db.commit()
+    return True, max(limit - count, 0)
 
 
 def _education_ai_tasks(
@@ -2060,26 +1847,23 @@ def _education_ai_tasks(
             "education AI is not configured",
             503,
         )
-    claim = _assessment_repository.claim_ai_task(
-        task_id,
-        user_id,
-        task_kind,
-        scope,
-        _education_daily_limit(),
-    )
-    if not claim["claimed"] and claim.get("reason") == "limit":
+    allowed, _remaining = _education_consume_ai_quota(user_id)
+    if not allowed:
         raise EducationAIError(
             "education_ai_limit_reached",
             "education AI daily limit reached",
             429,
         )
-    if not claim["claimed"] and claim.get("status") == "running":
-        raise EducationAIError(
-            "education_ai_task_in_progress",
-            "education AI task is already running",
-            409,
-        )
-    record_id = claim.get("id")
+    record_id = uuid.uuid4().hex
+    now = datetime.utcnow().isoformat()
+    db = _get_db()
+    db.execute(
+        """INSERT INTO education_ai_tasks
+             (id, task_key, user_id, task_kind, scope, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'running', ?, ?)""",
+        (record_id, task_id, user_id, task_kind, scope, now, now),
+    )
+    db.commit()
     try:
         context = create_education_context(_DATA_ROOT, config)
         checkpoint_dir = _EDUCATION_ROOT / scope / "llm_tasks" / task_kind
@@ -2089,13 +1873,20 @@ def _education_ai_tasks(
             task_kind=task_kind,
             checkpoint_dir=checkpoint_dir,
         )
-        if record_id:
-            _assessment_repository.finish_ai_task(record_id)
+        db.execute(
+            "UPDATE education_ai_tasks SET status = 'done', updated_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), record_id),
+        )
+        db.commit()
         return result
     except Exception as exc:
         safe_error = _education_safe_error_message(exc, config)
-        if record_id:
-            _assessment_repository.finish_ai_task(record_id, error=safe_error)
+        db.execute(
+            """UPDATE education_ai_tasks
+               SET status = 'failed', error = ?, updated_at = ? WHERE id = ?""",
+            (safe_error[:1000], datetime.utcnow().isoformat(), record_id),
+        )
+        db.commit()
         if safe_error != str(exc):
             raise RuntimeError(safe_error) from None
         raise
@@ -2116,7 +1907,7 @@ def _education_ai_task(*, user_id: int, task_id: str, task_kind: str, payload: d
 
 
 def _education_path_payload(snapshot, deterministic: dict, *, progress=None) -> dict:
-    nodes = _education_json(snapshot["nodes_json"], [])
+    nodes = _education_snapshot_graph(snapshot)["nodes"]
     node_by_id = {int(node["id"]): node for node in nodes if isinstance(node.get("id"), int)}
     candidate_ids = deterministic.get("candidateNodeIds") or []
     base_path = [
@@ -2364,14 +2155,13 @@ def _education_begin_assessment_write(
     expected_question_updated_at: str | None = None,
 ) -> None:
     """Lock and revalidate a draft assessment immediately before mutation."""
-    db.execute("BEGIN IMMEDIATE")
     assignment = db.execute(
-        "SELECT status, base_path_json FROM education_assignments WHERE id = ?",
+        "SELECT status, base_path_json FROM education_assignments WHERE id = ? FOR UPDATE",
         (assignment_id,),
     ).fetchone()
     path_node_ids = _education_path_node_ids(_education_json(assignment["base_path_json"], {})) if assignment else []
     node = db.execute(
-        "SELECT updated_at FROM education_assessment_nodes WHERE assignment_id = ? AND node_id = ?",
+        "SELECT updated_at FROM education_assessment_nodes WHERE assignment_id = ? AND node_id = ? FOR UPDATE",
         (assignment_id, node_id),
     ).fetchone()
     if (
@@ -2388,7 +2178,7 @@ def _education_begin_assessment_write(
         )
     if question_id is not None:
         question = db.execute(
-            "SELECT updated_at FROM education_assessment_questions WHERE id = ? AND assignment_id = ? AND node_id = ?",
+            "SELECT updated_at FROM education_assessment_questions WHERE id = ? AND assignment_id = ? AND node_id = ? FOR UPDATE",
             (question_id, assignment_id, node_id),
         ).fetchone()
         if not question or question["updated_at"] != expected_question_updated_at:
@@ -2409,8 +2199,9 @@ def _education_mark_assessment_failed(db, assignment_id: str, node_id: int, erro
 
 
 def _education_generate_initial_assessments(*, assignment_id: str, user_id: int, snapshot, path: dict) -> None:
-    nodes = _education_json(snapshot["nodes_json"], [])
+    nodes = _education_snapshot_graph(snapshot)["nodes"]
     tasks = build_assessment_tasks(nodes, path)
+    db = _get_db()
     node_ids = _education_path_node_ids(path)
     try:
         results = _education_ai_tasks(
@@ -2422,42 +2213,39 @@ def _education_generate_initial_assessments(*, assignment_id: str, user_id: int,
         )
     except Exception as exc:
         for node_id in node_ids:
-            _assessment_repository.mark_assessment_failed(
-                assignment_id, node_id, str(exc)
-            )
+            _education_mark_assessment_failed(db, assignment_id, node_id, str(exc))
+        db.commit()
         return
     for node_id in node_ids:
         result = results.get(str(node_id))
         if not isinstance(result, dict):
-            _assessment_repository.mark_assessment_failed(
-                assignment_id, node_id, "assessment_invalid_result"
-            )
+            _education_mark_assessment_failed(db, assignment_id, node_id, "assessment_invalid_result")
             continue
         try:
-            category = (tasks.get(str(node_id)) or {}).get("category")
-            required_kinds = ASSESSMENT_QUESTION_KINDS.get(category) or ()
-            _assessment_repository.replace_node_questions(
+            _education_replace_assessment_questions(
+                db,
                 assignment_id,
                 node_id,
-                result.get("questions") or [],
-                required_kinds,
+                result,
+                (tasks.get(str(node_id)) or {}).get("category"),
             )
-        except (KeyError, TypeError, ValueError):
-            _assessment_repository.mark_assessment_failed(
-                assignment_id, node_id, "assessment_invalid_result"
-            )
+        except (TypeError, ValueError):
+            _education_mark_assessment_failed(db, assignment_id, node_id, "assessment_invalid_result")
+    _education_rebalance_question_scores(db, assignment_id)
+    db.commit()
 
 
 @app.route("/api/v2/edu/status", methods=["GET"])
 def education_status():
     user = _current_user()
-    used = (
-        _education_repository.ai_usage_count(
-            int(user["id"]), datetime.utcnow().date()
-        )
-        if user
-        else 0
-    )
+    used = 0
+    if user:
+        today = datetime.utcnow().date().isoformat()
+        row = _get_db().execute(
+            "SELECT request_count FROM education_ai_usage WHERE user_id = ? AND usage_day = ?",
+            (user["id"], today),
+        ).fetchone()
+        used = int(row["request_count"] or 0) if row else 0
     limit = _education_daily_limit()
     return jsonify({
         "enabled": _education_enabled(),
@@ -2472,27 +2260,53 @@ def education_classes():
     user, error = _education_require_user("teacher" if request.method == "POST" else None)
     if error:
         return error
+    db = _get_db()
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
         title = str(body.get("title") or "").strip()
         if not title:
             return jsonify({"error": "class title is required"}), 400
-        created = _education_repository.create_class(int(user["id"]), title)
+        class_id = uuid.uuid4().hex
+        invite_code = secrets.token_hex(4).upper()
+        now = datetime.utcnow().isoformat()
+        db.execute(
+            """INSERT INTO education_classes
+                 (id, owner_user_id, title, invite_code, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (class_id, user["id"], title[:120], invite_code, now),
+        )
+        db.execute(
+            """INSERT INTO education_memberships (class_id, user_id, role, joined_at)
+               VALUES (?, ?, 'teacher', ?)""",
+            (class_id, user["id"], now),
+        )
+        db.commit()
         return jsonify({
             "class": {
-                "id": created["id"],
-                "title": created["title"],
-                "inviteCode": created["invite_code"],
+                "id": class_id,
+                "title": title[:120],
+                "inviteCode": invite_code,
                 "role": "teacher",
                 "memberCount": 1,
                 "assignmentCount": 0,
-                "createdAt": created["created_at"],
+                "createdAt": now,
             },
         }), 201
 
-    rows = _education_repository.list_user_classes(
-        int(user["id"]), user["education_role"]
-    )
+    assignment_count_filter = "ca.status = 'published'" if user["education_role"] == "student" else "ca.status != 'archived'"
+    rows = db.execute(
+        f"""SELECT c.*, m.role, m.student_name, m.student_number,
+                  (SELECT COUNT(*) FROM education_memberships cm
+                   WHERE cm.class_id = c.id AND cm.removed_at IS NULL) AS member_count,
+                  (SELECT COUNT(*) FROM education_assignments ca
+                   WHERE ca.class_id = c.id AND {assignment_count_filter}) AS assignment_count
+           FROM education_memberships m
+           JOIN education_classes c ON c.id = m.class_id
+           WHERE m.user_id = ? AND m.role = ? AND m.removed_at IS NULL
+             AND c.archived_at IS NULL
+           ORDER BY c.created_at DESC""",
+        (user["id"], user["education_role"]),
+    ).fetchall()
     return jsonify({
         "classes": [
             {
@@ -2522,36 +2336,71 @@ def education_class_join(class_id: str):
         return error
     body = request.get_json(silent=True) or {}
     invite_code = str(body.get("inviteCode") or class_id).strip().upper()
-    student_name, student_number, error = _education_student_profile(body)
-    if error:
-        return error
-    try:
-        class_row = _education_repository.join_student(
-            class_id,
-            invite_code,
-            int(user["id"]),
-            student_name,
-            student_number,
-        )
-    except LookupError:
+    db = _get_db()
+    class_row = db.execute(
+        """SELECT * FROM education_classes
+           WHERE archived_at IS NULL AND (id = ? OR invite_code = ?)""",
+        (class_id, invite_code),
+    ).fetchone()
+    if not class_row or invite_code != class_row["invite_code"]:
         return jsonify({"error": "invalid invite code", "code": "invalid_invite_code"}), 404
-    except ClassRoleConflictError:
-        return jsonify({"error": "this account is already the teacher of this class", "code": "class_role_conflict"}), 409
-    except MembershipRemovedError:
-        return jsonify({
-            "error": "this account has been removed from the class",
-            "code": "class_membership_removed",
-        }), 403
-    except StudentNumberConflictError:
-        return jsonify({
-            "error": "student number is already used in this class",
-            "code": "student_number_conflict",
-        }), 409
+    existing = db.execute(
+        "SELECT role, removed_at FROM education_memberships WHERE class_id = ? AND user_id = ?",
+        (class_row["id"], user["id"]),
+    ).fetchone()
+    if existing:
+        if existing["role"] != "student":
+            return jsonify({"error": "this account is already the teacher of this class", "code": "class_role_conflict"}), 409
+        if existing["removed_at"]:
+            return jsonify({
+                "error": "this account has been removed from the class",
+                "code": "class_membership_removed",
+            }), 403
+        role = "student"
+        student_name, student_number, error = _education_student_profile(body)
+        if error:
+            return error
+        try:
+            db.execute(
+                """UPDATE education_memberships
+                   SET student_name = ?, student_number = ?
+                   WHERE class_id = ? AND user_id = ?""",
+                (student_name, student_number, class_row["id"], user["id"]),
+            )
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return jsonify({
+                "error": "student number is already used in this class",
+                "code": "student_number_conflict",
+            }), 409
+    else:
+        role = "student"
+        student_name, student_number, error = _education_student_profile(body)
+        if error:
+            return error
+        try:
+            db.execute(
+                """INSERT INTO education_memberships
+                     (class_id, user_id, role, student_name, student_number, joined_at)
+                   VALUES (?, ?, 'student', ?, ?, ?)""",
+                (
+                    class_row["id"], user["id"], student_name, student_number,
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return jsonify({
+                "error": "student number is already used in this class",
+                "code": "student_number_conflict",
+            }), 409
     return jsonify({
         "class": {
             "id": class_row["id"],
             "title": class_row["title"],
-            "role": "student",
+            "role": role,
             "studentName": student_name,
             "studentNumber": student_number,
             "profileComplete": True,
@@ -2574,14 +2423,17 @@ def education_class_membership_update(class_id: str):
     student_name, student_number, error = _education_student_profile(body)
     if error:
         return error
+    db = _get_db()
     try:
-        membership = _education_repository.update_student_profile(
-            class_id,
-            int(user["id"]),
-            student_name,
-            student_number,
+        db.execute(
+            """UPDATE education_memberships
+               SET student_name = ?, student_number = ?
+               WHERE class_id = ? AND user_id = ?""",
+            (student_name, student_number, class_id, user["id"]),
         )
-    except StudentNumberConflictError:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
         return jsonify({
             "error": "student number is already used in this class",
             "code": "student_number_conflict",
@@ -2599,12 +2451,12 @@ def education_class_membership_update(class_id: str):
 
 
 def _education_require_class_teacher(class_id: str, user):
-    try:
-        return _education_access_service.class_teacher(
-            class_id, user_id=int(user["id"])
-        ), None
-    except EducationAccessError as exc:
-        return None, (jsonify({"error": exc.message}), exc.status)
+    membership, error = _education_require_membership(class_id, user, {"teacher"})
+    if error:
+        return None, error
+    if int(membership["owner_user_id"]) != int(user["id"]):
+        return None, (jsonify({"error": "forbidden"}), 403)
+    return membership, None
 
 
 @app.route("/api/v2/edu/classes/<class_id>", methods=["PATCH", "DELETE"])
@@ -2615,17 +2467,429 @@ def education_class_manage(class_id: str):
     _membership, error = _education_require_class_teacher(class_id, user)
     if error:
         return error
+    db = _get_db()
     if request.method == "PATCH":
         body = request.get_json(silent=True) or {}
         title = str(body.get("title") or "").strip()
         if not title:
             return jsonify({"error": "class title is required", "code": "class_title_required"}), 400
         title = title[:120]
-        _education_repository.rename_class(class_id, title)
+        db.execute(
+            "UPDATE education_classes SET title = ? WHERE id = ?",
+            (title, class_id),
+        )
+        db.commit()
         return jsonify({"class": {"id": class_id, "title": title}})
 
-    archived_at = _education_repository.archive_class(class_id)
-    return jsonify({"ok": True, "archivedAt": archived_at})
+    now = datetime.utcnow().isoformat()
+    db.execute(
+        "UPDATE education_classes SET archived_at = ? WHERE id = ? AND archived_at IS NULL",
+        (now, class_id),
+    )
+    db.commit()
+    return jsonify({"ok": True, "archivedAt": now})
+
+
+@app.route("/api/v2/edu/classes/<class_id>/game-summary", methods=["GET"])
+def education_class_game_summary(class_id: str):
+    user, error = _education_require_user()
+    if error:
+        return error
+    membership, error = _education_require_membership(class_id, user)
+    if error:
+        return error
+    return jsonify(
+        education_game.build_game_summary(
+            _get_db(),
+            class_row=membership,
+            user_id=int(user["id"]),
+            role=membership["role"],
+        )
+    )
+
+
+@app.route("/api/v2/edu/classes/<class_id>/game-settings", methods=["PATCH"])
+def education_class_game_settings(class_id: str):
+    user, error = _education_require_user("teacher")
+    if error:
+        return error
+    membership, error = _education_require_class_teacher(class_id, user)
+    if error:
+        return error
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "a JSON object is required"}), 400
+    unsupported = sorted(set(body) - {"studentExperience", "weeklyXpGoal"})
+    if unsupported:
+        return jsonify({"error": "unsupported game setting"}), 400
+    if not body:
+        return jsonify({"error": "studentExperience or weeklyXpGoal is required"}), 400
+
+    if "studentExperience" in body:
+        if not isinstance(body["studentExperience"], str) or body["studentExperience"] not in education_game.VALID_EXPERIENCES:
+            return jsonify({"error": "studentExperience must be classic or map"}), 400
+
+    if "weeklyXpGoal" in body:
+        value = body["weeklyXpGoal"]
+        if isinstance(value, bool) or not isinstance(value, int) or not 10 <= value <= 500:
+            return jsonify({"error": "weeklyXpGoal must be an integer between 10 and 500"}), 400
+
+    db = _get_db()
+    try:
+        row = db.execute(
+            "SELECT * FROM education_classes WHERE id = ? FOR UPDATE",
+            (class_id,),
+        ).fetchone()
+        if not row:
+            db.rollback()
+            return jsonify({"error": "class not found"}), 404
+        previous = education_game.settings_payload(row)
+        experience = body.get("studentExperience", previous["studentExperience"])
+        weekly_goal = body.get("weeklyXpGoal", previous["weeklyXpGoal"])
+        db.execute(
+            """UPDATE education_classes
+                  SET student_experience = ?, weekly_xp_goal = ?
+                WHERE id = ?""",
+            (experience, weekly_goal, class_id),
+        )
+        education_game.record_game_mode_change(
+            db,
+            class_id=class_id,
+            previous_mode=previous["studentExperience"],
+            next_mode=experience,
+            timezone_name=previous["timezone"],
+        )
+        if previous["studentExperience"] != "map" and experience == "map":
+            backfill = education_game.backfill_class_game_events(db, class_id)
+            affected_users = backfill["userIds"]
+        else:
+            affected_users = []
+        for user_id in affected_users:
+            education_game.reconcile_student_growth(
+                db,
+                class_id=class_id,
+                user_id=user_id,
+            )
+            education_game.reconcile_student_achievements(
+                db,
+                class_id=class_id,
+                user_id=user_id,
+                weekly_goal=weekly_goal,
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    updated = db.execute(
+        "SELECT * FROM education_classes WHERE id = ?",
+        (class_id,),
+    ).fetchone()
+    return jsonify({"settings": education_game.settings_payload(updated)})
+
+
+def _education_game_student(class_id: str):
+    user, error = _education_require_user(required_role="student")
+    if error:
+        return None, None, error
+    membership, error = _education_require_membership(class_id, user, {"student"})
+    if error:
+        return None, None, error
+    return user, membership, None
+
+
+def _education_game_value_error(db, cause: ValueError):
+    db.rollback()
+    code = str(cause) or "game_operation_invalid"
+    return jsonify({"error": code, "code": code}), 409
+
+
+@app.route("/api/v2/edu/classes/<class_id>/checkins", methods=["POST"])
+def education_game_checkin(class_id: str):
+    user, membership, error = _education_game_student(class_id)
+    if error:
+        return error
+    db = _get_db()
+    try:
+        payload = education_game.check_in_student(db, class_row=membership, user_id=int(user["id"]))
+        db.commit()
+        return jsonify(payload)
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
+
+
+@app.route("/api/v2/edu/classes/<class_id>/checkins/revive", methods=["POST"])
+def education_game_checkin_revive(class_id: str):
+    user, membership, error = _education_game_student(class_id)
+    if error:
+        return error
+    db = _get_db()
+    try:
+        checkin = education_game.revive_yesterday(db, class_row=membership, user_id=int(user["id"]))
+        db.commit()
+        return jsonify({"checkin": checkin})
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
+
+
+@app.route("/api/v2/edu/classes/<class_id>/inventory/xp-card/activate", methods=["POST"])
+def education_game_activate_xp_card(class_id: str):
+    user, _membership, error = _education_game_student(class_id)
+    if error:
+        return error
+    db = _get_db()
+    try:
+        inventory = education_game.activate_xp_card(db, class_id=class_id, user_id=int(user["id"]))
+        db.commit()
+        return jsonify({"inventory": inventory})
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
+
+
+@app.route("/api/v2/edu/classes/<class_id>/growth-rewards/<reward_id>/claim", methods=["POST"])
+def education_game_claim_growth_choice(class_id: str, reward_id: str):
+    user, _membership, error = _education_game_student(class_id)
+    if error:
+        return error
+    body = request.get_json(silent=True) or {}
+    option_key = body.get("optionKey")
+    if not isinstance(option_key, str) or not option_key:
+        return jsonify({"error": "optionKey is required"}), 400
+    db = _get_db()
+    try:
+        reward = education_game.claim_five_level_choice(db, class_id=class_id, user_id=int(user["id"]), reward_id=reward_id, option_key=option_key)
+        db.commit()
+        return jsonify({"reward": reward})
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
+
+
+@app.route("/api/v2/edu/classes/<class_id>/collectibles/equip", methods=["POST"])
+def education_game_equip_collectible(class_id: str):
+    user, _membership, error = _education_game_student(class_id)
+    if error:
+        return error
+    body = request.get_json(silent=True) or {}
+    collectible_key = body.get("collectibleKey")
+    if not isinstance(collectible_key, str) or not collectible_key:
+        return jsonify({"error": "collectibleKey is required"}), 400
+    db = _get_db()
+    try:
+        collectible = education_game.equip_collectible(db, class_id=class_id, user_id=int(user["id"]), collectible_key=collectible_key)
+        db.commit()
+        return jsonify({"collectible": collectible})
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
+
+
+@app.route("/api/v2/edu/classes/<class_id>/game-notifications/seen", methods=["POST"])
+def education_game_mark_seen(class_id: str):
+    user, _membership, error = _education_game_student(class_id)
+    if error:
+        return error
+    body = request.get_json(silent=True) or {}
+    growth_ids = body.get("growthIds", [])
+    chest_ids = body.get("chestIds", [])
+    if (
+        not isinstance(growth_ids, list)
+        or not isinstance(chest_ids, list)
+        or not all(isinstance(value, str) and value for value in growth_ids)
+        or not all(isinstance(value, str) and value for value in chest_ids)
+    ):
+        return jsonify({"error": "growthIds and chestIds must be string arrays"}), 400
+    db = _get_db()
+    education_game.mark_game_rewards_seen(db, class_id=class_id, user_id=int(user["id"]), growth_ids=growth_ids[:100], chest_ids=chest_ids[:100])
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v2/edu/classes/<class_id>/leaderboards", methods=["GET"])
+def education_game_leaderboard(class_id: str):
+    user, error = _education_require_user()
+    if error:
+        return error
+    _membership, error = _education_require_membership(class_id, user)
+    if error:
+        return error
+    kind = request.args.get("kind", "xp")
+    try:
+        return jsonify(education_game.build_leaderboard(_get_db(), class_id=class_id, viewer_user_id=int(user["id"]), kind=kind))
+    except ValueError:
+        return jsonify({"error": "kind must be xp or gems"}), 400
+
+
+@app.route("/api/v2/edu/classes/<class_id>/shop", methods=["GET"])
+def education_game_shop(class_id: str):
+    user, error = _education_require_user()
+    if error:
+        return error
+    membership, error = _education_require_membership(class_id, user)
+    if error:
+        return error
+    include_inactive = membership["role"] == "teacher" and request.args.get("includeInactive") == "1"
+    db = _get_db()
+    items = education_game.list_shop_items(db, class_id=class_id, include_inactive=include_inactive)
+    db.commit()
+    return jsonify({"items": items})
+
+
+@app.route("/api/v2/edu/classes/<class_id>/shop/items/<item_id>/redeem", methods=["POST"])
+def education_game_redeem_shop_item(class_id: str, item_id: str):
+    user, _membership, error = _education_game_student(class_id)
+    if error:
+        return error
+    db = _get_db()
+    try:
+        redemption = education_game.redeem_shop_item(db, class_id=class_id, user_id=int(user["id"]), item_id=item_id)
+        db.commit()
+        return jsonify({"redemption": redemption}), 201
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
+
+
+@app.route("/api/v2/edu/classes/<class_id>/shop/redemptions", methods=["GET"])
+def education_game_student_redemptions(class_id: str):
+    user, _membership, error = _education_game_student(class_id)
+    if error:
+        return error
+    return jsonify({"redemptions": education_game.list_student_redemptions(_get_db(), class_id=class_id, user_id=int(user["id"]))})
+
+
+@app.route("/api/v2/edu/classes/<class_id>/shop/items", methods=["POST"])
+def education_game_create_shop_item(class_id: str):
+    user, error = _education_require_user(required_role="teacher")
+    if error:
+        return error
+    _membership, error = _education_require_class_teacher(class_id, user)
+    if error:
+        return error
+    body = request.get_json(silent=True) or {}
+    try:
+        item = education_game.create_or_update_custom_shop_item(
+            _get_db(), class_id=class_id, teacher_user_id=int(user["id"]), item_id=None,
+            title=body.get("title", ""), description=body.get("description", ""), gem_price=body.get("gemPrice"),
+            stock=body.get("stock"), active=body.get("active", True),
+        )
+        _get_db().commit()
+        return jsonify({"item": item}), 201
+    except ValueError as cause:
+        return _education_game_value_error(_get_db(), cause)
+
+
+@app.route("/api/v2/edu/classes/<class_id>/shop/items/<item_id>", methods=["PATCH"])
+def education_game_update_shop_item(class_id: str, item_id: str):
+    user, error = _education_require_user(required_role="teacher")
+    if error:
+        return error
+    _membership, error = _education_require_class_teacher(class_id, user)
+    if error:
+        return error
+    body = request.get_json(silent=True) or {}
+    db = _get_db()
+    current = db.execute("SELECT * FROM education_shop_items WHERE id = ? AND class_id = ?", (item_id, class_id)).fetchone()
+    if not current:
+        return jsonify({"error": "shop item not found"}), 404
+    try:
+        item = education_game.create_or_update_custom_shop_item(
+            db, class_id=class_id, teacher_user_id=int(user["id"]), item_id=item_id,
+            title=body.get("title", current["title"]), description=body.get("description", current["description"]),
+            gem_price=body.get("gemPrice", int(current["gem_price"])), stock=body.get("stock", current["stock_quantity"]),
+            active=body.get("active", bool(current["is_active"])),
+        )
+        db.commit()
+        return jsonify({"item": item})
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
+
+
+@app.route("/api/v2/edu/classes/<class_id>/shop/redemptions/manage", methods=["GET"])
+def education_game_manage_redemptions(class_id: str):
+    user, error = _education_require_user(required_role="teacher")
+    if error:
+        return error
+    _membership, error = _education_require_class_teacher(class_id, user)
+    if error:
+        return error
+    return jsonify({"redemptions": education_game.list_teacher_redemptions(_get_db(), class_id=class_id)})
+
+
+@app.route("/api/v2/edu/classes/<class_id>/shop/redemptions/<redemption_id>/resolve", methods=["POST"])
+def education_game_resolve_redemption(class_id: str, redemption_id: str):
+    user, error = _education_require_user(required_role="teacher")
+    if error:
+        return error
+    _membership, error = _education_require_class_teacher(class_id, user)
+    if error:
+        return error
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    if not isinstance(action, str):
+        return jsonify({"error": "action is required"}), 400
+    db = _get_db()
+    try:
+        redemption = education_game.resolve_redemption(db, class_id=class_id, redemption_id=redemption_id, teacher_user_id=int(user["id"]), action=action)
+        db.commit()
+        return jsonify({"redemption": redemption})
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
+
+
+@app.route("/api/v2/edu/classes/<class_id>/gems/grants", methods=["GET", "POST"])
+def education_game_teacher_gem_grant(class_id: str):
+    user, error = _education_require_user(required_role="teacher")
+    if error:
+        return error
+    _membership, error = _education_require_class_teacher(class_id, user)
+    if error:
+        return error
+    if request.method == "GET":
+        return jsonify({"awards": education_game.list_teacher_gem_awards(_get_db(), class_id=class_id)})
+    body = request.get_json(silent=True) or {}
+    target_user_id = body.get("userId")
+    amount = body.get("amount")
+    reason = body.get("reason")
+    if isinstance(target_user_id, bool) or not isinstance(target_user_id, int) or not isinstance(reason, str):
+        return jsonify({"error": "userId, amount, and reason are required"}), 400
+    db = _get_db()
+    try:
+        award = education_game.grant_teacher_gems(db, class_id=class_id, user_id=target_user_id, amount=amount, reason=reason, teacher_user_id=int(user["id"]))
+        db.commit()
+        return jsonify({"award": award})
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
+
+
+@app.route("/api/v2/edu/assignments/<assignment_id>/growth-challenge", methods=["GET", "PUT", "DELETE"])
+def education_game_challenge_rule(assignment_id: str):
+    user, error = _education_require_user(required_role="teacher")
+    if error:
+        return error
+    assignment, _snapshot, membership, error = _education_assignment_context(assignment_id, user)
+    if error:
+        return error
+    if membership["role"] != "teacher":
+        return jsonify({"error": "forbidden"}), 403
+    db = _get_db()
+    if request.method == "GET":
+        return jsonify({"challenge": education_game.challenge_access_payload(db, class_id=assignment["class_id"], assignment_id=assignment_id, user_id=None)})
+    if request.method == "DELETE":
+        education_game.clear_challenge_unlock_rule(db, class_id=assignment["class_id"], assignment_id=assignment_id)
+        db.commit()
+        return jsonify({"ok": True})
+    body = request.get_json(silent=True) or {}
+    allowed = {"requiredLevel", "requiredStageKey", "requiredStageMilestone"}
+    if set(body) - allowed:
+        return jsonify({"error": "unsupported growth challenge field"}), 400
+    try:
+        challenge = education_game.set_challenge_unlock_rule(
+            db, class_id=assignment["class_id"], assignment_id=assignment_id,
+            required_level=body.get("requiredLevel"), required_stage_key=body.get("requiredStageKey"),
+            required_stage_milestone=body.get("requiredStageMilestone"),
+        )
+        db.commit()
+        return jsonify({"challenge": challenge})
+    except ValueError as cause:
+        return _education_game_value_error(db, cause)
 
 
 @app.route("/api/v2/edu/classes/<class_id>/members", methods=["GET"])
@@ -2636,7 +2900,14 @@ def education_class_members(class_id: str):
     _membership, error = _education_require_class_teacher(class_id, user)
     if error:
         return error
-    rows = _education_repository.list_class_students(class_id)
+    rows = _get_db().execute(
+        """SELECT m.user_id, m.student_name, m.student_number, m.joined_at, m.removed_at
+           FROM education_memberships m
+           WHERE m.class_id = ? AND m.role = 'student'
+           ORDER BY CASE WHEN m.removed_at IS NULL THEN 0 ELSE 1 END,
+                    m.student_number, m.user_id""",
+        (class_id,),
+    ).fetchall()
     return jsonify({
         "members": [
             {
@@ -2661,14 +2932,21 @@ def education_class_remove_member(class_id: str, user_id: int):
     _membership, error = _education_require_class_teacher(class_id, user)
     if error:
         return error
-    target = _education_repository.get_membership(
-        class_id, user_id, include_removed=True
-    )
+    db = _get_db()
+    target = db.execute(
+        "SELECT role, removed_at FROM education_memberships WHERE class_id = ? AND user_id = ?",
+        (class_id, user_id),
+    ).fetchone()
     if not target or target["role"] != "student":
         return jsonify({"error": "student not found", "code": "student_not_found"}), 404
     if target["removed_at"]:
         return jsonify({"ok": True, "status": "removed"})
-    removed_at = _education_repository.remove_student(class_id, user_id)
+    removed_at = datetime.utcnow().isoformat()
+    db.execute(
+        "UPDATE education_memberships SET removed_at = ? WHERE class_id = ? AND user_id = ?",
+        (removed_at, class_id, user_id),
+    )
+    db.commit()
     return jsonify({"ok": True, "status": "removed", "removedAt": removed_at})
 
 
@@ -2680,12 +2958,18 @@ def education_class_restore_member(class_id: str, user_id: int):
     _membership, error = _education_require_class_teacher(class_id, user)
     if error:
         return error
-    target = _education_repository.get_membership(
-        class_id, user_id, include_removed=True
-    )
+    db = _get_db()
+    target = db.execute(
+        "SELECT role, removed_at FROM education_memberships WHERE class_id = ? AND user_id = ?",
+        (class_id, user_id),
+    ).fetchone()
     if not target or target["role"] != "student":
         return jsonify({"error": "student not found", "code": "student_not_found"}), 404
-    _education_repository.restore_student(class_id, user_id)
+    db.execute(
+        "UPDATE education_memberships SET removed_at = NULL WHERE class_id = ? AND user_id = ?",
+        (class_id, user_id),
+    )
+    db.commit()
     return jsonify({"ok": True, "status": "active"})
 
 
@@ -2697,16 +2981,9 @@ def education_class_snapshots(class_id: str):
     membership, error = _education_require_membership(class_id, user)
     if error:
         return error
+    db = _get_db()
     if request.method == "GET":
-        rows = db.execute(
-            """SELECT s.*,
-                      (SELECT COUNT(*) FROM education_assignments a WHERE a.snapshot_id = s.id)
-                        AS bound_assignment_count
-                 FROM education_snapshots s
-                WHERE s.class_id = ? AND COALESCE(s.snapshot_type, 'graph') = 'graph'
-                ORDER BY s.created_at DESC""",
-            (class_id,),
-        ).fetchall()
+        rows = _education_course_graph_snapshot_rows(db, class_id)
         return jsonify({"snapshots": [_education_public_snapshot(row) for row in rows]})
     if membership["role"] != "teacher":
         return jsonify({"error": "forbidden"}), 403
@@ -2722,57 +2999,161 @@ def education_class_snapshots(class_id: str):
     if len(set(node_ids)) != len(node_ids):
         return jsonify({"error": "snapshot node ids must be unique"}), 400
 
+    snapshot_id = uuid.uuid4().hex
     source_graph_id = str(body.get("sourceGraphId") or "").strip() or None
+    if source_graph_id:
+        existing = db.execute(
+            "SELECT * FROM education_snapshots WHERE class_id = ? AND source_graph_id = ? ORDER BY created_at ASC LIMIT 1",
+            (class_id, source_graph_id),
+        ).fetchone()
+        if existing:
+            return jsonify({
+                "snapshot": _education_public_snapshot(existing, include_graph=True),
+                "created": False,
+            })
     source_pdf = None
-    source_meta = None
     source_job_id = str(body.get("sourceJobId") or "").strip() or None
     source_history_id = source_job_id or source_graph_id
     if source_history_id:
-        history_row = _learning_repository.get_owned_history(
-            int(user["id"]), source_history_id
-        )
+        history_row = db.execute(
+            "SELECT id, source_pdf_json FROM history WHERE id = ? AND user_id = ?",
+            (source_history_id, user["id"]),
+        ).fetchone()
         source_meta = _read_source_pdf_meta(history_row) if history_row else None
         if source_meta:
+            target_dir = _EDUCATION_SNAPSHOT_ROOT / snapshot_id
+            target_dir.mkdir(parents=True, exist_ok=True)
             source_pdf = _stored_source_pdf_meta(source_meta) or {}
+            for path_key, name_key in (
+                ("pdf_path", "pdf_name"),
+                ("source_path", "source_name"),
+                ("log_path", "log_name"),
+            ):
+                source_path = Path(str(source_meta.get(path_key) or ""))
+                if source_path.is_file():
+                    safe_name = Path(str(source_pdf.get(name_key) or source_path.name)).name
+                    shutil.copy2(source_path, target_dir / safe_name)
+                    source_pdf[name_key] = safe_name
+            source_pdf["pdf_url"] = f"/api/v2/edu/snapshots/{snapshot_id}/source-pdf"
+            source_pdf["compile_log_url"] = f"/api/v2/edu/snapshots/{snapshot_id}/compile-log"
+
+    now = datetime.utcnow().isoformat()
     try:
-        row, created = _education_repository.create_snapshot(
-            public_class_id=class_id,
-            actor_id=int(user["id"]),
-            source_graph_id=source_graph_id,
-            source_history_id=source_history_id,
-            filename=str(body.get("filename") or "教学图谱"),
-            nodes=nodes,
-            edges=edges,
-            source_markdown=str(body.get("sourceMarkdown") or ""),
-            latex_macros=(
-                body.get("latexMacros")
-                if isinstance(body.get("latexMacros"), dict)
-                else {}
+        db.execute(
+            """INSERT INTO education_snapshots
+                 (id, class_id, source_graph_id, filename, node_count, edge_count,
+                  source_markdown, latex_macros_json, source_pdf_json, created_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                snapshot_id,
+                class_id,
+                source_graph_id,
+                str(body.get("filename") or "教学图谱")[:255],
+                len(nodes),
+                len(edges),
+                str(body.get("sourceMarkdown") or ""),
+                json.dumps(body.get("latexMacros") if isinstance(body.get("latexMacros"), dict) else {}, ensure_ascii=False),
+                json.dumps(source_pdf, ensure_ascii=False) if source_pdf else None,
+                user["id"],
+                now,
             ),
-            source_pdf=source_pdf,
         )
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    if created and source_history_id and source_meta:
-        target_dir = _EDUCATION_SNAPSHOT_ROOT / row["id"]
-        target_dir.mkdir(parents=True, exist_ok=True)
-        for path_key, name_key in (
-            ("pdf_path", "pdf_name"),
-            ("source_path", "source_name"),
-            ("log_path", "log_name"),
-        ):
-            source_path = Path(str(source_meta.get(path_key) or ""))
-            if source_path.is_file():
-                safe_name = Path(str(source_pdf.get(name_key) or source_path.name)).name
-                shutil.copy2(source_path, target_dir / safe_name)
+        graph_key = f"source:{source_graph_id}" if source_graph_id else f"snapshot:{snapshot_id}"
+        next_order = db.execute(
+            """SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order
+                 FROM education_course_graph_order
+                WHERE class_id = ?""",
+            (class_id,),
+        ).fetchone()["next_order"]
+        db.execute(
+            """INSERT INTO education_course_graph_order
+                 (class_id, graph_key, sort_order, updated_by, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (class_id, graph_key, int(next_order), user["id"], now),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    persist_graph(snapshot_id, "education_snapshot", nodes, edges)
+    _invalidate_api_graph(snapshot_id)
+    row = db.execute("SELECT * FROM education_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
     return jsonify({
         "snapshot": _education_public_snapshot(row, include_graph=True),
-        "created": created,
-    }), 201 if created else 200
+        "created": True,
+    }), 201
+
+
+@app.route("/api/v2/edu/classes/<class_id>/course-graph-order", methods=["PATCH"])
+def education_class_course_graph_order(class_id: str):
+    user, error = _education_require_user()
+    if error:
+        return error
+    membership, error = _education_require_membership(class_id, user)
+    if error:
+        return error
+    if membership["role"] != "teacher":
+        return jsonify({"error": "forbidden"}), 403
+
+    body = request.get_json(silent=True) or {}
+    graph_ids = body.get("graphIds")
+    known_graph_ids = body.get("knownGraphIds")
+    if not isinstance(graph_ids, list) or any(not isinstance(item, str) or not item.strip() for item in graph_ids):
+        return jsonify({"error": "graphIds must be an array of snapshot ids", "code": "invalid_course_graph_order"}), 400
+    if known_graph_ids is not None and (
+        not isinstance(known_graph_ids, list)
+        or any(not isinstance(item, str) or not item.strip() for item in known_graph_ids)
+    ):
+        return jsonify({"error": "knownGraphIds must be an array of snapshot ids", "code": "invalid_course_graph_order"}), 400
+    graph_ids = [item.strip() for item in graph_ids]
+    known_graph_ids = [item.strip() for item in known_graph_ids] if isinstance(known_graph_ids, list) else None
+    if len(set(graph_ids)) != len(graph_ids) or (known_graph_ids is not None and len(set(known_graph_ids)) != len(known_graph_ids)):
+        return jsonify({"error": "graph ids must not contain duplicates", "code": "invalid_course_graph_order"}), 400
+
+    db = _get_db()
+    rows = db.execute(
+        """SELECT * FROM education_snapshots
+            WHERE class_id = ? AND COALESCE(snapshot_type, 'graph') = 'graph'
+            ORDER BY created_at ASC, id ASC FOR UPDATE""",
+        (class_id,),
+    ).fetchall()
+    groups = _education_course_graph_groups(rows)
+    canonical_by_id = {str(group["canonical"]["id"]): key for key, group in groups.items()}
+    expected_ids = set(canonical_by_id)
+    provided_ids = set(graph_ids)
+    invalid_ids = provided_ids - expected_ids
+    if invalid_ids:
+        return jsonify({"error": "graphIds contains a graph that is not a current class course graph", "code": "invalid_course_graph_order"}), 400
+    if known_graph_ids is not None and set(known_graph_ids) != expected_ids:
+        return jsonify({
+            "error": "course graph collection changed; reload and try again",
+            "code": "course_graph_order_conflict",
+        }), 409
+    if provided_ids != expected_ids or len(graph_ids) != len(expected_ids):
+        return jsonify({"error": "graphIds must contain every current class course graph exactly once", "code": "invalid_course_graph_order"}), 400
+
+    now = datetime.utcnow().isoformat()
+    try:
+        db.execute("DELETE FROM education_course_graph_order WHERE class_id = ?", (class_id,))
+        db.executemany(
+            """INSERT INTO education_course_graph_order
+                 (class_id, graph_key, sort_order, updated_by, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            [(class_id, canonical_by_id[snapshot_id], index, user["id"], now) for index, snapshot_id in enumerate(graph_ids)],
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return jsonify({"snapshots": [_education_public_snapshot(row) for row in _education_course_graph_snapshot_rows(db, class_id)]})
 
 
 def _education_assignment_rows(class_id: str, role: str):
-    return _education_repository.list_assignments(class_id, role)
+    where = "class_id = ? AND status != 'archived'" if role == "teacher" else "class_id = ? AND status = 'published'"
+    return _get_db().execute(
+        f"SELECT * FROM education_assignments WHERE {where} ORDER BY updated_at DESC",
+        (class_id,),
+    ).fetchall()
 
 
 def _direct_question_payload(raw, index: int, score: float, *, node_id: int | None = None, allow_empty_question: bool = False) -> dict:
@@ -2980,10 +3361,10 @@ def education_direct_assignment_create(class_id: str):
     try:
         db.execute(
             """INSERT INTO education_snapshots
-                 (id, class_id, snapshot_type, source_graph_id, filename, nodes_json, edges_json,
+                 (id, class_id, snapshot_type, source_graph_id, filename, node_count, edge_count,
                   source_markdown, latex_macros_json, source_pdf_json, created_by, created_at)
                VALUES (?, ?, 'direct', NULL, ?, ?, ?, ?, '{}', NULL, ?, ?)""",
-            (snapshot_id, class_id, f"{title}.direct", json.dumps(nodes, ensure_ascii=False), json.dumps(edges, ensure_ascii=False), source_text, user["id"], now),
+            (snapshot_id, class_id, f"{title}.direct", len(nodes), len(edges), source_text, user["id"], now),
         )
         db.execute(
             """INSERT INTO education_assignments
@@ -3020,6 +3401,8 @@ def education_direct_assignment_create(class_id: str):
         if source_dir.exists():
             shutil.rmtree(source_dir, ignore_errors=True)
         raise
+    persist_graph(snapshot_id, "education_snapshot", nodes, edges)
+    _invalidate_api_graph(snapshot_id)
     row = db.execute("SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()
     snapshot = db.execute("SELECT * FROM education_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
     return jsonify({"assignment": _education_public_assignment(row, snapshot=snapshot, role=membership["role"])}), 201
@@ -3036,7 +3419,9 @@ def education_class_assignments(class_id: str):
     if request.method == "GET":
         return jsonify({
             "assignments": [
-                _education_public_assignment(row, role=membership["role"])
+                _education_public_assignment(
+                    row, role=membership["role"], user_id=int(user["id"]) if membership["role"] == "student" else None
+                )
                 for row in _education_assignment_rows(class_id, membership["role"])
             ],
         })
@@ -3049,49 +3434,59 @@ def education_class_assignments(class_id: str):
         target_node_id = int(body.get("targetNodeId"))
     except (TypeError, ValueError):
         return jsonify({"error": "targetNodeId must be an integer"}), 400
-    snapshot = _education_repository.get_snapshot(snapshot_id)
-    if not snapshot or snapshot["class_id"] != class_id:
+    db = _get_db()
+    snapshot = db.execute(
+        "SELECT * FROM education_snapshots WHERE id = ? AND class_id = ?",
+        (snapshot_id, class_id),
+    ).fetchone()
+    if not snapshot:
         return jsonify({"error": "snapshot not found"}), 404
     try:
         deterministic = build_learning_path(
-            _education_json(snapshot["nodes_json"], []),
-            _education_json(snapshot["edges_json"], []),
+            _education_snapshot_graph(snapshot)["nodes"],
+            _education_snapshot_graph(snapshot)["edges"],
             target_node_id,
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    assignment_id = uuid.uuid4().hex
     path = deterministic
     try:
         ai_result = _education_ai_task(
             user_id=int(user["id"]),
-            task_id=uuid.uuid4().hex,
+            task_id=assignment_id,
             task_kind="path",
             payload=_education_path_payload(snapshot, deterministic),
-            scope=f"classes/{class_id}",
+            scope=f"assignments/{assignment_id}",
         )
         path = merge_ai_path(deterministic, ai_result)
     except Exception:
         path = {**deterministic, "aiEnhanced": False, "aiFallbackReason": "deterministic_fallback"}
     title = str(body.get("title") or f"学习：{target_node_id}").strip()[:160]
-    try:
-        row = _education_repository.create_assignment(
-            public_class_id=class_id,
-            snapshot_id=snapshot_id,
-            actor_id=int(user["id"]),
-            title=title,
-            target_node_id=target_node_id,
-            due_at=body.get("dueAt") or None,
-            path=path,
-        )
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+    now = datetime.utcnow().isoformat()
+    db.execute(
+        """INSERT INTO education_assignments
+             (id, class_id, snapshot_id, title, target_node_id, due_at, status,
+              base_path_json, summary, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?)""",
+        (
+            assignment_id, class_id, snapshot_id, title, target_node_id,
+            body.get("dueAt") or None,
+            json.dumps(path, ensure_ascii=False),
+            path.get("summary") or "",
+            user["id"], now, now,
+        ),
+    )
+    _education_reconcile_assessment_nodes(db, assignment_id, path, initial=True)
+    db.commit()
     _education_generate_initial_assessments(
-        assignment_id=row["id"],
+        assignment_id=assignment_id,
         user_id=int(user["id"]),
         snapshot=snapshot,
         path=path,
     )
+    row = db.execute("SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()
     return jsonify({
         "assignment": _education_public_assignment(row, snapshot=snapshot, role="teacher"),
         "warnings": _education_order_warnings(path),
@@ -3099,7 +3494,10 @@ def education_class_assignments(class_id: str):
 
 
 def _education_assignment_context(assignment_id: str, user):
-    assignment = _education_repository.get_assignment(assignment_id)
+    db = _get_db()
+    assignment = db.execute(
+        "SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)
+    ).fetchone()
     if not assignment:
         return None, None, None, (jsonify({"error": "assignment not found"}), 404)
     membership, error = _education_require_membership(assignment["class_id"], user)
@@ -3109,7 +3507,15 @@ def _education_assignment_context(assignment_id: str, user):
         return None, None, None, (jsonify({"error": "assignment not found"}), 404)
     if membership["role"] == "student" and assignment["status"] != "published":
         return None, None, None, (jsonify({"error": "assignment not found"}), 404)
-    snapshot = _education_repository.get_snapshot(assignment["snapshot_id"])
+    if membership["role"] == "student" and assignment["assignment_type"] == "direct":
+        challenge = education_game.challenge_access_payload(
+            db, class_id=assignment["class_id"], assignment_id=assignment_id, user_id=int(user["id"])
+        )
+        if challenge["locked"]:
+            return None, None, None, (jsonify({"error": "growth challenge is locked", "code": "growth_challenge_locked", "challenge": challenge}), 403)
+    snapshot = db.execute(
+        "SELECT * FROM education_snapshots WHERE id = ?", (assignment["snapshot_id"],)
+    ).fetchone()
     return assignment, snapshot, membership, None
 
 
@@ -3177,12 +3583,16 @@ def education_assignment(assignment_id: str):
                 except ValueError:
                     return jsonify({"error": "dueAt must be an ISO date string or null"}), 400
 
-        updated = _education_repository.update_assignment(
-            assignment_id,
-            title=title,
-            due_at=due_at,
-            require_status="published",
+        now = datetime.utcnow().isoformat()
+        db = _get_db()
+        db.execute(
+            """UPDATE education_assignments
+               SET title = ?, due_at = ?, updated_at = ?
+               WHERE id = ? AND status = 'published'""",
+            (title, due_at, now, assignment_id),
         )
+        db.commit()
+        updated = db.execute("SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()
         return jsonify({
             "assignment": _education_public_assignment(updated, snapshot=snapshot, role="teacher"),
         })
@@ -3204,7 +3614,8 @@ def education_assignment(assignment_id: str):
         if assignment["status"] == "draft" and assignment["assignment_type"] == "direct":
             snapshot_id = str(assignment["snapshot_id"])
             try:
-                db.execute("BEGIN IMMEDIATE")
+                prepare_graph_delete(snapshot_id)
+                _invalidate_api_graph(snapshot_id)
                 db.execute(
                     "DELETE FROM education_assignments WHERE id = ? AND status = 'draft' AND assignment_type = 'direct'",
                     (assignment_id,),
@@ -3214,6 +3625,7 @@ def education_assignment(assignment_id: str):
                     (snapshot_id,),
                 )
                 db.commit()
+                complete_graph_delete(snapshot_id)
             except Exception:
                 db.rollback()
                 raise
@@ -3303,13 +3715,24 @@ def education_assignment(assignment_id: str):
     path = {**current_path, "steps": normalized_steps}
     if isinstance(body.get("summary"), str):
         path["summary"] = body["summary"].strip()
-    updated = _education_repository.update_assignment(
-        assignment_id,
-        title=str(body.get("title") or assignment["title"]),
-        due_at=body.get("dueAt") if "dueAt" in body else assignment["due_at"],
-        path=path,
-        require_status="draft",
+    now = datetime.utcnow().isoformat()
+    db = _get_db()
+    db.execute(
+        """UPDATE education_assignments
+           SET title = ?, due_at = ?, base_path_json = ?, summary = ?, updated_at = ?
+           WHERE id = ?""",
+        (
+            str(body.get("title") or assignment["title"]).strip()[:160],
+            body.get("dueAt") if "dueAt" in body else assignment["due_at"],
+            json.dumps(path, ensure_ascii=False),
+            path.get("summary") or "",
+            now,
+            assignment_id,
+        ),
     )
+    _education_reconcile_assessment_nodes(db, assignment_id, path)
+    db.commit()
+    updated = db.execute("SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()
     return jsonify({
         "assignment": _education_public_assignment(updated, snapshot=snapshot, role="teacher"),
         "warnings": _education_order_warnings(path),
@@ -3366,12 +3789,12 @@ def education_direct_questions_update(assignment_id: str):
             """INSERT INTO education_assignment_sources
                  (assignment_id, filename, mime_type, source_origin, storage_name, source_text, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(assignment_id) DO UPDATE SET
-                 filename = excluded.filename,
-                 mime_type = excluded.mime_type,
-                 source_origin = excluded.source_origin,
-                 storage_name = excluded.storage_name,
-                 source_text = excluded.source_text""",
+               ON DUPLICATE KEY UPDATE
+                 filename = VALUES(filename),
+                 mime_type = VALUES(mime_type),
+                 source_origin = VALUES(source_origin),
+                 storage_name = VALUES(storage_name),
+                 source_text = VALUES(source_text)""",
             (assignment_id, source_filename, source_file.mimetype if source_file else (mimetypes.guess_type(source_filename)[0] or "text/plain"), source_origin, storage_name, source_text, now),
         )
         db.execute("UPDATE education_snapshots SET source_markdown = ? WHERE id = ?", (source_text, snapshot["id"]))
@@ -3386,7 +3809,6 @@ def education_direct_questions_update(assignment_id: str):
         db = _get_db()
         now = datetime.utcnow().isoformat()
         try:
-            db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM education_assessment_questions WHERE assignment_id = ? AND node_id = ?", (assignment_id, _DIRECT_ASSIGNMENT_NODE_ID))
             db.executemany(
                 """INSERT INTO education_assessment_questions
@@ -3416,7 +3838,7 @@ def education_direct_questions_update(assignment_id: str):
     except ValueError as exc:
         return jsonify({"error": str(exc), "code": "assessment_score_invalid" if "maxScore" in str(exc) or "order" in str(exc) else None}), 400
 
-    existing_nodes = _education_json(snapshot["nodes_json"], [])
+    existing_nodes = _education_snapshot_graph(snapshot)["nodes"]
     existing_ids = []
     for node in existing_nodes:
         try:
@@ -3456,8 +3878,10 @@ def education_direct_questions_update(assignment_id: str):
     now = datetime.utcnow().isoformat()
     db = _get_db()
     try:
-        db.execute("BEGIN IMMEDIATE")
-        db.execute("UPDATE education_snapshots SET nodes_json = ?, edges_json = ? WHERE id = ?", (json.dumps(nodes, ensure_ascii=False), json.dumps(edges, ensure_ascii=False), snapshot["id"]))
+        db.execute(
+            "UPDATE education_snapshots SET node_count = ?, edge_count = ? WHERE id = ?",
+            (len(nodes), len(edges), snapshot["id"]),
+        )
         db.execute("DELETE FROM education_assessment_questions WHERE assignment_id = ?", (assignment_id,))
         db.execute("DELETE FROM education_assessment_nodes WHERE assignment_id = ?", (assignment_id,))
         db.executemany("INSERT INTO education_assessment_nodes (assignment_id, node_id, status, updated_at) VALUES (?, ?, 'ready', ?)", [(assignment_id, node_id, now) for node_id in node_ids])
@@ -3479,6 +3903,8 @@ def education_direct_questions_update(assignment_id: str):
         if source_file_path and source_file_path.exists():
             source_file_path.unlink()
         raise
+    persist_graph(str(snapshot["id"]), "education_snapshot", nodes, edges)
+    _invalidate_api_graph(str(snapshot["id"]))
     updated = db.execute("SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()
     updated_snapshot = db.execute("SELECT * FROM education_snapshots WHERE id = ?", (snapshot["id"],)).fetchone()
     return jsonify({
@@ -3565,9 +3991,29 @@ def _education_assessment_payload_for_node(assignment_id: str, node_id: int) -> 
 
 
 def _education_unresolved_assessment_node_ids(assignment_id: str, path: dict) -> list[int]:
-    return _assessment_repository.unresolved_node_ids(
-        assignment_id, _education_path_node_ids(path)
-    )
+    path_node_ids = _education_path_node_ids(path)
+    assessment_rows = _get_db().execute(
+        """SELECT n.node_id, n.status, COUNT(q.id) AS question_count
+             FROM education_assessment_nodes n
+             LEFT JOIN education_assessment_questions q
+               ON q.assignment_id = n.assignment_id AND q.node_id = n.node_id
+            WHERE n.assignment_id = ?
+            GROUP BY n.node_id, n.status""",
+        (assignment_id,),
+    ).fetchall()
+    assessment_by_node = {
+        int(row["node_id"]): (row["status"], int(row["question_count"] or 0))
+        for row in assessment_rows
+    }
+    return [
+        node_id
+        for node_id in path_node_ids
+        if assessment_by_node.get(node_id, ("pending", 0))[0] not in {"ready", "exempt"}
+        or (
+            assessment_by_node.get(node_id, ("pending", 0))[0] == "ready"
+            and assessment_by_node.get(node_id, ("pending", 0))[1] < 1
+        )
+    ]
 
 
 @app.route(
@@ -3585,9 +4031,11 @@ def education_assessment_question_update(assignment_id: str, node_id: int, quest
         return jsonify({"error": "assessment scoring standard is frozen", "code": "assessment_scoring_frozen"}), 409
     if node_id not in set(_education_path_node_ids(_education_json(assignment["base_path_json"], {}))):
         return jsonify({"error": "node is outside the frozen learning path"}), 400
-    current = _assessment_repository.get_question(
-        assignment_id, node_id, question_id
-    )
+    db = _get_db()
+    current = db.execute(
+        "SELECT * FROM education_assessment_questions WHERE id = ? AND assignment_id = ? AND node_id = ?",
+        (question_id, assignment_id, node_id),
+    ).fetchone()
     if not current:
         return jsonify({"error": "assessment question not found"}), 404
     body = request.get_json(silent=True) or {}
@@ -3606,19 +4054,53 @@ def education_assessment_question_update(assignment_id: str, node_id: int, quest
         or max_score > 100
     ):
         return jsonify({"error": "invalid scoring standard", "code": "assessment_scoring_invalid"}), 400
-    try:
-        updated = _assessment_repository.update_scoring_standard(
-            assignment_id,
-            node_id,
-            question_id,
-            reference_answer=reference_answer,
-            expected_points=expected_points,
-            max_score=max_score,
+    if assignment["status"] == "published":
+        current_points = _education_json(current["expected_points_json"], [])
+        current_reference = str(current["reference_answer"] or "").strip()
+        current_score = float(current["max_score"] or 0)
+        submissions_finalized = db.execute(
+            "SELECT 1 FROM education_assignment_submissions WHERE assignment_id = ? AND status IN ('finalized', 'released') LIMIT 1",
+            (assignment_id,),
+        ).fetchone()
+        changed_existing = (
+            (current_reference and reference_answer != current_reference)
+            or (current_points and expected_points != current_points)
+            or (current_score > 0 and abs(max_score - current_score) > 0.001)
         )
-    except ValueError:
-        return jsonify({"error": "published scoring standard is frozen", "code": "assessment_scoring_frozen"}), 409
-    if not updated:
+        if submissions_finalized or changed_existing:
+            return jsonify({"error": "published scoring standard is frozen", "code": "assessment_scoring_frozen"}), 409
+    db = _get_db()
+    cursor = db.execute(
+        """UPDATE education_assessment_questions
+              SET reference_answer = ?, expected_points_json = ?, max_score = ?, updated_at = ?
+            WHERE id = ? AND assignment_id = ? AND node_id = ?""",
+        (reference_answer, json.dumps(expected_points, ensure_ascii=False), max_score, datetime.utcnow().isoformat(), question_id, assignment_id, node_id),
+    )
+    if cursor.rowcount == 0:
         return jsonify({"error": "assessment question not found"}), 404
+    if assignment["status"] == "published":
+        pending_submissions = db.execute(
+            "SELECT id, snapshot_json FROM education_assignment_submissions WHERE assignment_id = ? AND status IN ('submitted', 'review_draft')",
+            (assignment_id,),
+        ).fetchall()
+        for submission in pending_submissions:
+            snapshot_payload = _education_json(submission["snapshot_json"], {})
+            for item in snapshot_payload.get("questions") or []:
+                if isinstance(item, dict) and str(item.get("questionId")) == question_id:
+                    item["referenceAnswer"] = reference_answer
+                    item["expectedPoints"] = expected_points
+                    item["maxScore"] = max_score
+            db.execute(
+                "UPDATE education_assignment_submissions SET snapshot_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(snapshot_payload, ensure_ascii=False), datetime.utcnow().isoformat(), submission["id"]),
+            )
+            db.execute(
+                """UPDATE education_submission_question_grades
+                      SET reference_answer = ?, expected_points_json = ?, max_score = ?, updated_at = ?
+                    WHERE submission_id = ? AND question_id = ?""",
+                (reference_answer, json.dumps(expected_points, ensure_ascii=False), max_score, datetime.utcnow().isoformat(), submission["id"], question_id),
+            )
+    db.commit()
     return jsonify({"assessment": _education_assessment_payload_for_node(assignment_id, node_id)})
 
 
@@ -3631,13 +4113,19 @@ def education_assessment_regenerate(assignment_id: str, node_id: int):
     if error:
         return error
     path = _education_json(assignment["base_path_json"], {})
-    task = build_assessment_tasks(_education_json(snapshot["nodes_json"], []), path).get(str(node_id))
+    task = build_assessment_tasks(_education_snapshot_graph(snapshot)["nodes"], path).get(str(node_id))
     if not task:
         return jsonify({"error": "node not found"}), 404
-    existing = _assessment_repository.list_questions(assignment_id, node_id)
-    assessment_node = _assessment_repository.get_assessment_node(
-        assignment_id, node_id
-    )
+    existing = _get_db().execute(
+        """SELECT question FROM education_assessment_questions
+            WHERE assignment_id = ? AND node_id = ? ORDER BY sort_order""",
+        (assignment_id, node_id),
+    ).fetchall()
+    assessment_node = _get_db().execute(
+        """SELECT updated_at FROM education_assessment_nodes
+             WHERE assignment_id = ? AND node_id = ?""",
+        (assignment_id, node_id),
+    ).fetchone()
     if not assessment_node:
         return jsonify({"error": "assessment node not found"}), 404
     expected_node_updated_at = assessment_node["updated_at"]
@@ -3658,14 +4146,19 @@ def education_assessment_regenerate(assignment_id: str, node_id: int):
                 "assessment_invalid_result",
                 503,
             )
-        required_kinds = ASSESSMENT_QUESTION_KINDS.get(task.get("category")) or ()
-        _assessment_repository.replace_node_questions(
+        db = _get_db()
+        _education_begin_assessment_write(
+            db,
             assignment_id,
             node_id,
-            result.get("questions") or [],
-            required_kinds,
+            expected_node_updated_at,
         )
+        _education_replace_assessment_questions(
+            db, assignment_id, node_id, result, task.get("category")
+        )
+        db.commit()
     except Exception as exc:
+        _get_db().rollback()
         return _education_ai_error_response(exc, "assessment_regeneration_failed")
     return jsonify({"assessment": _education_assessment_payload_for_node(assignment_id, node_id)})
 
@@ -3678,27 +4171,35 @@ def education_assessment_question_regenerate(assignment_id: str, node_id: int, q
     user, assignment, snapshot, error = _education_teacher_draft_assessment_context(assignment_id, node_id)
     if error:
         return error
-    stored = _assessment_repository.get_question(
-        assignment_id, node_id, question_id
-    )
+    db = _get_db()
+    stored = db.execute(
+        """SELECT * FROM education_assessment_questions
+            WHERE id = ? AND assignment_id = ? AND node_id = ?""",
+        (question_id, assignment_id, node_id),
+    ).fetchone()
     if not stored:
         return jsonify({"error": "assessment question not found"}), 404
-    assessment_node = _assessment_repository.get_assessment_node(
-        assignment_id, node_id
-    )
+    assessment_node = db.execute(
+        """SELECT updated_at FROM education_assessment_nodes
+             WHERE assignment_id = ? AND node_id = ?""",
+        (assignment_id, node_id),
+    ).fetchone()
     if not assessment_node:
         return jsonify({"error": "assessment node not found"}), 404
     expected_node_updated_at = assessment_node["updated_at"]
     expected_question_updated_at = stored["updated_at"]
     path = _education_json(assignment["base_path_json"], {})
-    task = build_assessment_tasks(_education_json(snapshot["nodes_json"], []), path).get(str(node_id))
+    task = build_assessment_tasks(_education_snapshot_graph(snapshot)["nodes"], path).get(str(node_id))
     if not task:
         return jsonify({"error": "node not found"}), 404
     task["requiredKind"] = stored["kind"]
     task["existingQuestions"] = [
         row["question"]
-        for row in _assessment_repository.list_questions(assignment_id, node_id)
-        if row["id"] != question_id
+        for row in db.execute(
+            """SELECT question FROM education_assessment_questions
+                WHERE assignment_id = ? AND node_id = ? AND id != ? ORDER BY sort_order""",
+            (assignment_id, node_id, question_id),
+        ).fetchall()
     ]
     operation_id = uuid.uuid4().hex
     try:
@@ -3728,15 +4229,37 @@ def education_assessment_question_regenerate(assignment_id: str, node_id: int, q
                 "assessment_invalid_result",
                 503,
             )
-        if not _assessment_repository.update_regenerated_question(
-            assignment_id, node_id, question_id, question
-        ):
-            raise EducationAIError(
-                "assessment_draft_changed",
-                "assessment draft changed before the generated result could be saved",
-                409,
-            )
+        _education_begin_assessment_write(
+            db,
+            assignment_id,
+            node_id,
+            expected_node_updated_at,
+            question_id=question_id,
+            expected_question_updated_at=expected_question_updated_at,
+        )
+        now = datetime.utcnow().isoformat()
+        db.execute(
+            """UPDATE education_assessment_questions
+                  SET question = ?, focus = ?, expected_points_json = ?, reference_answer = ?, updated_at = ?
+                WHERE id = ?""",
+            (
+                str(question.get("question") or "").strip(),
+                str(question.get("focus") or "").strip(),
+                json.dumps(question.get("expectedPoints") or [], ensure_ascii=False),
+                str(question.get("referenceAnswer") or "").strip(),
+                now,
+                question_id,
+            ),
+        )
+        db.execute(
+            """UPDATE education_assessment_nodes
+                  SET status = 'ready', last_error = NULL, updated_at = ?
+                WHERE assignment_id = ? AND node_id = ?""",
+            (now, assignment_id, node_id),
+        )
+        db.commit()
     except Exception as exc:
+        db.rollback()
         return _education_ai_error_response(exc, "assessment_regeneration_failed")
     return jsonify({"assessment": _education_assessment_payload_for_node(assignment_id, node_id)})
 
@@ -3749,22 +4272,60 @@ def education_assessment_question_delete(assignment_id: str, node_id: int, quest
     _user, _assignment, _snapshot, error = _education_teacher_draft_assessment_context(assignment_id, node_id)
     if error:
         return error
-    assessment_node = _assessment_repository.get_assessment_node(
-        assignment_id, node_id
-    )
+    db = _get_db()
+    assessment_node = db.execute(
+        """SELECT updated_at FROM education_assessment_nodes
+             WHERE assignment_id = ? AND node_id = ?""",
+        (assignment_id, node_id),
+    ).fetchone()
     if not assessment_node:
         return jsonify({"error": "assessment node not found"}), 404
     expected_node_updated_at = assessment_node["updated_at"]
-    stored_question = _assessment_repository.get_question(
-        assignment_id, node_id, question_id
-    )
+    stored_question = db.execute(
+        """SELECT updated_at FROM education_assessment_questions
+             WHERE id = ? AND assignment_id = ? AND node_id = ?""",
+        (question_id, assignment_id, node_id),
+    ).fetchone()
     if not stored_question:
         return jsonify({"error": "assessment question not found"}), 404
     expected_question_updated_at = stored_question["updated_at"]
-    if not _assessment_repository.delete_question(
-        assignment_id, node_id, question_id
-    ):
-        return jsonify({"error": "assessment draft changed", "code": "assessment_draft_changed"}), 409
+    try:
+        _education_begin_assessment_write(
+            db,
+            assignment_id,
+            node_id,
+            expected_node_updated_at,
+            question_id=question_id,
+            expected_question_updated_at=expected_question_updated_at,
+        )
+        cursor = db.execute(
+            """DELETE FROM education_assessment_questions
+                WHERE id = ? AND assignment_id = ? AND node_id = ?""",
+            (question_id, assignment_id, node_id),
+        )
+        if cursor.rowcount == 0:
+            raise EducationAIError(
+                "assessment_draft_changed",
+                "assessment draft changed before the assessment question could be deleted",
+                409,
+            )
+        remaining = db.execute(
+            """SELECT COUNT(*) FROM education_assessment_questions
+                WHERE assignment_id = ? AND node_id = ?""",
+            (assignment_id, node_id),
+        ).fetchone()[0]
+        now = datetime.utcnow().isoformat()
+        db.execute(
+            """UPDATE education_assessment_nodes
+                  SET status = ?, last_error = NULL, updated_at = ?
+                WHERE assignment_id = ? AND node_id = ?""",
+            ("ready" if remaining else "exempt", now, assignment_id, node_id),
+        )
+        _education_rebalance_question_scores(db, assignment_id)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        return _education_ai_error_response(exc, "assessment_mutation_failed", 409)
     return jsonify({"assessment": _education_assessment_payload_for_node(assignment_id, node_id)})
 
 
@@ -3776,13 +4337,36 @@ def education_assessment_exempt(assignment_id: str, node_id: int):
     _user, _assignment, _snapshot, error = _education_teacher_draft_assessment_context(assignment_id, node_id)
     if error:
         return error
-    assessment_node = _assessment_repository.get_assessment_node(
-        assignment_id, node_id
-    )
+    db = _get_db()
+    assessment_node = db.execute(
+        """SELECT updated_at FROM education_assessment_nodes
+             WHERE assignment_id = ? AND node_id = ?""",
+        (assignment_id, node_id),
+    ).fetchone()
     if not assessment_node:
         return jsonify({"error": "assessment node not found"}), 404
-    if not _assessment_repository.exempt_node(assignment_id, node_id):
-        return jsonify({"error": "assessment draft changed", "code": "assessment_draft_changed"}), 409
+    try:
+        _education_begin_assessment_write(
+            db,
+            assignment_id,
+            node_id,
+            assessment_node["updated_at"],
+        )
+        db.execute(
+            "DELETE FROM education_assessment_questions WHERE assignment_id = ? AND node_id = ?",
+            (assignment_id, node_id),
+        )
+        db.execute(
+            """UPDATE education_assessment_nodes
+                  SET status = 'exempt', last_error = NULL, updated_at = ?
+                WHERE assignment_id = ? AND node_id = ?""",
+            (datetime.utcnow().isoformat(), assignment_id, node_id),
+        )
+        _education_rebalance_question_scores(db, assignment_id)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        return _education_ai_error_response(exc, "assessment_mutation_failed", 409)
     return jsonify({"assessment": _education_assessment_payload_for_node(assignment_id, node_id)})
 
 
@@ -3810,7 +4394,7 @@ def education_assessments_regenerate_unresolved(assignment_id: str):
             "failedNodeIds": [],
         })
 
-    nodes = _education_json(snapshot["nodes_json"], [])
+    nodes = _education_snapshot_graph(snapshot)["nodes"]
     all_tasks = build_assessment_tasks(nodes, path)
     tasks = {str(node_id): all_tasks[str(node_id)] for node_id in unresolved if str(node_id) in all_tasks}
     operation_id = uuid.uuid4().hex
@@ -3827,25 +4411,32 @@ def education_assessments_regenerate_unresolved(assignment_id: str):
         except Exception as exc:
             return _education_ai_error_response(exc, "assessment_regeneration_failed")
 
+    db = _get_db()
     ready_ids = []
     for node_id in unresolved:
         result = results.get(str(node_id))
         if not isinstance(result, dict):
-            _assessment_repository.mark_assessment_failed(assignment_id, node_id, "assessment_invalid_result")
+            _education_mark_assessment_failed(db, assignment_id, node_id, "assessment_invalid_result")
             continue
         try:
-            required_kinds = ASSESSMENT_QUESTION_KINDS.get(
-                (all_tasks.get(str(node_id)) or {}).get("category")
-            ) or ()
-            _assessment_repository.replace_node_questions(
+            _education_replace_assessment_questions(
+                db,
                 assignment_id,
                 node_id,
-                result.get("questions") or [],
-                required_kinds,
+                result,
+                (all_tasks.get(str(node_id)) or {}).get("category"),
             )
             ready_ids.append(node_id)
         except (TypeError, ValueError):
-            _assessment_repository.mark_assessment_failed(assignment_id, node_id, "assessment_invalid_result")
+            _education_mark_assessment_failed(db, assignment_id, node_id, "assessment_invalid_result")
+    if ready_ids:
+        score_rows = db.execute(
+            "SELECT max_score FROM education_assessment_questions WHERE assignment_id = ?",
+            (assignment_id,),
+        ).fetchall()
+        if score_rows and (any(float(row["max_score"] or 0) <= 0 for row in score_rows) or abs(sum(float(row["max_score"] or 0) for row in score_rows) - 100.0) > 0.001):
+            _education_rebalance_question_scores(db, assignment_id)
+    db.commit()
 
     failed_ids = _education_unresolved_assessment_node_ids(assignment_id, path)
     return jsonify({
@@ -3902,8 +4493,15 @@ def education_assignment_publish(assignment_id: str):
             "code": "assessment_scoring_required",
             **scoring,
         }), 409
-    _assessment_repository.publish_assignment(assignment_id)
-    updated = _education_repository.get_assignment(assignment_id)
+    now = datetime.utcnow().isoformat()
+    db = _get_db()
+    db.execute(
+        """UPDATE education_assignments
+           SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?""",
+        (now, now, assignment_id),
+    )
+    db.commit()
+    updated = db.execute("SELECT * FROM education_assignments WHERE id = ?", (assignment_id,)).fetchone()
     return jsonify({"assignment": _education_public_assignment(updated, snapshot=snapshot, role="teacher")})
 
 
@@ -3943,11 +4541,15 @@ def education_assignment_progress(assignment_id: str, node_id: int):
     candidate_ids = set(_education_path_node_ids(base_path))
     if node_id not in candidate_ids:
         return jsonify({"error": "node is outside the frozen learning path"}), 400
+    now = datetime.utcnow().isoformat()
+    db = _get_db()
     mastery_source = "self"
     if state == "mastered":
-        assessment = _assessment_repository.get_assessment_node(
-            assignment_id, node_id
-        )
+        assessment = db.execute(
+            """SELECT status FROM education_assessment_nodes
+                WHERE assignment_id = ? AND node_id = ?""",
+            (assignment_id, node_id),
+        ).fetchone()
         if not assessment or assessment["status"] in {"pending", "failed"}:
             return jsonify({
                 "error": "assessment is not available",
@@ -3958,18 +4560,29 @@ def education_assignment_progress(assignment_id: str, node_id: int):
                 "error": "teacher grading must be released before this node can be marked mastered",
                 "code": "assignment_review_required",
             }), 409
-    progress = _assessment_repository.upsert_progress(
-        assignment_id, int(user["id"]), node_id, state, mastery_source
+    db.execute(
+        """INSERT INTO education_node_progress
+             (assignment_id, user_id, node_id, state, mastery_source, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             state = VALUES(state),
+             mastery_source = VALUES(mastery_source),
+             updated_at = VALUES(updated_at)""",
+        (assignment_id, user["id"], node_id, state, mastery_source, now),
     )
+    db.commit()
     path = _education_student_path(assignment, int(user["id"]))
     return jsonify({
-        "progress": progress,
+        "progress": {"nodeId": node_id, "state": state, "updatedAt": now},
         "path": path,
     })
 
 
 def _education_student_submission(assignment_id: str, user_id: int):
-    return _assessment_repository.get_student_submission(assignment_id, user_id)
+    return _get_db().execute(
+        "SELECT * FROM education_assignment_submissions WHERE assignment_id = ? AND user_id = ?",
+        (assignment_id, user_id),
+    ).fetchone()
 
 
 def _education_attempt_payload(attempt, questions) -> dict:
@@ -4012,24 +4625,46 @@ def education_assessment_attempt_start(assignment_id: str, node_id: int):
         return jsonify({"error": "assignment is already submitted", "code": "assignment_already_submitted"}), 409
     if node_id not in set(_education_path_node_ids(_education_json(assignment["base_path_json"], {}))):
         return jsonify({"error": "node is outside the frozen learning path"}), 400
-    assessment = _assessment_repository.get_assessment_node(
-        assignment_id, node_id
-    )
+    db = _get_db()
+    assessment = db.execute(
+        """SELECT status FROM education_assessment_nodes
+            WHERE assignment_id = ? AND node_id = ?""",
+        (assignment_id, node_id),
+    ).fetchone()
     if not assessment or assessment["status"] in {"pending", "failed"}:
         return jsonify({"error": "assessment is not available", "code": "assessment_unavailable"}), 409
     if assessment["status"] == "exempt":
         return jsonify({"error": "this node is exempt from assessment", "code": "assessment_exempt"}), 409
-    questions = _assessment_repository.list_questions(assignment_id, node_id)
+    questions = db.execute(
+        """SELECT * FROM education_assessment_questions
+            WHERE assignment_id = ? AND node_id = ? ORDER BY sort_order""",
+        (assignment_id, node_id),
+    ).fetchall()
     if not questions:
         return jsonify({"error": "assessment has no questions", "code": "assessment_unavailable"}), 409
-    attempt, _created = _assessment_repository.start_attempt(
-        assignment_id, int(user["id"]), node_id
+    attempt_id = uuid.uuid4().hex
+    now = datetime.utcnow().isoformat()
+    db.execute(
+        """INSERT INTO education_assessment_attempts
+             (id, assignment_id, user_id, node_id, status, answers_json, started_at, updated_at)
+           VALUES (?, ?, ?, ?, 'draft', '{}', ?, ?)
+           ON DUPLICATE KEY UPDATE id = id""",
+        (attempt_id, assignment_id, user["id"], node_id, now, now),
     )
+    db.commit()
+    attempt = db.execute(
+        """SELECT * FROM education_assessment_attempts
+            WHERE assignment_id = ? AND user_id = ? AND node_id = ?""",
+        (assignment_id, user["id"], node_id),
+    ).fetchone()
     return jsonify({"attempt": _education_attempt_payload(attempt, questions)}), 201
 
 
 def _education_owned_assessment_attempt(attempt_id: str, user):
-    attempt = _assessment_repository.get_attempt(attempt_id, int(user["id"]))
+    attempt = _get_db().execute(
+        "SELECT * FROM education_assessment_attempts WHERE id = ? AND user_id = ?",
+        (attempt_id, user["id"]),
+    ).fetchone()
     if not attempt:
         return None, None, (jsonify({"error": "assessment attempt not found"}), 404)
     assignment, _snapshot, membership, error = _education_assignment_context(attempt["assignment_id"], user)
@@ -4054,15 +4689,31 @@ def education_assessment_attempt_save(attempt_id: str):
     raw_answers = body.get("answers")
     if not isinstance(raw_answers, dict):
         return jsonify({"error": "answers must be an object"}), 400
-    questions = _assessment_repository.list_questions(
-        attempt["assignment_id"], int(attempt["node_id"])
-    )
-    question_ids = {row["id"] for row in questions}
+    db = _get_db()
+    question_ids = {
+        row["id"]
+        for row in db.execute(
+            """SELECT id FROM education_assessment_questions
+                WHERE assignment_id = ? AND node_id = ?""",
+            (attempt["assignment_id"], attempt["node_id"]),
+        ).fetchall()
+    }
     if any(question_id not in question_ids or not isinstance(answer, str) for question_id, answer in raw_answers.items()):
         return jsonify({"error": "answers contain an unknown question or invalid value"}), 400
-    updated = _assessment_repository.save_attempt_answers(
-        attempt_id, int(user["id"]), raw_answers
+    answers = _education_json(attempt["answers_json"], {})
+    answers.update(raw_answers)
+    now = datetime.utcnow().isoformat()
+    db.execute(
+        "UPDATE education_assessment_attempts SET answers_json = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(answers, ensure_ascii=False), now, attempt_id),
     )
+    db.commit()
+    updated = db.execute("SELECT * FROM education_assessment_attempts WHERE id = ?", (attempt_id,)).fetchone()
+    questions = db.execute(
+        """SELECT * FROM education_assessment_questions
+            WHERE assignment_id = ? AND node_id = ? ORDER BY sort_order""",
+        (attempt["assignment_id"], attempt["node_id"]),
+    ).fetchall()
     return jsonify({"attempt": _education_attempt_payload(updated, questions)})
 
 
@@ -4074,14 +4725,29 @@ def education_assessment_attempt_complete(attempt_id: str):
     attempt, assignment, error = _education_owned_assessment_attempt(attempt_id, user)
     if error:
         return error
-    questions = _assessment_repository.list_questions(
-        attempt["assignment_id"], int(attempt["node_id"])
-    )
+    db = _get_db()
+    questions = db.execute(
+        """SELECT * FROM education_assessment_questions
+            WHERE assignment_id = ? AND node_id = ? ORDER BY sort_order""",
+        (attempt["assignment_id"], attempt["node_id"]),
+    ).fetchall()
+    class_row = db.execute(
+        "SELECT * FROM education_classes WHERE id = ?",
+        (assignment["class_id"],),
+    ).fetchone()
     if attempt["status"] == "completed":
         return jsonify({
             "attempt": _education_attempt_payload(attempt, questions),
             "path": _education_student_path(assignment, int(user["id"])),
+            "reward": education_game.build_reward_receipt(
+                db,
+                class_row=class_row,
+                user_id=int(user["id"]),
+                xp_delta=0,
+                unlocked_achievements=[],
+            ),
         })
+
     body = request.get_json(silent=True) or {}
     submitted_answers = body.get("answers", {})
     if not isinstance(submitted_answers, dict):
@@ -4089,26 +4755,138 @@ def education_assessment_attempt_complete(attempt_id: str):
     question_ids = {question["id"] for question in questions}
     if any(question_id not in question_ids or not isinstance(answer, str) for question_id, answer in submitted_answers.items()):
         return jsonify({"error": "answers contain an unknown question or invalid value"}), 400
-    answers = _education_json(attempt["answers_json"], {})
-    answers.update(submitted_answers)
-    missing = [question_id for question_id in question_ids if not str(answers.get(question_id) or "").strip()]
-    if missing:
-        return jsonify({
-            "error": "all assessment questions require an answer",
-            "code": "assessment_incomplete",
-            "questionIds": missing,
-        }), 400
-    updated = _assessment_repository.complete_attempt(
-        attempt_id, int(user["id"]), submitted_answers
-    )
+
+    try:
+        current = db.execute(
+            "SELECT * FROM education_assessment_attempts WHERE id = ? AND user_id = ? FOR UPDATE",
+            (attempt_id, user["id"]),
+        ).fetchone()
+        fresh_assignment = db.execute(
+            "SELECT * FROM education_assignments WHERE id = ? FOR UPDATE",
+            (assignment["id"],),
+        ).fetchone()
+        class_row = db.execute(
+            "SELECT * FROM education_classes WHERE id = ?",
+            (assignment["class_id"],),
+        ).fetchone()
+        if not current or not fresh_assignment:
+            db.rollback()
+            return jsonify({"error": "assessment attempt not found"}), 404
+        assignment = fresh_assignment
+        if assignment["grades_published_at"] or _education_student_submission(assignment["id"], int(user["id"])):
+            db.rollback()
+            return jsonify({"error": "assignment is already submitted", "code": "assignment_already_submitted"}), 409
+        if current["status"] == "completed":
+            reward = education_game.build_reward_receipt(
+                db,
+                class_row=class_row,
+                user_id=int(user["id"]),
+                xp_delta=0,
+                unlocked_achievements=[],
+            )
+            db.commit()
+            return jsonify({
+                "attempt": _education_attempt_payload(current, questions),
+                "path": _education_student_path(assignment, int(user["id"])),
+                "reward": reward,
+            })
+
+        now = datetime.utcnow().isoformat()
+        answers = _education_json(current["answers_json"], {})
+        answers.update(submitted_answers)
+        missing = [question_id for question_id in question_ids if not str(answers.get(question_id) or "").strip()]
+        if missing:
+            db.rollback()
+            return jsonify({
+                "error": "all assessment questions require an answer",
+                "code": "assessment_incomplete",
+                "questionIds": missing,
+            }), 400
+        updated_count = db.execute(
+            """UPDATE education_assessment_attempts
+                  SET answers_json = ?, status = 'completed', completed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'draft'""",
+            (json.dumps(answers, ensure_ascii=False), now, now, attempt_id),
+        ).rowcount
+        if updated_count != 1:
+            current = db.execute(
+                "SELECT * FROM education_assessment_attempts WHERE id = ? AND user_id = ?",
+                (attempt_id, user["id"]),
+            ).fetchone()
+            reward = education_game.build_reward_receipt(
+                db,
+                class_row=class_row,
+                user_id=int(user["id"]),
+                xp_delta=0,
+                unlocked_achievements=[],
+            )
+            db.commit()
+            return jsonify({
+                "attempt": _education_attempt_payload(current, questions),
+                "path": _education_student_path(assignment, int(user["id"])),
+                "reward": reward,
+            })
+        db.execute(
+            """INSERT INTO education_node_progress
+                 (assignment_id, user_id, node_id, state, mastery_source, updated_at)
+               VALUES (?, ?, ?, 'in_progress', 'self', ?)
+               ON DUPLICATE KEY UPDATE
+                 state = CASE WHEN education_node_progress.state = 'mastered' THEN 'mastered' ELSE 'in_progress' END,
+                 mastery_source = CASE WHEN education_node_progress.state = 'mastered' THEN education_node_progress.mastery_source ELSE 'self' END,
+                 updated_at = VALUES(updated_at)""",
+            (attempt["assignment_id"], user["id"], attempt["node_id"], now),
+        )
+
+        xp_delta = 0
+        unlocked = []
+        growth_events = []
+        if education_game.settings_payload(class_row)["studentExperience"] == "map":
+            awarded = education_game.award_learning_xp(
+                db,
+                class_row=class_row,
+                class_id=assignment["class_id"],
+                user_id=int(user["id"]),
+                assignment_id=attempt["assignment_id"],
+                event_type="assessment_complete",
+                event_key=f"assessment_complete:{attempt_id}",
+                occurred_at=now,
+                metadata={
+                    "attemptId": attempt_id,
+                    "nodeId": int(attempt["node_id"]),
+                    "assignmentType": assignment["assignment_type"],
+                },
+            )
+            xp_delta = int(awarded["xpDelta"])
+            unlocked = awarded["unlockedAchievements"]
+            growth_events = awarded["growthRewards"]
+        updated = db.execute(
+            "SELECT * FROM education_assessment_attempts WHERE id = ?",
+            (attempt_id,),
+        ).fetchone()
+        reward = education_game.build_reward_receipt(
+            db,
+            class_row=class_row,
+            user_id=int(user["id"]),
+            xp_delta=xp_delta,
+            unlocked_achievements=unlocked,
+            growth_events=growth_events,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return jsonify({
         "attempt": _education_attempt_payload(updated, questions),
         "path": _education_student_path(assignment, int(user["id"])),
+        "reward": reward,
     })
 
 
 def _education_submission_context(submission_id: str, user):
-    submission = _assessment_repository.get_submission(submission_id)
+    submission = _get_db().execute(
+        "SELECT * FROM education_assignment_submissions WHERE id = ?",
+        (submission_id,),
+    ).fetchone()
     if not submission:
         return None, None, None, (jsonify({"error": "submission not found"}), 404)
     assignment, snapshot, membership, error = _education_assignment_context(submission["assignment_id"], user)
@@ -4120,9 +4898,13 @@ def _education_submission_context(submission_id: str, user):
 
 
 def _education_submission_payload(submission, *, role: str) -> dict:
+    db = _get_db()
     snapshot = _education_json(submission["snapshot_json"], {})
     question_by_id = {str(item.get("questionId")): item for item in snapshot.get("questions") or [] if isinstance(item, dict)}
-    member = _assessment_repository.submission_member_profile(submission["id"])
+    member = db.execute(
+        "SELECT student_name, student_number FROM education_memberships WHERE class_id = (SELECT class_id FROM education_assignments WHERE id = ?) AND user_id = ?",
+        (submission["assignment_id"], submission["user_id"]),
+    ).fetchone()
     payload = {
         "id": submission["id"],
         "assignmentId": submission["assignment_id"],
@@ -4144,7 +4926,10 @@ def _education_submission_payload(submission, *, role: str) -> dict:
             "aiError": submission["ai_error"] if role == "teacher" else None,
         })
         grades = []
-        for row in _assessment_repository.list_submission_grades(submission["id"]):
+        for row in db.execute(
+            "SELECT * FROM education_submission_question_grades WHERE submission_id = ? ORDER BY node_id, question_id",
+            (submission["id"],),
+        ).fetchall():
             question = question_by_id.get(str(row["question_id"]), {})
             grades.append({
                 "questionId": row["question_id"],
@@ -4179,15 +4964,178 @@ def education_assignment_submit(assignment_id: str):
         return jsonify({"error": "only students can submit assignments"}), 403
     if assignment["status"] != "published" or assignment["grades_published_at"]:
         return jsonify({"error": "assignment is closed", "code": "assignment_closed"}), 409
+
+    db = _get_db()
+    class_row = membership
     existing = _education_student_submission(assignment_id, int(user["id"]))
     if existing:
-        return jsonify({"submission": _education_submission_payload(existing, role="student")})
-    created, was_created, missing = _assessment_repository.submit_assignment(
-        assignment_id, int(user["id"])
-    )
-    if missing:
-        return jsonify({"error": "all assessment questions must be completed before submission", "code": "assignment_incomplete", "questionIds": missing}), 400
-    return jsonify({"submission": _education_submission_payload(created, role="student")}), 201 if was_created else 200
+        return jsonify({
+            "submission": _education_submission_payload(existing, role="student"),
+            "reward": education_game.build_reward_receipt(
+                db,
+                class_row=class_row,
+                user_id=int(user["id"]),
+                xp_delta=0,
+                unlocked_achievements=[],
+            ),
+        })
+
+    submission_id = uuid.uuid4().hex
+    try:
+        assignment = db.execute(
+            "SELECT * FROM education_assignments WHERE id = ? FOR UPDATE",
+            (assignment_id,),
+        ).fetchone()
+        class_row = db.execute(
+            "SELECT * FROM education_classes WHERE id = ?",
+            (assignment["class_id"],),
+        ).fetchone()
+        if not assignment or assignment["status"] != "published" or assignment["grades_published_at"]:
+            db.rollback()
+            return jsonify({"error": "assignment is closed", "code": "assignment_closed"}), 409
+        now = datetime.utcnow().isoformat()
+        existing = _education_student_submission(assignment_id, int(user["id"]))
+        if existing:
+            reward = education_game.build_reward_receipt(
+                db,
+                class_row=class_row,
+                user_id=int(user["id"]),
+                xp_delta=0,
+                unlocked_achievements=[],
+            )
+            db.commit()
+            return jsonify({
+                "submission": _education_submission_payload(existing, role="student"),
+                "reward": reward,
+            })
+
+        questions = db.execute(
+            "SELECT * FROM education_assessment_questions WHERE assignment_id = ? ORDER BY node_id, sort_order",
+            (assignment_id,),
+        ).fetchall()
+        attempts = {
+            int(row["node_id"]): row
+            for row in db.execute(
+                "SELECT * FROM education_assessment_attempts WHERE assignment_id = ? AND user_id = ?",
+                (assignment_id, user["id"]),
+            ).fetchall()
+        }
+        missing = []
+        frozen_questions = []
+        for question in questions:
+            attempt = attempts.get(int(question["node_id"]))
+            answers = _education_json(attempt["answers_json"], {}) if attempt else {}
+            answer = str(answers.get(question["id"]) or "").strip()
+            if not attempt or attempt["status"] != "completed" or not answer:
+                missing.append(question["id"])
+                continue
+            frozen_questions.append({
+                "questionId": question["id"],
+                "nodeId": int(question["node_id"]),
+                "kind": question["kind"],
+                "order": int(question["sort_order"]),
+                "question": question["question"],
+                "focus": question["focus"],
+                "expectedPoints": _education_json(question["expected_points_json"], []),
+                "referenceAnswer": question["reference_answer"] or "",
+                "maxScore": float(question["max_score"] or 0),
+                "studentAnswer": answer,
+            })
+        if missing:
+            db.rollback()
+            return jsonify({"error": "all assessment questions must be completed before submission", "code": "assignment_incomplete", "questionIds": missing}), 400
+
+        snapshot = {
+            "assignmentVersion": int(assignment["version"] or 1),
+            "assignmentType": assignment["assignment_type"],
+            "dueAt": _education_utc_timestamp(assignment["due_at"]),
+            "questions": frozen_questions,
+        }
+        db.execute(
+            """INSERT INTO education_assignment_submissions
+                 (id, assignment_id, user_id, status, ai_status, snapshot_json, submitted_at, updated_at)
+               VALUES (?, ?, ?, 'submitted', 'not_started', ?, ?, ?)""",
+            (submission_id, assignment_id, user["id"], json.dumps(snapshot, ensure_ascii=False), now, now),
+        )
+        db.executemany(
+            """INSERT INTO education_submission_question_grades
+                 (submission_id, question_id, node_id, max_score, student_answer, reference_answer, expected_points_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(submission_id, item["questionId"], item["nodeId"], item["maxScore"], item["studentAnswer"], item["referenceAnswer"], json.dumps(item["expectedPoints"], ensure_ascii=False), now) for item in frozen_questions],
+        )
+
+        xp_delta = 0
+        unlocked = []
+        growth_events = []
+        settings = education_game.settings_payload(class_row)
+        if settings["studentExperience"] == "map":
+            awarded = education_game.award_learning_xp(
+                db,
+                class_row=class_row,
+                class_id=assignment["class_id"],
+                user_id=int(user["id"]),
+                assignment_id=assignment_id,
+                event_type="assignment_submit",
+                event_key=f"assignment_submit:{submission_id}",
+                occurred_at=now,
+                metadata={
+                    "submissionId": submission_id,
+                    "assignmentType": assignment["assignment_type"],
+                },
+            )
+            xp_delta += int(awarded["xpDelta"])
+            unlocked = awarded["unlockedAchievements"]
+            growth_events.extend(awarded["growthRewards"])
+            if education_game.is_on_time(now, assignment["due_at"]):
+                ontime = education_game.award_learning_xp(
+                    db,
+                    class_row=class_row,
+                    class_id=assignment["class_id"],
+                    user_id=int(user["id"]),
+                    assignment_id=assignment_id,
+                    event_type="assignment_ontime",
+                    event_key=f"assignment_ontime:{submission_id}",
+                    occurred_at=now,
+                    metadata={"submissionId": submission_id, "dueAt": _education_utc_timestamp(assignment["due_at"])},
+                )
+                xp_delta += int(ontime["xpDelta"])
+                unlocked.extend(item for item in ontime["unlockedAchievements"] if item not in unlocked)
+                growth_events.extend(ontime["growthRewards"])
+        created = db.execute(
+            "SELECT * FROM education_assignment_submissions WHERE id = ?",
+            (submission_id,),
+        ).fetchone()
+        reward = education_game.build_reward_receipt(
+            db,
+            class_row=class_row,
+            user_id=int(user["id"]),
+            xp_delta=xp_delta,
+            unlocked_achievements=unlocked,
+            growth_events=growth_events,
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = _education_student_submission(assignment_id, int(user["id"]))
+        if existing:
+            return jsonify({
+                "submission": _education_submission_payload(existing, role="student"),
+                "reward": education_game.build_reward_receipt(
+                    db,
+                    class_row=class_row,
+                    user_id=int(user["id"]),
+                    xp_delta=0,
+                    unlocked_achievements=[],
+                ),
+            })
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    return jsonify({
+        "submission": _education_submission_payload(created, role="student"),
+        "reward": reward,
+    }), 201
 
 
 @app.route("/api/v2/edu/assignments/<assignment_id>/grading-overview", methods=["GET"])
@@ -4200,9 +5148,16 @@ def education_grading_overview(assignment_id: str):
         return error
     if membership["role"] != "teacher":
         return jsonify({"error": "forbidden"}), 403
-    rows = _assessment_repository.grading_overview(
-        assignment_id, assignment["class_id"]
-    )
+    rows = _get_db().execute(
+        """SELECT m.user_id, m.student_name, m.student_number, s.id AS submission_id, s.status, s.ai_status,
+                         s.submitted_at, s.ai_suggested_total, s.teacher_total, s.updated_at
+                    FROM education_memberships m
+                    LEFT JOIN education_assignment_submissions s
+                      ON s.assignment_id = ? AND s.user_id = m.user_id
+                   WHERE m.class_id = ? AND m.role = 'student' AND m.removed_at IS NULL
+                   ORDER BY m.student_number, m.user_id""",
+        (assignment_id, assignment["class_id"]),
+    ).fetchall()
     submissions = [row for row in rows if row["submission_id"]]
     pending = [int(row["user_id"]) for row in submissions if row["status"] != "released" and row["teacher_total"] is None]
     return jsonify({
@@ -4241,7 +5196,7 @@ def _education_class_statistics_payload(class_id: str):
         """SELECT user_id, student_name, student_number
              FROM education_memberships
             WHERE class_id = ? AND role = 'student' AND removed_at IS NULL
-            ORDER BY student_number COLLATE NOCASE, user_id""",
+            ORDER BY student_number, user_id""",
         (class_id,),
     ).fetchall()
     assignments = db.execute(
@@ -4332,7 +5287,7 @@ def _education_class_statistics_payload(class_id: str):
             "questionCount": question_counts[assignment["id"]],
             "maxScore": max_score,
             "publishedAt": assignment["published_at"],
-            "dueAt": assignment["due_at"],
+            "dueAt": _education_utc_timestamp(assignment["due_at"]),
             "studentCount": len(students),
             "submittedCount": submitted,
             "finalizedCount": len(values),
@@ -4524,7 +5479,7 @@ def education_assignment_statistics(assignment_id: str):
         """SELECT user_id, student_name, student_number
              FROM education_memberships
             WHERE class_id = ? AND role = 'student' AND removed_at IS NULL
-            ORDER BY student_number COLLATE NOCASE, user_id""",
+            ORDER BY student_number, user_id""",
         (assignment["class_id"],),
     ).fetchall()
     questions = db.execute(
@@ -4635,19 +5590,13 @@ def education_submission_detail(submission_id: str):
     return jsonify({"submission": _education_submission_payload(submission, role=role)})
 
 
-@app.route("/api/v2/edu/submissions/<submission_id>/evaluate", methods=["POST"])
-def education_submission_evaluate(submission_id: str):
-    user, error = _education_require_user(required_role="teacher")
-    if error:
-        return error
-    submission, _assignment, _snapshot, error = _education_submission_context(submission_id, user)
-    if error:
-        return error
-    if submission["status"] in {"finalized", "released"}:
-        return jsonify({"error": "finalized grading cannot be reevaluated", "code": "grading_finalized"}), 409
-    grade_rows = _assessment_repository.list_submission_grades(submission_id)
+def _education_prepare_submission_ai_grading(db, submission, assignment):
+    grade_rows = list(db.execute(
+        "SELECT * FROM education_submission_question_grades WHERE submission_id = ?",
+        (submission["id"],),
+    ).fetchall())
     invalid_standards = []
-    is_direct_assignment = _assignment["assignment_type"] == "direct"
+    is_direct_assignment = assignment["assignment_type"] == "direct"
     for grade in grade_rows:
         reference_answer = str(grade["reference_answer"] or "").strip()
         expected_points = _education_json(grade["expected_points_json"], [])
@@ -4658,28 +5607,27 @@ def education_submission_evaluate(submission_id: str):
             or float(grade["max_score"] or 0) <= 0
             or reference_report["status"] in {"contradicted", "structural_invalid"}
         ):
-            invalid_standards.append(grade["question_id"])
+            invalid_standards.append(str(grade["question_id"]))
     if invalid_standards:
-        return jsonify({
-            "error": "submission scoring standards require review before AI evaluation",
-            "code": "assessment_scoring_required",
-            "questionIds": invalid_standards,
-        }), 409
-    _assessment_repository.set_submission_ai_state(
-        submission_id, ai_status="running", ai_error=None
-    )
+        return grade_rows, {}, invalid_standards
+
+    now = datetime.utcnow().isoformat()
     snapshot = _education_json(submission["snapshot_json"], {})
-    question_by_id = {str(item.get("questionId")): item for item in snapshot.get("questions") or [] if isinstance(item, dict)}
+    question_by_id = {
+        str(item.get("questionId")): item
+        for item in snapshot.get("questions") or []
+        if isinstance(item, dict)
+    }
     tasks = {}
     for grade in grade_rows:
-        question = question_by_id.get(str(grade["question_id"]), {})
+        question_id = str(grade["question_id"])
+        question = question_by_id.get(question_id, {})
         report = analyze_matrix_answer(grade["student_answer"], grade["reference_answer"])
-        _assessment_repository.update_grade_analysis(
-            submission_id,
-            grade["question_id"],
-            matrix_report=report,
+        db.execute(
+            "UPDATE education_submission_question_grades SET matrix_report_json = ?, updated_at = ? WHERE submission_id = ? AND question_id = ?",
+            (json.dumps(report, ensure_ascii=False), now, submission["id"], grade["question_id"]),
         )
-        tasks[str(grade["question_id"])] = {
+        tasks[question_id] = {
             "question": question.get("question") or "",
             "focus": question.get("focus") or "",
             "maxScore": float(grade["max_score"] or 0),
@@ -4688,27 +5636,16 @@ def education_submission_evaluate(submission_id: str):
             "studentAnswer": grade["student_answer"],
             "matrixCheck": report,
         }
-    try:
-        results = _education_ai_tasks(
-            user_id=int(user["id"]),
-            task_id=submission_id,
-            task_kind="grade_question",
-            tasks=tasks,
-            scope=f"assignments/{submission['assignment_id']}/submissions/{submission_id}",
-        ) if tasks else {}
-    except Exception as exc:
-        safe_error = _education_safe_error_message(exc, _education_llm_config(int(user["id"])))
-        _assessment_repository.set_submission_ai_state(
-            submission_id,
-            status="review_draft",
-            ai_status="failed",
-            ai_error=safe_error[:1000],
-        )
-        return _education_ai_error_response(exc, "grading_ai_failed")
+    return grade_rows, tasks, []
+
+
+def _education_apply_submission_ai_grading(db, submission_id: str, grade_rows, results: dict):
     suggested_total = 0.0
     valid = True
+    now = datetime.utcnow().isoformat()
     for grade in grade_rows:
-        result = results.get(str(grade["question_id"]))
+        question_id = str(grade["question_id"])
+        result = results.get(question_id)
         max_score = float(grade["max_score"] or 0)
         try:
             suggested = round(float((result or {}).get("suggestedScore")), 1)
@@ -4720,22 +5657,179 @@ def education_submission_evaluate(submission_id: str):
             valid = False
             continue
         suggested_total += suggested
-        _assessment_repository.update_grade_analysis(
-            submission_id,
-            grade["question_id"],
-            ai_result=result,
-            ai_score=suggested,
+        db.execute(
+            "UPDATE education_submission_question_grades SET ai_result_json = ?, ai_suggested_score = ?, updated_at = ? WHERE submission_id = ? AND question_id = ?",
+            (json.dumps(result, ensure_ascii=False), suggested, now, submission_id, grade["question_id"]),
         )
     ai_status = "ready" if valid else "failed"
     ai_error = None if valid else "grade_question_invalid_result"
-    updated = _assessment_repository.set_submission_ai_state(
-        submission_id,
-        status="review_draft",
-        ai_status=ai_status,
-        ai_total=round(suggested_total, 1) if valid else None,
-        ai_error=ai_error,
+    db.execute(
+        "UPDATE education_assignment_submissions SET status = 'review_draft', ai_status = ?, ai_suggested_total = ?, ai_error = ?, updated_at = ? WHERE id = ?",
+        (ai_status, round(suggested_total, 1) if valid else None, ai_error, now, submission_id),
     )
+    return ai_status
+
+
+def _education_bulk_submission_question_results(result, submission, grade_rows):
+    if (
+        not isinstance(result, dict)
+        or result.get("submissionId") != submission["id"]
+        or result.get("studentUserId") != int(submission["user_id"])
+        or not isinstance(result.get("grades"), list)
+    ):
+        return {}
+    by_question_id = {}
+    for item in result["grades"]:
+        if not isinstance(item, dict):
+            return {}
+        question_id = item.get("questionId")
+        if not isinstance(question_id, str) or question_id in by_question_id:
+            return {}
+        by_question_id[question_id] = item
+    expected_question_ids = {str(grade["question_id"]) for grade in grade_rows}
+    return by_question_id if set(by_question_id) == expected_question_ids else {}
+
+
+@app.route("/api/v2/edu/submissions/<submission_id>/evaluate", methods=["POST"])
+def education_submission_evaluate(submission_id: str):
+    user, error = _education_require_user(required_role="teacher")
+    if error:
+        return error
+    submission, assignment, _snapshot, error = _education_submission_context(submission_id, user)
+    if error:
+        return error
+    if submission["status"] in {"finalized", "released"}:
+        return jsonify({"error": "finalized grading cannot be reevaluated", "code": "grading_finalized"}), 409
+    db = _get_db()
+    grade_rows, tasks, invalid_standards = _education_prepare_submission_ai_grading(db, submission, assignment)
+    if invalid_standards:
+        return jsonify({
+            "error": "submission scoring standards require review before AI evaluation",
+            "code": "assessment_scoring_required",
+            "questionIds": invalid_standards,
+        }), 409
+    now = datetime.utcnow().isoformat()
+    db.execute(
+        "UPDATE education_assignment_submissions SET ai_status = 'running', ai_error = NULL, updated_at = ? WHERE id = ?",
+        (now, submission_id),
+    )
+    db.commit()
+    try:
+        results = _education_ai_tasks(
+            user_id=int(user["id"]),
+            task_id=submission_id,
+            task_kind="grade_question",
+            tasks=tasks,
+            scope=f"assignments/{submission['assignment_id']}/submissions/{submission_id}",
+        ) if tasks else {}
+    except Exception as exc:
+        safe_error = _education_safe_error_message(exc, _education_llm_config(int(user["id"])))
+        db.execute(
+            "UPDATE education_assignment_submissions SET status = 'review_draft', ai_status = 'failed', ai_error = ?, updated_at = ? WHERE id = ?",
+            (safe_error[:1000], datetime.utcnow().isoformat(), submission_id),
+        )
+        db.commit()
+        return _education_ai_error_response(exc, "grading_ai_failed")
+    _education_apply_submission_ai_grading(db, submission_id, grade_rows, results)
+    db.commit()
+    updated = db.execute("SELECT * FROM education_assignment_submissions WHERE id = ?", (submission_id,)).fetchone()
     return jsonify({"submission": _education_submission_payload(updated, role="teacher")})
+
+
+@app.route("/api/v2/edu/assignments/<assignment_id>/submissions/evaluate", methods=["POST"])
+def education_assignment_submissions_evaluate(assignment_id: str):
+    user, error = _education_require_user(required_role="teacher")
+    if error:
+        return error
+    assignment, _snapshot, membership, error = _education_assignment_context(assignment_id, user)
+    if error:
+        return error
+    if membership["role"] != "teacher":
+        return jsonify({"error": "forbidden"}), 403
+    if assignment["status"] != "published" or assignment["grades_published_at"]:
+        return jsonify({"error": "assignment is closed", "code": "assignment_closed"}), 409
+
+    db = _get_db()
+    submissions = list(db.execute(
+        """SELECT * FROM education_assignment_submissions
+             WHERE assignment_id = ? AND status NOT IN ('finalized', 'released')
+             ORDER BY user_id, id""",
+        (assignment_id,),
+    ).fetchall())
+    if not submissions:
+        return jsonify({"error": "no submitted assignments require AI evaluation", "code": "grading_no_submissions"}), 409
+
+    prepared = {}
+    invalid = []
+    for submission in submissions:
+        grade_rows, question_tasks, invalid_standards = _education_prepare_submission_ai_grading(db, submission, assignment)
+        if invalid_standards:
+            invalid.append({"submissionId": submission["id"], "userId": int(submission["user_id"]), "questionIds": invalid_standards})
+            continue
+        task_key = f"submission:{submission['id']}:user:{int(submission['user_id'])}"
+        prepared[task_key] = (submission, grade_rows, question_tasks)
+    if invalid:
+        db.rollback()
+        return jsonify({
+            "error": "submission scoring standards require review before AI evaluation",
+            "code": "assessment_scoring_required",
+            "submissions": invalid,
+        }), 409
+
+    now = datetime.utcnow().isoformat()
+    tasks = {}
+    for task_key, (submission, _grade_rows, question_tasks) in prepared.items():
+        db.execute(
+            "UPDATE education_assignment_submissions SET ai_status = 'running', ai_error = NULL, updated_at = ? WHERE id = ?",
+            (now, submission["id"]),
+        )
+        tasks[task_key] = {
+            "submissionId": submission["id"],
+            "studentUserId": int(submission["user_id"]),
+            "questions": [
+                {"questionId": question_id, **question_task}
+                for question_id, question_task in question_tasks.items()
+            ],
+        }
+    db.commit()
+
+    try:
+        results = _education_ai_tasks(
+            user_id=int(user["id"]),
+            task_id=assignment_id,
+            task_kind="grade_submission",
+            tasks=tasks,
+            scope=f"assignments/{assignment_id}/bulk-grading",
+        )
+    except Exception as exc:
+        safe_error = _education_safe_error_message(exc, _education_llm_config(int(user["id"])))
+        failed_at = datetime.utcnow().isoformat()
+        for submission, _grade_rows, _question_tasks in prepared.values():
+            db.execute(
+                "UPDATE education_assignment_submissions SET status = 'review_draft', ai_status = 'failed', ai_error = ?, updated_at = ? WHERE id = ?",
+                (safe_error[:1000], failed_at, submission["id"]),
+            )
+        db.commit()
+        return _education_ai_error_response(exc, "grading_ai_failed")
+
+    evaluated_submission_ids = []
+    failed_submission_ids = []
+    for task_key, (submission, grade_rows, _question_tasks) in prepared.items():
+        question_results = _education_bulk_submission_question_results(results.get(task_key), submission, grade_rows)
+        ai_status = _education_apply_submission_ai_grading(db, submission["id"], grade_rows, question_results)
+        if ai_status == "ready":
+            evaluated_submission_ids.append(submission["id"])
+        else:
+            failed_submission_ids.append(submission["id"])
+    db.commit()
+    return jsonify({
+        "assignmentId": assignment_id,
+        "requestedCount": len(prepared),
+        "evaluatedCount": len(evaluated_submission_ids),
+        "failedCount": len(failed_submission_ids),
+        "evaluatedSubmissionIds": evaluated_submission_ids,
+        "failedSubmissionIds": failed_submission_ids,
+    })
 
 
 @app.route("/api/v2/edu/submissions/<submission_id>/grade", methods=["PATCH"])
@@ -4752,10 +5846,9 @@ def education_submission_grade(submission_id: str):
     raw_grades = body.get("grades")
     if not isinstance(raw_grades, list):
         return jsonify({"error": "grades must be a list"}), 400
-    stored = {
-        row["question_id"]: row
-        for row in _assessment_repository.list_submission_grades(submission_id)
-    }
+    db = _get_db()
+    stored = {row["question_id"]: row for row in db.execute("SELECT * FROM education_submission_question_grades WHERE submission_id = ?", (submission_id,)).fetchall()}
+    now = datetime.utcnow().isoformat()
     for item in raw_grades:
         if not isinstance(item, dict) or item.get("questionId") not in stored:
             return jsonify({"error": "unknown grading question"}), 400
@@ -4788,10 +5881,15 @@ def education_submission_finalize(submission_id: str):
         return error
     if submission["status"] == "released":
         return jsonify({"error": "grades are already released", "code": "grades_released"}), 409
-    rows = _assessment_repository.list_submission_grades(submission_id)
+    rows = _get_db().execute("SELECT teacher_score FROM education_submission_question_grades WHERE submission_id = ?", (submission_id,)).fetchall()
     if any(row["teacher_score"] is None for row in rows):
         return jsonify({"error": "every question requires a teacher score", "code": "grading_incomplete"}), 409
-    updated = _assessment_repository.finalize_submission(submission_id)
+    total = round(sum(float(row["teacher_score"] or 0) for row in rows), 1)
+    now = datetime.utcnow().isoformat()
+    db = _get_db()
+    db.execute("UPDATE education_assignment_submissions SET status = 'finalized', teacher_total = ?, finalized_at = ?, updated_at = ? WHERE id = ?", (total, now, now, submission_id))
+    db.commit()
+    updated = db.execute("SELECT * FROM education_assignment_submissions WHERE id = ?", (submission_id,)).fetchone()
     return jsonify({"submission": _education_submission_payload(updated, role="teacher")})
 
 
@@ -4814,7 +5912,6 @@ def education_assignment_publish_grades(assignment_id: str):
         return jsonify({"error": "all submitted assignments must be scored and saved before release", "code": "grading_incomplete", "userIds": pending}), 409
     now = datetime.utcnow().isoformat()
     try:
-        db.execute("BEGIN IMMEDIATE")
         for submission in submissions:
             node_scores = defaultdict(lambda: [0.0, 0.0])
             for grade in db.execute("SELECT node_id, max_score, teacher_score FROM education_submission_question_grades WHERE submission_id = ?", (submission["id"],)).fetchall():
@@ -4826,9 +5923,19 @@ def education_assignment_publish_grades(assignment_id: str):
                     """INSERT INTO education_node_progress
                          (assignment_id, user_id, node_id, state, mastery_source, diagnostic_summary, updated_at)
                        VALUES (?, ?, ?, ?, 'teacher', ?, ?)
-                       ON CONFLICT(assignment_id, user_id, node_id) DO UPDATE SET
-                         state = excluded.state, mastery_source = 'teacher', diagnostic_summary = excluded.diagnostic_summary, updated_at = excluded.updated_at""",
+                       ON DUPLICATE KEY UPDATE
+                         state = VALUES(state), mastery_source = 'teacher', diagnostic_summary = VALUES(diagnostic_summary), updated_at = VALUES(updated_at)""",
                     (assignment_id, submission["user_id"], node_id, state, submission["teacher_summary"] or "", now),
+                )
+            possible_score = sum(maximum for _score, maximum in node_scores.values())
+            earned_score = sum(score for score, _maximum in node_scores.values())
+            if possible_score > 0:
+                education_game.grant_excellent_assignment_chest(
+                    db,
+                    class_row=membership,
+                    user_id=int(submission["user_id"]),
+                    submission_id=submission["id"],
+                    percentage=earned_score / possible_score * 100,
                 )
             db.execute("UPDATE education_assignment_submissions SET status = 'released', released_at = ?, updated_at = ? WHERE id = ?", (now, now, submission["id"]))
         db.execute("UPDATE education_assignments SET grades_published_at = ?, updated_at = ? WHERE id = ?", (now, now, assignment_id))
@@ -4847,6 +5954,64 @@ def education_diagnostic_create(assignment_id: str):
         "message": "Use the teacher-reviewed assessment flow.",
     }), 410
 
+    user, error = _education_require_user()
+    if error:
+        return error
+    assignment, snapshot, membership, error = _education_assignment_context(assignment_id, user)
+    if error:
+        return error
+    if membership["role"] != "student":
+        return jsonify({"error": "only students can run diagnostics"}), 403
+    body = request.get_json(silent=True) or {}
+    try:
+        node_id = int(body.get("nodeId"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "nodeId must be an integer"}), 400
+    base_path = _education_json(assignment["base_path_json"], {})
+    if node_id not in set(base_path.get("candidateNodeIds") or []):
+        return jsonify({"error": "node is outside the frozen learning path"}), 400
+    nodes = _education_snapshot_graph(snapshot)["nodes"]
+    node = next((item for item in nodes if item.get("id") == node_id), None)
+    if not node:
+        return jsonify({"error": "node not found"}), 404
+    diagnostic_id = uuid.uuid4().hex
+    try:
+        question = _education_ai_task(
+            user_id=int(user["id"]),
+            task_id=diagnostic_id,
+            task_kind="question",
+            payload={
+                "nodeId": node_id,
+                "title": _education_node_title(node),
+                "statement": node.get("content") or node.get("source_statement") or "",
+            },
+            scope=f"diagnostics/{diagnostic_id}",
+        )
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    now = datetime.utcnow().isoformat()
+    db = _get_db()
+    db.execute(
+        """INSERT INTO education_diagnostics
+             (id, assignment_id, user_id, node_id, question_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            diagnostic_id, assignment_id, user["id"], node_id,
+            json.dumps(question, ensure_ascii=False), now, now,
+        ),
+    )
+    db.commit()
+    return jsonify({
+        "diagnostic": {
+            "id": diagnostic_id,
+            "assignmentId": assignment_id,
+            "nodeId": node_id,
+            "question": question.get("question"),
+            "focus": question.get("focus") or "",
+            "createdAt": now,
+        },
+    }), 201
+
 
 @app.route("/api/v2/edu/diagnostics/<diagnostic_id>/submit", methods=["POST"])
 def education_diagnostic_submit(diagnostic_id: str):
@@ -4855,6 +6020,81 @@ def education_diagnostic_submit(diagnostic_id: str):
         "code": "diagnostics_replaced",
         "message": "Use the teacher-reviewed assessment flow.",
     }), 410
+
+    user, error = _education_require_user()
+    if error:
+        return error
+    db = _get_db()
+    diagnostic = db.execute(
+        "SELECT * FROM education_diagnostics WHERE id = ? AND user_id = ?",
+        (diagnostic_id, user["id"]),
+    ).fetchone()
+    if not diagnostic:
+        return jsonify({"error": "diagnostic not found"}), 404
+    assignment, snapshot, membership, error = _education_assignment_context(
+        diagnostic["assignment_id"], user
+    )
+    if error:
+        return error
+    if membership["role"] != "student":
+        return jsonify({"error": "forbidden"}), 403
+    body = request.get_json(silent=True) or {}
+    answer = str(body.get("answer") or "").strip()
+    if not answer:
+        return jsonify({"error": "answer is required"}), 400
+    nodes = _education_snapshot_graph(snapshot)["nodes"]
+    node = next((item for item in nodes if item.get("id") == diagnostic["node_id"]), None)
+    question = _education_json(diagnostic["question_json"], {})
+    try:
+        evaluation = _education_ai_task(
+            user_id=int(user["id"]),
+            task_id=diagnostic_id,
+            task_kind="evaluate",
+            payload={
+                "node": {
+                    "nodeId": diagnostic["node_id"],
+                    "title": _education_node_title(node or {}),
+                    "statement": (node or {}).get("content")
+                    or (node or {}).get("source_statement")
+                    or "",
+                },
+                "question": question.get("question") or "",
+                "expectedPoints": question.get("expectedPoints") or [],
+                "answer": answer,
+            },
+            scope=f"diagnostics/{diagnostic_id}",
+        )
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    result = evaluation["result"]
+    summary = evaluation["summary"]
+    now = datetime.utcnow().isoformat()
+    db.execute(
+        """UPDATE education_diagnostics
+           SET answer = ?, result = ?, summary = ?, updated_at = ? WHERE id = ?""",
+        (answer, result, summary, now, diagnostic_id),
+    )
+    db.execute(
+        """INSERT INTO education_node_progress
+             (assignment_id, user_id, node_id, state, mastery_source,
+              diagnostic_summary, updated_at)
+           VALUES (?, ?, ?, ?, 'diagnostic', ?, ?)
+           ON DUPLICATE KEY UPDATE
+             state = VALUES(state),
+             mastery_source = 'diagnostic',
+             diagnostic_summary = VALUES(diagnostic_summary),
+             updated_at = VALUES(updated_at)""",
+        (
+            assignment["id"], user["id"], diagnostic["node_id"],
+            result, summary, now,
+        ),
+    )
+    db.commit()
+    return jsonify({
+        "result": result,
+        "summary": summary,
+        "nextStep": evaluation.get("nextStep") or "",
+    })
 
 
 @app.route("/api/v2/edu/assignments/<assignment_id>/overview", methods=["GET"])
@@ -4868,9 +6108,23 @@ def education_assignment_overview(assignment_id: str):
     if membership["role"] != "teacher":
         return jsonify({"error": "forbidden"}), 403
     total_steps = len(_education_json(assignment["base_path_json"], {}).get("steps") or [])
-    rows = _assessment_repository.assignment_overview(
-        assignment_id, assignment["class_id"]
-    )
+    rows = _get_db().execute(
+        """SELECT u.id AS user_id, m.student_name, m.student_number,
+                  SUM(CASE WHEN p.state = 'mastered' THEN 1 ELSE 0 END) AS mastered_count,
+                  SUM(CASE WHEN p.state = 'needs_review' THEN 1 ELSE 0 END) AS needs_review_count,
+                  MAX(p.updated_at) AS last_activity,
+                  (SELECT d.summary FROM education_diagnostics d
+                   WHERE d.assignment_id = ? AND d.user_id = u.id AND d.summary IS NOT NULL
+                   ORDER BY d.updated_at DESC LIMIT 1) AS diagnostic_summary
+           FROM education_memberships m
+           JOIN users u ON u.id = m.user_id
+           LEFT JOIN education_node_progress p
+             ON p.assignment_id = ? AND p.user_id = u.id
+           WHERE m.class_id = ? AND m.role = 'student' AND m.removed_at IS NULL
+           GROUP BY u.id, m.student_name, m.student_number
+           ORDER BY m.student_number, u.id""",
+        (assignment_id, assignment_id, assignment["class_id"]),
+    ).fetchall()
     return jsonify({
         "assignmentId": assignment_id,
         "totalSteps": total_steps,
@@ -4896,7 +6150,7 @@ def education_assignment_overview(assignment_id: str):
 
 def _education_context_node_ids(snapshot, node_id: int) -> list[int]:
     related = []
-    for edge in _education_json(snapshot["edges_json"], []):
+    for edge in _education_snapshot_graph(snapshot)["edges"]:
         if not isinstance(edge, dict):
             continue
         source, target = edge.get("from"), edge.get("to")
@@ -4921,9 +6175,14 @@ def education_student_context(assignment_id: str):
         return jsonify({"error": "only students can view their context"}), 403
     raw_node_id = request.args.get("nodeId")
     if raw_node_id is None or raw_node_id == "":
-        overview = _student_context_repository.build_overview(
-            assignment, snapshot, int(user["id"])
+        db = _get_db()
+        overview = build_student_context_overview(
+            db,
+            assignment=assignment,
+            snapshot=snapshot,
+            user_id=int(user["id"]),
         )
+        db.commit()
         return jsonify(overview)
     try:
         node_id = int(raw_node_id)
@@ -4932,11 +6191,17 @@ def education_student_context(assignment_id: str):
     if node_id not in set(_education_path_node_ids(_education_json(assignment["base_path_json"], {}))):
         return jsonify({"error": "node is outside the frozen learning path"}), 400
     try:
-        packet = _student_context_repository.build_packet(
-            assignment, snapshot, int(user["id"]), node_id
+        db = _get_db()
+        packet = build_student_context_packet(
+            db,
+            assignment=assignment,
+            snapshot=snapshot,
+            user_id=int(user["id"]),
+            node_id=node_id,
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
+    db.commit()
     return jsonify({
         "contextVersion": packet["contextVersion"],
         "contextPreview": context_preview(packet),
@@ -4976,14 +6241,20 @@ def education_proof_assist(assignment_id: str):
     if len(user_proof) > 200000:
         return jsonify({"error": "userProof is too large"}), 413
 
-    existing = _student_context_repository.load_idempotent_result(
-        assignment_id, int(user["id"]), client_interaction_id
+    db = _get_db()
+    existing = load_idempotent_result(
+        db,
+        assignment_id=assignment_id,
+        user_id=int(user["id"]),
+        client_interaction_id=client_interaction_id,
     )
     if existing:
         return jsonify(existing)
-    incomplete = _student_context_repository.interaction_exists(
-        assignment_id, int(user["id"]), client_interaction_id
-    )
+    incomplete = db.execute(
+        """SELECT id FROM learning_interactions
+            WHERE assignment_id = ? AND user_id = ? AND client_interaction_id = ?""",
+        (assignment_id, user["id"], client_interaction_id),
+    ).fetchone()
     if incomplete:
         return jsonify({
             "error": "interaction is still being finalized",
@@ -4996,37 +6267,41 @@ def education_proof_assist(assignment_id: str):
             "error": "education AI is not configured",
             "code": "education_ai_unconfigured",
         }), 503
-    task_key = f"proof:{assignment_id}:{int(user['id'])}:{client_interaction_id}"
-    claim = _assessment_repository.claim_ai_task(
-        task_key,
-        int(user["id"]),
-        "student_proof_assist",
-        f"assignments/{assignment_id}/student-context",
-        _education_daily_limit(),
-    )
-    if not claim["claimed"] and claim.get("reason") == "limit":
+    allowed, _remaining = _education_consume_ai_quota(int(user["id"]))
+    if not allowed:
         return jsonify({
             "error": "education AI daily limit reached",
             "code": "education_ai_limit_reached",
         }), 429
-    if not claim["claimed"]:
-        return jsonify({
-            "error": "interaction is still being finalized",
-            "code": "interaction_incomplete",
-        }), 409
     try:
-        packet = _student_context_repository.build_packet(
-            assignment,
-            snapshot,
-            int(user["id"]),
-            node_id,
+        packet = build_student_context_packet(
+            db,
+            assignment=assignment,
+            snapshot=snapshot,
+            user_id=int(user["id"]),
+            node_id=node_id,
             user_proof=user_proof,
             action=action,
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
     related_node_ids = _education_context_node_ids(snapshot, node_id)
-    task_record_id = claim.get("id")
+    task_record_id = uuid.uuid4().hex
+    now = datetime.utcnow().isoformat()
+    db.execute(
+        """INSERT INTO education_ai_tasks
+             (id, task_key, user_id, task_kind, scope, status, created_at, updated_at)
+           VALUES (?, ?, ?, 'student_proof_assist', ?, 'running', ?, ?)""",
+        (
+            task_record_id,
+            client_interaction_id,
+            user["id"],
+            f"assignments/{assignment_id}/student-context",
+            now,
+            now,
+        ),
+    )
+    db.commit()
     try:
         llm_context = create_education_context(_DATA_ROOT, config)
         assist_result = run_structured_proof_assist(
@@ -5035,7 +6310,8 @@ def education_proof_assist(assignment_id: str):
             packet=packet,
             allowed_related_node_ids=related_node_ids,
         )
-        stored = _student_context_repository.store_interaction_with_evidence(
+        stored = store_interaction_with_evidence(
+            db,
             assignment=assignment,
             snapshot=snapshot,
             user_id=int(user["id"]),
@@ -5048,11 +6324,12 @@ def education_proof_assist(assignment_id: str):
             learning_delta=assist_result["learningDelta"],
             classification_status=assist_result["classificationStatus"],
         )
-        refreshed_packet = _student_context_repository.build_packet(
-            assignment,
-            snapshot,
-            int(user["id"]),
-            node_id,
+        refreshed_packet = build_student_context_packet(
+            db,
+            assignment=assignment,
+            snapshot=snapshot,
+            user_id=int(user["id"]),
+            node_id=node_id,
             user_proof=user_proof,
             action=action,
         )
@@ -5071,18 +6348,22 @@ def education_proof_assist(assignment_id: str):
                 and requested_context_version != packet["contextVersion"]
             ),
         }
-        _student_context_repository.save_interaction_result(
-            stored["interactionId"], result
+        save_interaction_result(db, interaction_id=stored["interactionId"], result=result)
+        db.execute(
+            "UPDATE education_ai_tasks SET status = 'done', updated_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), task_record_id),
         )
-        if task_record_id:
-            _assessment_repository.finish_ai_task(task_record_id)
+        db.commit()
         return jsonify(result)
     except Exception as exc:
         safe_error = _education_safe_error_message(exc, config)
-        if task_record_id:
-            _assessment_repository.finish_ai_task(
-                task_record_id, error=safe_error[:1000]
-            )
+        db.rollback()
+        db.execute(
+            """UPDATE education_ai_tasks
+               SET status = 'failed', error = ?, updated_at = ? WHERE id = ?""",
+            (safe_error[:1000], datetime.utcnow().isoformat(), task_record_id),
+        )
+        db.commit()
         return jsonify({"error": "student proof assistance failed", "message": safe_error}), 502
 
 
@@ -5094,16 +6375,18 @@ def education_context_evidence_feedback(evidence_id: str):
     body = request.get_json(silent=True) or {}
     status = str(body.get("status") or "").strip()
     try:
-        evidence = _student_context_repository.update_evidence_status(
-            evidence_id,
-            int(user["id"]),
-            status,
-            str(body.get("note") or ""),
+        evidence = update_evidence_status(
+            _get_db(),
+            evidence_id=evidence_id,
+            user_id=int(user["id"]),
+            new_status=status,
+            note=str(body.get("note") or ""),
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     if not evidence:
         return jsonify({"error": "evidence not found"}), 404
+    _get_db().commit()
     return jsonify({"evidence": evidence})
 
 
@@ -5120,17 +6403,26 @@ def education_teacher_student_context_summary(assignment_id: str, student_user_i
         return error
     if membership["role"] != "teacher":
         return jsonify({"error": "forbidden"}), 403
-    student = _education_repository.get_membership(
-        assignment["class_id"], student_user_id
-    )
-    if not student or student["role"] != "student" or student.get("removed_at"):
+    student = _get_db().execute(
+        """SELECT u.id, m.student_name, m.student_number
+             FROM education_memberships m
+             JOIN users u ON u.id = m.user_id
+            WHERE m.class_id = ? AND m.user_id = ? AND m.role = 'student'
+              AND m.removed_at IS NULL""",
+        (assignment["class_id"], student_user_id),
+    ).fetchone()
+    if not student:
         return jsonify({"error": "student not found", "code": "student_not_found"}), 404
-    summary = _student_context_repository.teacher_summary(
-        assignment, snapshot, student_user_id
+    summary = build_teacher_context_summary(
+        _get_db(),
+        assignment=assignment,
+        snapshot=snapshot,
+        student_user_id=student_user_id,
     )
+    _get_db().commit()
     return jsonify({
         "student": {
-            "userId": student_user_id,
+            "userId": student["id"],
             "studentName": student["student_name"],
             "studentNumber": student["student_number"],
         },
@@ -5139,10 +6431,14 @@ def education_teacher_student_context_summary(assignment_id: str, student_user_i
 
 
 def _education_student_context_owner(class_id: str, user):
-    # 数据权利接口在班级归档或学生被移除后仍可用，但只能访问本人数据。
-    membership = _student_context_repository.data_rights_membership(
-        class_id, int(user["id"])
-    )
+    # Data-rights endpoints remain available after a class is archived or a
+    # student is removed; ownership is still constrained by user_id + class_id.
+    membership = _get_db().execute(
+        """SELECT m.role FROM education_memberships m
+            JOIN education_classes c ON c.id = m.class_id
+            WHERE m.class_id = ? AND m.user_id = ?""",
+        (class_id, user["id"]),
+    ).fetchone()
     if not membership:
         return None, (jsonify({"error": "class not found"}), 404)
     if membership["role"] != "student":
@@ -5158,8 +6454,8 @@ def education_student_context_export(class_id: str):
     _membership, error = _education_student_context_owner(class_id, user)
     if error:
         return error
-    payload = _student_context_repository.export_student_context(
-        class_id, int(user["id"])
+    payload = export_student_context(
+        _get_db(), class_id=class_id, user_id=int(user["id"])
     )
     response = jsonify(payload)
     response.headers["Content-Disposition"] = (
@@ -5182,14 +6478,22 @@ def education_student_context_delete(class_id: str):
             "error": "confirmClassId must match the course",
             "code": "context_delete_confirmation_required",
         }), 400
-    counts = _student_context_repository.delete_student_context(
-        class_id, int(user["id"])
-    )
+    db = _get_db()
+    try:
+        counts = delete_student_context(
+            db, class_id=class_id, user_id=int(user["id"])
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return jsonify({"ok": True, **counts})
 
 
 def _education_snapshot_context(snapshot_id: str, user):
-    snapshot = _education_repository.get_snapshot(snapshot_id)
+    snapshot = _get_db().execute(
+        "SELECT * FROM education_snapshots WHERE id = ?", (snapshot_id,)
+    ).fetchone()
     if not snapshot:
         return None, (jsonify({"error": "snapshot not found"}), 404)
     _membership, error = _education_require_membership(snapshot["class_id"], user)
@@ -5213,12 +6517,65 @@ def education_snapshot(snapshot_id: str):
         if membership["role"] != "teacher":
             return jsonify({"error": "forbidden"}), 403
 
-        deleted = _education_repository.delete_snapshot_group(snapshot_id)
-        if deleted is None:
-            return jsonify({"error": "snapshot not found"}), 404
-        snapshot_ids = deleted["snapshot_ids"]
-        assignment_ids = deleted["assignment_ids"]
-        diagnostic_ids = deleted["diagnostic_ids"]
+        db = _get_db()
+        source_graph_id = str(snapshot["source_graph_id"] or "").strip()
+        if source_graph_id:
+            snapshot_rows = db.execute(
+                """SELECT id FROM education_snapshots
+                    WHERE class_id = ? AND source_graph_id = ?""",
+                (snapshot["class_id"], source_graph_id),
+            ).fetchall()
+        else:
+            snapshot_rows = [snapshot]
+        snapshot_ids = [str(row["id"]) for row in snapshot_rows]
+        snapshot_placeholders = ",".join("?" for _ in snapshot_ids)
+        assignment_rows = db.execute(
+            f"SELECT id FROM education_assignments WHERE snapshot_id IN ({snapshot_placeholders})",
+            snapshot_ids,
+        ).fetchall()
+        assignment_ids = [str(row["id"]) for row in assignment_rows]
+        diagnostic_ids = []
+        if assignment_ids:
+            assignment_placeholders = ",".join("?" for _ in assignment_ids)
+            diagnostic_ids = [
+                str(row["id"])
+                for row in db.execute(
+                    f"SELECT id FROM education_diagnostics WHERE assignment_id IN ({assignment_placeholders})",
+                    assignment_ids,
+                ).fetchall()
+            ]
+
+        task_keys = assignment_ids + diagnostic_ids
+        try:
+            for item in snapshot_ids:
+                prepare_graph_delete(item)
+                _invalidate_api_graph(item)
+            if task_keys:
+                task_placeholders = ",".join("?" for _ in task_keys)
+                db.execute(
+                    f"DELETE FROM education_ai_tasks WHERE task_key IN ({task_placeholders})",
+                    task_keys,
+                )
+            if assignment_ids:
+                assignment_placeholders = ",".join("?" for _ in assignment_ids)
+                db.execute(
+                    f"DELETE FROM education_assignments WHERE id IN ({assignment_placeholders})",
+                    assignment_ids,
+                )
+            db.execute(
+                "DELETE FROM education_course_graph_order WHERE class_id = ? AND graph_key = ?",
+                (snapshot["class_id"], _education_course_graph_key(snapshot)),
+            )
+            db.execute(
+                f"DELETE FROM education_snapshots WHERE id IN ({snapshot_placeholders})",
+                snapshot_ids,
+            )
+            db.commit()
+            for item in snapshot_ids:
+                complete_graph_delete(item)
+        except Exception:
+            db.rollback()
+            raise
 
         cleanup_warnings = []
         cleanup_targets = [
@@ -5291,7 +6648,7 @@ def education_snapshot_locate(snapshot_id: str):
         node_id = int(request.args.get("node_id", ""))
     except (TypeError, ValueError):
         return jsonify({"error": "node_id must be an integer"}), 400
-    nodes = _education_json(snapshot["nodes_json"], [])
+    nodes = _education_snapshot_graph(snapshot)["nodes"]
     node = next((item for item in nodes if item.get("id") == node_id), None)
     if not node:
         return jsonify({"error": "node not found"}), 404
@@ -6849,9 +8206,22 @@ def _cancel_job_record(job_id: str, owner_id: int | None, *, artifact_dir=None):
         selected_artifact_dir = (
             job.get("_artifact_dir") if job else artifact_dir or str(_persistent_job_dir(job_id))
         )
-    _remove_job_artifacts(job_id, selected_artifact_dir)
     if owner_id is not None:
-        _learning_repository.delete_owned_history(int(owner_id), job_id)
+        with connect_database() as conn:
+            owned = conn.execute(
+                "SELECT id FROM history WHERE id = ? AND user_id = ?",
+                (job_id, owner_id),
+            ).fetchone()
+        if owned:
+            prepare_graph_delete(job_id)
+            _invalidate_api_graph(job_id)
+            with connect_database() as conn:
+                conn.execute(
+                    "DELETE FROM history WHERE id = ? AND user_id = ?",
+                    (job_id, owner_id),
+                )
+            complete_graph_delete(job_id)
+    _remove_job_artifacts(job_id, selected_artifact_dir)
     with _jobs_lock:
         runtime = _job_runtimes.pop(job_id, None)
         if runtime and runtime.get("queue"):
@@ -7183,23 +8553,17 @@ def job_result(job_id):
 
 
 def _source_pdf_context(job_id: str) -> tuple[dict | None, list[dict]]:
-    user = _current_user()
     job = _jobs.get(job_id)
     if job:
-        owner_id = job.get("_user_id")
-        if owner_id is not None and (
-            user is None or int(user["id"]) != int(owner_id)
-        ):
-            return None, []
         result = job.get("result") or {}
         return job.get("source_pdf"), result.get("nodes") or []
-    if user is None:
-        return None, []
-    row = _learning_repository.get_owned_history(int(user["id"]), job_id)
+    row = _get_db().execute(
+        "SELECT id, source_pdf_json FROM history WHERE id = ?", (job_id,)
+    ).fetchone()
     if not row:
         return None, []
-    nodes = copy.deepcopy(row.get("nodes") or [])
-    return _read_source_pdf_meta(row), nodes
+    graph = _load_api_graph(job_id)
+    return _read_source_pdf_meta(row), graph["nodes"]
 
 
 @app.route("/api/v2/source-pdf/<job_id>")
@@ -7553,26 +8917,42 @@ network.on('click', params => {{
 </html>"""
 
 
+@app.route("/health/live")
+def health_live():
+    return jsonify({"ok": True, "service": "mathweaver-api"})
+
+
+@app.route("/health/ready")
+def health_ready():
+    mysql = database_health()
+    try:
+        neo4j = get_graph_store().health()
+    except Exception as exc:
+        app.logger.error("Neo4j readiness check failed: %s", exc)
+        neo4j = {"ok": False}
+    ready = bool(mysql.get("ok") and neo4j.get("ok"))
+    payload = {
+        "ok": ready,
+        "mysql": {
+            "ok": bool(mysql.get("ok")),
+            "revision": mysql.get("revision"),
+            "expected": mysql.get("expected"),
+        },
+        "neo4j": {
+            "ok": bool(neo4j.get("ok")),
+            "database": neo4j.get("database"),
+            "constraints": neo4j.get("constraints") or [],
+        },
+    }
+    return jsonify(payload), 200 if ready else 503
+
+
 @app.route("/api/v2/ping")
 def ping():
     return jsonify({"ok": True})
 
 
-@app.route("/api/v2/ready")
-def ready():
-    """确认主数据库可执行查询；失败时不泄露连接信息，也不回退本地存储。"""
-    try:
-        with get_engine().connect() as connection:
-            connection.execute(text("SELECT 1")).scalar_one()
-    except Exception:
-        return jsonify({
-            "ok": False,
-            "database": "unavailable",
-            "code": "database_unavailable",
-        }), 503
-    return jsonify({"ok": True, "database": "ready"})
-
-
 if __name__ == "__main__":
+    reconcile_interrupted_history()
     print("MathGraph API v2  →  http://0.0.0.0:5001")
     app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)

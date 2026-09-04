@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, type ClipboardEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, type ClipboardEvent, type CompositionEvent, type FormEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 import { MathText } from "./math";
 
 export type DirectQuestionContentSegment =
@@ -11,6 +11,26 @@ export interface DirectQuestionEditorHandle {
   focus: () => void;
   getSelectionRange: () => DirectQuestionEditorSelection;
   setSelectionRange: (start: number, end: number) => void;
+}
+
+export function directQuestionEditorKey(questionId: string, field: "question" | "referenceAnswer") {
+  return `${questionId}:${field}`;
+}
+
+export function shouldSyncDirectQuestionEditorInput(composing: boolean, nativeIsComposing: boolean) {
+  return !composing && !nativeIsComposing;
+}
+
+export function releaseDirectQuestionEditorInteraction(root: HTMLElement | null) {
+  if (!root || typeof document === "undefined") return;
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && root.contains(active)) active.blur();
+  if (typeof window === "undefined") return;
+  const selection = window.getSelection();
+  if (!selection) return;
+  const selectionInsideRoot = (selection.anchorNode && root.contains(selection.anchorNode))
+    || (selection.focusNode && root.contains(selection.focusNode));
+  if (selectionInsideRoot) selection.removeAllRanges();
 }
 
 const DIRECT_INLINE_IMAGE_PATTERN = /!\[([^\]]*)\]\((data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+=*)\)/gi;
@@ -197,6 +217,15 @@ export const DirectQuestionEditor = forwardRef<DirectQuestionEditorHandle, Direc
   const rootRef = useRef<HTMLDivElement | null>(null);
   const lastValueRef = useRef(value);
   const selectionRef = useRef<DirectQuestionEditorSelection>({ start: value.length, end: value.length });
+  const composingRef = useRef(false);
+
+  const setRootRef = useCallback((node: HTMLDivElement | null) => {
+    if (!node && rootRef.current) {
+      composingRef.current = false;
+      releaseDirectQuestionEditorInteraction(rootRef.current);
+    }
+    rootRef.current = node;
+  }, []);
 
   const readSelection = () => {
     const root = rootRef.current;
@@ -246,6 +275,18 @@ export const DirectQuestionEditor = forwardRef<DirectQuestionEditorHandle, Direc
     selectionRef.current = nextSelection;
     lastValueRef.current = nextValue;
     onChange(nextValue, nextSelection);
+  };
+  const handleInput = (event: FormEvent<HTMLDivElement>) => {
+    const nativeIsComposing = Boolean((event.nativeEvent as InputEvent).isComposing);
+    if (!shouldSyncDirectQuestionEditorInput(composingRef.current, nativeIsComposing)) return;
+    syncFromDom();
+  };
+  const handleCompositionStart = (_event: CompositionEvent<HTMLDivElement>) => {
+    composingRef.current = true;
+  };
+  const handleCompositionEnd = (_event: CompositionEvent<HTMLDivElement>) => {
+    composingRef.current = false;
+    syncFromDom();
   };
 
   useImperativeHandle(ref, () => ({
@@ -308,7 +349,7 @@ export const DirectQuestionEditor = forwardRef<DirectQuestionEditorHandle, Direc
 
   return (
     <div
-      ref={rootRef}
+      ref={setRootRef}
       className={`direct-content-editor ${className}`.trim()}
       contentEditable
       suppressContentEditableWarning
@@ -317,7 +358,9 @@ export const DirectQuestionEditor = forwardRef<DirectQuestionEditorHandle, Direc
       aria-multiline="true"
       aria-placeholder={placeholder}
       data-empty={value.length === 0 ? "true" : "false"}
-      onInput={syncFromDom}
+      onInput={handleInput}
+      onCompositionStart={handleCompositionStart}
+      onCompositionEnd={handleCompositionEnd}
       onFocus={notifySelection}
       onClick={notifySelection}
       onKeyUp={notifySelection}
