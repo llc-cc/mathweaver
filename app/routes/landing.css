@@ -2819,6 +2819,18 @@ body:has(.brief-root) {
 
 .brief-footer-bottom {
   align-items: center;
+  justify-content: center;
+}
+
+.brief-footer-bottom a {
+  color: inherit;
+  text-decoration: none;
+  transition: color .2s ease;
+}
+
+.brief-footer-bottom a:hover,
+.brief-footer-bottom a:focus-visible {
+  color: var(--accent);
 }
 
 
@@ -3206,7 +3218,7 @@ body:has(.brief-root) {
     margin: 30px 0 20px;
   }
   .brief-footer-bottom {
-    align-items: flex-start;
+    align-items: center;
     flex-direction: column;
     gap: 9px;
   }

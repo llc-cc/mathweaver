@@ -1227,8 +1227,7 @@ function BriefFooter() {
         </div>
         <div className="brief-footer-divider" />
         <div className="brief-footer-bottom">
-          <span>© 2026 上海交通大学 AI4Math 课题组 · 保留所有权利</span>
-          <span>本项目仅供学术研究与教学用途</span>
+          <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer">粤ICP备2026074225号-3</a>
         </div>
       </div>
     </footer>
